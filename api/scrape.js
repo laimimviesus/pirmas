@@ -15,6 +15,8 @@ module.exports = async (req, res) => {
     });
 
     page = await browser.newPage();
+page.setDefaultNavigationTimeout(60000);
+page.setDefaultTimeout(60000);
 
     // ---- LOGIN (2-step) ----
     await page.goto('https://app.mercell.com/', { waitUntil: 'networkidle2' });
@@ -28,7 +30,10 @@ module.exports = async (req, res) => {
       (await page.$('button[type="submit"]'));
 
     if (!continueBtn) throw new Error('Continue/Next button not found after entering email');
-    await continueBtn.click();
+await Promise.all([
+  continueBtn.click(),
+  page.waitForSelector('input[name="password"][type="password"]', { timeout: 60000 }),
+]);
 
     await page.waitForSelector('input[name="password"][type="password"]', { timeout: 15000 });
     await page.fill('input[name="password"][type="password"]', process.env.MERCELL_PASSWORD);
@@ -41,17 +46,20 @@ module.exports = async (req, res) => {
 
     if (!signInBtn) throw new Error('Sign-in button not found on password step');
 
-    await Promise.all([
-      signInBtn.click(),
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => null),
-    ]);
 
-    const loggedIn =
-      (await page.$('text=Explore')) ||
-      (await page.$('a[href*="explore"]')) ||
-      (await page.$('[data-testid="user-menu"]'));
+// laukiam, kol atsiras kažkas “po login”
+await page.waitForSelector(
+  'text=Explore, a[href*="explore"], [data-testid="user-menu"]',
+  { timeout: 60000 }
+);
 
-    if (!loggedIn) throw new Error('Login appears unsuccessful — no post-login selector found');
+// laukiam, kol atsiras kažkas “po login”
+await page.waitForSelector(
+  'text=Explore, a[href*="explore"], [data-testid="user-menu"]',
+  { timeout: 60000 }
+);
+await signInBtn.click();
+
 
     await browser.close();
     return res.status(200).json({ ok: true });
