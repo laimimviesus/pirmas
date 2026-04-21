@@ -112,9 +112,9 @@ const stillOnLogin = page.url().includes('/auth/login');
 if (stillOnLogin) {
   throw new Error('Still on login page after submit (credentials error / captcha / SSO)');
 }
-
-    await page.goto('https://app.mercell.com/tender/explore', {
-  waitUntil: 'networkidle0',
+// po sėkmingo login
+    await page.goto('https://app.mercell.com/search', {
+  waitUntil: 'domcontentloaded',
   timeout: 120000,
 });
 await page.waitForSelector('body', { timeout: 15000 });
