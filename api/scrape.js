@@ -90,7 +90,10 @@ if (!clickedLogin) {
 // laukiame, kol:
 await Promise.race([
   // 1) pavyksta išeiti iš /auth/login
-  page.waitForFunction(() => !location.pathname.includes('/auth/login'), { timeout: 120000 }),
+  page.waitForFunction(
+    () => !location.pathname.includes('/auth/login'),
+    { timeout: 120000 }
+  ),
 
   // 2) atsiranda klaidos tekstas (neteisingas password ir pan.)
   page.waitForFunction(
@@ -99,11 +102,10 @@ await Promise.race([
   ),
 
   // 3) atsiranda blokavimo/captcha tekstas (jei Mercell taip rodo)
-
-await Promise.race([
-  page.waitForFunction(() => !location.pathname.includes('/auth/login'), { timeout: 120000 }),
-  page.waitForFunction(() => /invalid|incorrect|wrong|error/i.test(document.body.innerText), { timeout: 120000 }),
-  page.waitForFunction(() => /captcha|robot|blocked|challenge/i.test(document.body.innerText), { timeout: 60000 }),
+  page.waitForFunction(
+    () => /captcha|robot|blocked|challenge/i.test(document.body.innerText),
+    { timeout: 120000 }
+  ),
 ]);
 
 const stillOnLogin = page.url().includes('/auth/login');
