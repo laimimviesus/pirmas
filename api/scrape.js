@@ -149,6 +149,7 @@ await page.waitForFunction(() => {
          !pub.classList.contains('p-disabled');
 }, { timeout: 30000 });
 // c) atidarom Location dropdown
+
 // sąrašas šalių
 const countries = [
   'Norway', 'Denmark', 'Sweden', 'Finland', 'The Netherlands',
@@ -157,18 +158,22 @@ const countries = [
   'Switzerland', 'United Kingdom',
 ];
 
-// palaukiam, kol Location dropdown apskritai bus DOM’e
-await page.waitForSelector('div[data-testid="location-dropdown"] .p-treeselect-trigger', {
-  timeout: 15000,
-});
+// 1) įsitikinam, kad Filters panelė atidaryta
+const sfOk = await clickButtonContainsText(page, 'Search & Filters');
+console.log('Clicked Search & Filters?', sfOk);
 
-// atidarom Location dropdown
-await page.click('div[data-testid="location-dropdown"] .p-treeselect-trigger');
+await page.waitForSelector('button[data-testid="more-filters-toggle-button"]', { timeout: 15000 });
+await page.click('button[data-testid="more-filters-toggle-button"]');
+console.log('Clicked Filters button');
 
-// palaukiam, kol atsiras medis su šalių įrašais
+// 2) spaudžiam „Location“ tekstą, kad atsidarytų medis
+const locOk = await clickSpanContainsText(page, 'Location');
+console.log('Clicked Location label?', locOk);
+
+// 3) laukiam, kol atsiras šalių medis
 await page.waitForSelector('span.p-treenode-label', { timeout: 15000 });
 
-// spaudžiam šalis vieną po kitos
+// 4) spaudžiam šalis vieną po kitos
 for (const country of countries) {
   const ok = await page.evaluate((c) => {
     const labels = Array.from(document.querySelectorAll('span.p-treenode-label'));
