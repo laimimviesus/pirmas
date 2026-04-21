@@ -73,11 +73,20 @@ if (signInBtn) {
   if (!clicked) throw new Error('Sign-in button not found on password step');
 }
 
-// laikina post-login patikra: laukiam, kol išeis iš /auth/login
-await page.waitForFunction(
-  () => !location.pathname.includes('/auth/login'),
-  { timeout: 60000 }
-);
+await Promise.race([
+  // sėkmė: išeina iš login kelio
+  page.waitForFunction(() => !location.pathname.includes('/auth/login'), { timeout: 60000 }),
+
+  // klaida: atsirado error tekstas (dažni variantai)
+  page.waitForFunction(() => /invalid|incorrect|wrong|error/i.test(document.body.innerText), { timeout: 60000 }),
+
+  // captcha/blocked (dažni variantai)
+  page.waitForFunction(() => /captcha|robot|blocked|challenge/i.test(document.body.innerText), { timeout: 60000 }),
+]);
+const stillOnLogin = page.url().includes('/auth/login');
+if (stillOnLogin) {
+  throw new Error('Still on login page after submit (credentials error / captcha / SSO)');
+}
 
 await signInBtn.click();
 
@@ -88,11 +97,10 @@ await signInBtn.click();
     const debug = { errorMessage: e?.message || String(e) };
 try {
   if (page) {
-    debug.url = page.url();
-    const html = await page.content();
-    debug.htmlSnippet = html.slice(0, 12000);
-    const screenshot = await page.screenshot({ type: 'png', fullPage: true });
-    debug.screenshotBase64 = screenshot.toString('base64');
+debug.url = page.url();
+debug.htmlSnippet = (await page.content()).slice(0, 30000);
+const screenshot = await page.screenshot({ type: 'png', fullPage: true });
+debug.screenshotBase64 = screenshot.toString('base64');
   }
 } catch (dbgErr) {
   debug.debugCaptureError = dbgErr?.message || String(dbgErr);
