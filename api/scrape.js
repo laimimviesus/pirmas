@@ -10,7 +10,7 @@ module.exports = async (req, res) => {
     skipped: 0,
     errors: [],
   };
-
+export default async function handler(req, res) {
   try {
     // 1. Prisijungimas prie Mercell
     const browser = await puppeteer.launch({ 
@@ -64,6 +64,9 @@ module.exports = async (req, res) => {
   }
 } catch (e) {
   console.error('Mercell login failed:', e);
+  return res.status(500).json({ ok: false, error: e?.message || String(e) });
+ }
+}
 
   const debug = { errorMessage: e?.message || String(e) };
 
