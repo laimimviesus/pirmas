@@ -62,7 +62,6 @@ await page.type('input[name="password"][type="password"]', process.env.MERCELL_P
 let signInBtn = await page.$('button[type="submit"]');
 
 if (signInBtn) {
-  await signInBtn.click();
 } else {
   // 2) jei nėra submit, spaudžiam pagal tekstą (per evaluate)
   const clicked =
@@ -93,42 +92,32 @@ await signInBtn.click();
 
     await browser.close();
     return res.status(200).json({ ok: true });
-  } catch (e) {
-    const debug = { errorMessage: e?.message || String(e) };
-try {
-  if (page) {
-debug.url = page.url();
-    debug.path = await page.evaluate(() => location.pathname);
-    debug.bodyText = await page.evaluate(
-      () => (document.body?.innerText || '').slice(0, 4000)
-    );
 
-    debug.htmlSnippet = (await page.content()).slice(0, 30000);
+} catch (e) {
+  const debug = { errorMessage: e?.message || String(e) };
 
-    const screenshot = await page.screenshot({ type: 'png', fullPage: true });
-    debug.screenshotBase64 = screenshot.toString('base64');
-  }
-} catch (dbgErr) {
-  debug.debugCaptureError = dbgErr?.message || String(dbgErr);
-  }
-} catch (dbgErr) {
-  debug.debugCaptureError = dbgErr?.message || String(dbgErr);
-}
-    try {
-      if (page) {
-        const screenshot = await page.screenshot({ type: 'png', fullPage: false });
-        debug.screenshotBase64 = screenshot.toString('base64');
+  try {
+    if (page) {
+      debug.url = page.url();
+      debug.path = await page.evaluate(() => location.pathname);
+      debug.bodyText = await page.evaluate(
+        () => (document.body?.innerText || '').slice(0, 4000)
+      );
 
-        const html = await page.content();
-        debug.htmlSnippet = html.slice(0, 4000);
-      }
-    } catch (dbgErr) {
-      debug.debugCaptureError = dbgErr?.message || String(dbgErr);
+      debug.htmlSnippet = (await page.content()).slice(0, 30000);
+
+      const screenshot = await page.screenshot({ type: 'png', fullPage: true });
+      debug.screenshotBase64 = screenshot.toString('base64');
     }
-
-    try { if (browser) await browser.close(); } catch (_) {}
-
-    return res.status(500).json({ ok: false, error: 'Login failed', debug });
+  } catch (dbgErr) {
+    debug.debugCaptureError = dbgErr?.message || String(dbgErr);
   }
+
+  try { if (browser) await browser.close(); } catch (_) {}
+
+  return res.status(500).json({ ok: false, error: 'Login failed', debug });
+}
+
+
 };
 
