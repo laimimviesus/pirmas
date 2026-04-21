@@ -146,13 +146,23 @@ const countries = [
   'Switzerland', 'United Kingdom',
 ];
 
-// atidarom Location dropdown (bet dabar jau be .p-disabled)
+// atidarom Location dropdown
 await page.click('div[data-testid="location-dropdown"] .p-treeselect-trigger');
 
-// paprastam variante pabandom tiesiog spausti šalių pavadinimus eilės tvarka
+// palaukiam, kol atsiras medis su šalių įrašais
+await page.waitForSelector('span.p-treenode-label', { timeout: 15000 });
+
+// spaudžiam šalis vieną po kitos
 for (const country of countries) {
-  const ok = await clickButtonContainsText(page, country);
-  console.log('Selected country?', country, ok);
+  const ok = await page.evaluate((c) => {
+    const labels = Array.from(document.querySelectorAll('span.p-treenode-label'));
+    const el = labels.find(span => (span.textContent || '').trim().startsWith(c));
+    if (!el) return false;
+    el.click();
+    return true;
+  }, country);
+
+  console.log('Selected country via tree label?', country, ok);
 }
 
 
