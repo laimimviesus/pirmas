@@ -327,7 +327,25 @@ const sidebarDebug = await page.evaluate(() => {
   };
 });
 console.log('DEBUG sidebar contents:', JSON.stringify(sidebarDebug));
+// Paspaudžiam "Show all (50)" Location sekcijoje, kad būtų visi 50 šalių
+const expandedAll = await page.evaluate(() => {
+  const btn = document.querySelector('button[data-testid="show-more-button"]');
+  if (!btn) return false;
+  btn.scrollIntoView({ block: 'center' });
+  btn.click();
+  return true;
+});
+console.log('Clicked "Show all" in Location?', expandedAll);
 
+// palaukiam, kol medyje atsiras daugiau negu 5 šalys
+await page.waitForFunction(() => {
+  return document.querySelectorAll('span.p-treenode-label').length > 10;
+}, { timeout: 10000 }).catch(() => {
+  console.log('WARN: tree did not expand beyond 10 labels in 10s');
+});
+
+// mažytė pauzė, kad tree suspėtų stabilizuotis
+await new Promise(r => setTimeout(r, 400));
 
 for (const country of countries) {
   const res = await checkTreeNodeByName(page, country);
