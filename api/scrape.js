@@ -22,15 +22,9 @@ async function clickSpanContainsText(page, text) {
 
   return ok;
 }
-// Pažymi checkbox'ą šalia tree node'o pagal jo pavadinimą.
-// Nespaudžia label'o, kad nesusipainiotų su expand toggler'iu.
-// Jei medis virtualizuotas — pascroll'ina konteinerį, kol elementą suranda.
 async function checkTreeNodeByName(page, name) {
   return await page.evaluate(async (n) => {
-    const container =
-      document.querySelector('.p-tree-container') ||
-      document.querySelector('.p-tree-wrapper') ||
-      document.querySelector('.p-tree');
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
     const findLabel = () => {
       const labels = Array.from(document.querySelectorAll('span.p-treenode-label'));
@@ -40,29 +34,65 @@ async function checkTreeNodeByName(page, name) {
       });
     };
 
+    const getScrollableAncestor = (el) => {
+      let cur = el;
+      while (cur && cur !== document.body) {
+        const s = getComputedStyle(cur);
+        const canScroll =
+          (s.overflowY === 'auto' || s.overflowY === 'scroll' ||
+           s.overflow  === 'auto' || s.overflow  === 'scroll') &&
+          cur.scrollHeight > cur.clientHeight + 1;
+        if (canScroll) return cur;
+        cur = cur.parentElement;
+      }
+      return null;
+    };
+
+    const fireScroll = (el) => {
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    };
+
+    // 1) bandom surasti iš karto
     let label = findLabel();
 
-    // jei nerado — scroll'inam medį iš viršaus žemyn, kol atsiras
-    if (!label && container) {
-      container.scrollTop = 0;
-      await new Promise(r => setTimeout(r, 80));
-      const max = container.scrollHeight;
-      for (let y = 0; y <= max; y += 120) {
-        container.scrollTop = y;
-        await new Promise(r => setTimeout(r, 60));
-        label = findLabel();
-        if (label) break;
+    // 2) jei nerado — scroll'inam tikrąjį medžio scrollable tėvą
+    if (!label) {
+      const anyLabel = document.querySelector('span.p-treenode-label');
+      const scroller = anyLabel ? getScrollableAncestor(anyLabel) : null;
+
+      if (scroller) {
+        scroller.scrollTop = 0;
+        fireScroll(scroller);
+        await sleep(120);
+
+        const maxY = scroller.scrollHeight + 3000; // su rezervu virtualizavimui
+        for (let y = 0; y <= maxY; y += 120) {
+          scroller.scrollTop = y;
+          fireScroll(scroller);
+          await sleep(70);
+          label = findLabel();
+          if (label) break;
+        }
+      }
+
+      // 3) atsarginis planas — scroll'inam visą window
+      if (!label) {
+        for (let y = 0; y <= document.documentElement.scrollHeight; y += 200) {
+          window.scrollTo(0, y);
+          await sleep(60);
+          label = findLabel();
+          if (label) break;
+        }
       }
     }
 
-    if (!label) return { ok: false, reason: 'label not found' };
+    if (!label) {
+      const visible = Array.from(document.querySelectorAll('span.p-treenode-label'))
+        .map(s => (s.textContent || '').trim());
+      return { ok: false, reason: 'label not found', visible };
+    }
 
-    // iš label'io keliaujam į .p-treenode-content ir randam checkbox'ą
-    const content =
-      label.closest('.p-treenode-content') ||
-      label.parentElement;
-    if (!content) return { ok: false, reason: 'content not found' };
-
+    const content = label.closest('.p-treenode-content') || label.parentElement;
     const checkbox =
       content.querySelector('.p-checkbox-box') ||
       content.querySelector('[role="checkbox"]') ||
@@ -70,12 +100,11 @@ async function checkTreeNodeByName(page, name) {
 
     if (!checkbox) return { ok: false, reason: 'checkbox not found' };
 
-    checkbox.scrollIntoView({ block: 'center' });
+    label.scrollIntoView({ block: 'center' });
     checkbox.click();
     return { ok: true };
   }, name);
 }
-
 
 module.exports = async (req, res) => {
   const summary = { errors: [] };
@@ -228,6 +257,30 @@ console.log('Clicked Location label?', locOk);
 await page.waitForSelector('span.p-treenode-label', { timeout: 15000 });
 
 // 4) pažymim šalių checkbox'us (neišskleidžiant sub-regionų)
+// DEBUG: kas yra medyje ir kurie konteineriai scroll'inasi
+const treeDebug = await page.evaluate(() => {
+  const labels = Array.from(document.querySelectorAll('span.p-treenode-label'))
+                      .map(s => (s.textContent || '').trim());
+
+  const scrollables = Array.from(document.querySelectorAll('*'))
+    .filter(el => {
+      const s = getComputedStyle(el);
+      return (s.overflowY === 'auto' || s.overflowY === 'scroll' ||
+              s.overflow  === 'auto' || s.overflow  === 'scroll') &&
+             el.scrollHeight > el.clientHeight + 1;
+    })
+    .slice(0, 20)
+    .map(el => ({
+      tag: el.tagName,
+      cls: (typeof el.className === 'string' ? el.className : '').slice(0, 160),
+      id: el.id || null,
+      sh: el.scrollHeight,
+      ch: el.clientHeight,
+    }));
+
+  return { labelCount: labels.length, labels, scrollables };
+});
+console.log('DEBUG tree snapshot:', JSON.stringify(treeDebug));
 for (const country of countries) {
   const res = await checkTreeNodeByName(page, country);
   console.log('Checked country checkbox?', country, JSON.stringify(res));
