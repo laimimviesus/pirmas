@@ -34,6 +34,20 @@ page.setDefaultTimeout(120000);
        waitUntil: 'domcontentloaded',
        timeout: 120000,
      });
+// >>> čia įterpiam cookie banerio tvarkymą
+    try {
+      await page.waitForFunction(
+        () => /Cookie preferences|Accept all|Accept essentials/i.test(document.body.innerText),
+        { timeout: 5000 }
+      );
+
+      await clickButtonContainsText(page, 'Accept essentials');
+      await clickButtonContainsText(page, 'Accept all');
+      await clickButtonContainsText(page, 'Accept');
+    } catch (_) {
+      // jei banerio nėra – nieko blogo
+    }
+ 
 
     await page.waitForSelector('#email', { timeout: 15000 });
 await page.click('#email', { clickCount: 3 });
@@ -59,29 +73,43 @@ await page.click('input[name="password"][type="password"]', { clickCount: 3 });
 await page.type('input[name="password"][type="password"]', process.env.MERCELL_PASSWORD, { delay: 20 });
 
 // 1) pabandom paprastą submit mygtuką
-let signInBtn = await page.$('button[type="submit"]');
 
-if (signInBtn) {
-  await signInBtn.click();
-} else {
-  const clicked =
-    (await clickButtonContainsText(page, 'Sign in')) ||
-    (await clickButtonContainsText(page, 'Log in')) ||
-    (await clickButtonContainsText(page, 'Login'));
+// spaudžiam login mygtuką pagal tekstą
+const clickedLogin =
+  (await clickButtonContainsText(page, 'Log in')) ||
+  (await clickButtonContainsText(page, 'Login')) ||
+  (await clickButtonContainsText(page, 'Sign in'));
 
-  if (!clicked) throw new Error('Sign-in button not found on password step');
+if (!clickedLogin) {
+  // fallback – jei pavyksta rasti submit mygtuką per selector
+  const submit = await page.$('button[type="submit"]');
+  if (!submit) throw new Error('Sign-in button not found on password step');
+  await submit.click();
 }
 
-if (signInBtn) {
-  await signInBtn.click();
-} else {
-  const clicked =
-    (await clickButtonContainsText(page, 'Sign in')) ||
-    (await clickButtonContainsText(page, 'Log in')) ||
-    (await clickButtonContainsText(page, 'Login'));
+// laukiame, kol:
+await Promise.race([
+  // 1) pavyksta išeiti iš /auth/login
+  page.waitForFunction(() => !location.pathname.includes('/auth/login'), { timeout: 120000 }),
 
-  if (!clicked) throw new Error('Sign-in button not found on password step');
+  // 2) atsiranda klaidos tekstas (neteisingas password ir pan.)
+  page.waitForFunction(
+    () => /invalid|incorrect|wrong|error/i.test(document.body.innerText),
+    { timeout: 120000 }
+  ),
+
+  // 3) atsiranda blokavimo/captcha tekstas (jei Mercell taip rodo)
+  page.waitForFunction(
+    () => /captcha|robot|blocked|challenge/i.test(document.body.innerText),
+    { timeout: 120000 }
+  ),
+]);
+
+const stillOnLogin = page.url().includes('/auth/login');
+if (stillOnLogin) {
+  throw new Error('Still on login page after submit (credentials error / captcha / SSO)');
 }
+
 
 await Promise.race([
   page.waitForFunction(() => !location.pathname.includes('/auth/login'), { timeout: 120000 }),
