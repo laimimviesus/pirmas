@@ -75,10 +75,10 @@ if (signInBtn) {
 
 await Promise.race([
   // sėkmė: išeina iš login kelio
-  page.waitForFunction(() => !location.pathname.includes('/auth/login'), { timeout: 60000 }),
+  page.waitForFunction(() => !location.pathname.includes('/auth/login'), { timeout: 120000 }),
 
   // klaida: atsirado error tekstas (dažni variantai)
-  page.waitForFunction(() => /invalid|incorrect|wrong|error/i.test(document.body.innerText), { timeout: 60000 }),
+  page.waitForFunction(() => /invalid|incorrect|wrong|error/i.test(document.body.innerText), { timeout: 120000 }),
 
   // captcha/blocked (dažni variantai)
   page.waitForFunction(() => /captcha|robot|blocked|challenge/i.test(document.body.innerText), { timeout: 60000 }),
@@ -98,9 +98,18 @@ await signInBtn.click();
 try {
   if (page) {
 debug.url = page.url();
-debug.htmlSnippet = (await page.content()).slice(0, 30000);
-const screenshot = await page.screenshot({ type: 'png', fullPage: true });
-debug.screenshotBase64 = screenshot.toString('base64');
+    debug.path = await page.evaluate(() => location.pathname);
+    debug.bodyText = await page.evaluate(
+      () => (document.body?.innerText || '').slice(0, 4000)
+    );
+
+    debug.htmlSnippet = (await page.content()).slice(0, 30000);
+
+    const screenshot = await page.screenshot({ type: 'png', fullPage: true });
+    debug.screenshotBase64 = screenshot.toString('base64');
+  }
+} catch (dbgErr) {
+  debug.debugCaptureError = dbgErr?.message || String(dbgErr);
   }
 } catch (dbgErr) {
   debug.debugCaptureError = dbgErr?.message || String(dbgErr);
