@@ -58,13 +58,20 @@ await Promise.all([
 await page.click('input[name="password"][type="password"]', { clickCount: 3 });
 await page.type('input[name="password"][type="password"]', process.env.MERCELL_PASSWORD, { delay: 20 });
 
-    const signInBtn =
-      (await page.$('button:has-text("Sign in")')) ||
-      (await page.$('button:has-text("Log in")')) ||
-      (await page.$('button:has-text("Login")')) ||
-      (await page.$('button[type="submit"]'));
+// 1) pabandom paprastą submit mygtuką
+let signInBtn = await page.$('button[type="submit"]');
 
-    if (!signInBtn) throw new Error('Sign-in button not found on password step');
+if (signInBtn) {
+  await signInBtn.click();
+} else {
+  // 2) jei nėra submit, spaudžiam pagal tekstą (per evaluate)
+  const clicked =
+    (await clickButtonContainsText(page, 'Sign in')) ||
+    (await clickButtonContainsText(page, 'Log in')) ||
+    (await clickButtonContainsText(page, 'Login'));
+
+  if (!clicked) throw new Error('Sign-in button not found on password step');
+}
 
 
 // laukiam, kol atsiras kažkas “po login”
