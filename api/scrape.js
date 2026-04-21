@@ -32,7 +32,7 @@ page.setDefaultTimeout(120000);
     // ---- LOGIN (2-step) ----
     await page.goto('https://app.mercell.com/auth/login/challenge/password', { 
        waitUntil: 'domcontentloaded',
-       timeour: 120000,
+       timeout: 120000,
      });
 
     await page.waitForSelector('#email', { timeout: 15000 });
@@ -62,8 +62,19 @@ await page.type('input[name="password"][type="password"]', process.env.MERCELL_P
 let signInBtn = await page.$('button[type="submit"]');
 
 if (signInBtn) {
+  await signInBtn.click();
 } else {
-  // 2) jei nėra submit, spaudžiam pagal tekstą (per evaluate)
+  const clicked =
+    (await clickButtonContainsText(page, 'Sign in')) ||
+    (await clickButtonContainsText(page, 'Log in')) ||
+    (await clickButtonContainsText(page, 'Login'));
+
+  if (!clicked) throw new Error('Sign-in button not found on password step');
+}
+
+if (signInBtn) {
+  await signInBtn.click();
+} else {
   const clicked =
     (await clickButtonContainsText(page, 'Sign in')) ||
     (await clickButtonContainsText(page, 'Log in')) ||
@@ -73,22 +84,15 @@ if (signInBtn) {
 }
 
 await Promise.race([
-  // sėkmė: išeina iš login kelio
   page.waitForFunction(() => !location.pathname.includes('/auth/login'), { timeout: 120000 }),
-
-  // klaida: atsirado error tekstas (dažni variantai)
   page.waitForFunction(() => /invalid|incorrect|wrong|error/i.test(document.body.innerText), { timeout: 120000 }),
-
-  // captcha/blocked (dažni variantai)
   page.waitForFunction(() => /captcha|robot|blocked|challenge/i.test(document.body.innerText), { timeout: 60000 }),
 ]);
+
 const stillOnLogin = page.url().includes('/auth/login');
 if (stillOnLogin) {
   throw new Error('Still on login page after submit (credentials error / captcha / SSO)');
 }
-
-await signInBtn.click();
-
 
     await browser.close();
     return res.status(200).json({ ok: true });
