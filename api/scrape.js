@@ -114,7 +114,34 @@ if (stillOnLogin) {
 }
 
     await browser.close();
-    return res.status(200).json({ ok: true });
+    await page.goto('https://app.mercell.com/tender/explore', {
+  waitUntil: 'networkidle0',
+  timeout: 120000,
+});
+await page.waitForSelector('body', { timeout: 15000 });
+console.log('EXPLORE URL:', await page.url());
+// atsidūrus Explore puslapyje – atsidarom filtrus
+
+// a) „Search & Filters“ (viršuje)
+await clickButtonContainsText(page, 'Search & Filters');
+
+// b) „Filters“ mygtukas (dešiniau)
+await page.waitForSelector('button[data-testid="more-filters-toggle-button"]', { timeout: 15000 });
+await page.click('button[data-testid="more-filters-toggle-button"]');
+// palaukiam, kol dropdown'ai taps aktyvūs (nebebus .p-disabled)
+await page.waitForFunction(() => {
+  const loc = document.querySelector('div[data-testid="location-dropdown"]');
+  const opp = document.querySelector('div[data-testid="opportunity-dropdown"]');
+  const pub = document.querySelector('div[data-testid="publication-date-dropdown"]');
+  if (!loc || !opp || !pub) return false;
+  return !loc.classList.contains('p-disabled') &&
+         !opp.classList.contains('p-disabled') &&
+         !pub.classList.contains('p-disabled');
+}, { timeout: 30000 });
+// c) atidarom Location dropdown
+await page.click('div[data-testid="location-dropdown"] .p-treeselect-trigger');
+
+return res.status(200).json({ ok: true });
 
 } catch (e) {
   const debug = { errorMessage: e?.message || String(e) };
