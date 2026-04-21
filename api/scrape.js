@@ -354,57 +354,60 @@ for (const country of countries) {
   await new Promise(r => setTimeout(r, 250));
 }
 
+// --- OPPORTUNITY TYPES: Contract ---
 
-// Opportunity type: Contract
-const oppClicked = await clickSpanContainsText(page, 'Contract');
-console.log('Selected opportunity type Contract?', oppClicked);
-
-// --- STATUS (MultiSelect dropdown'as) ---
-
-// --- STATUS (MultiSelect dropdown'as) ---
-
-// Palaukiam po Contract, kad sidebar'as stabilizuotųsi
-await new Promise(r => setTimeout(r, 800));
-
-// Scroll'inam sidebar'ą iki apačios – priverčiam visus accordion tab'us į DOM'ą
-await page.evaluate(async () => {
-  const sidebar = document.querySelector('.p-sidebar-content');
-  if (!sidebar) return;
-  for (let y = 0; y <= sidebar.scrollHeight + 1000; y += 200) {
-    sidebar.scrollTop = y;
-    sidebar.dispatchEvent(new Event('scroll', { bubbles: true }));
-    await new Promise(r => setTimeout(r, 60));
-  }
-  sidebar.scrollTop = 0;
-});
-
-// DEBUG: parodo VISUS accordion tabs (id, tekstas, ar išplėsti)
-const allAcc = await page.evaluate(() => {
+// 1) Atidarom "Opportunity types" accordion'ą
+const oppAcc = await page.evaluate(() => {
   const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
-  return tabs.map(t => {
-    const link = t.querySelector('.p-accordion-header-link');
-    return {
-      id: t.id || null,
-      text: link ? (link.textContent || '').trim().slice(0, 80) : null,
-      expanded: link?.getAttribute('aria-expanded') || null,
-    };
-  });
+  const target = tabs.find(t => /doc_type_code/i.test(t.id || ''));
+  if (!target) return { found: false };
+  const link = target.querySelector('.p-accordion-header-link');
+  const wasExpanded = link?.getAttribute('aria-expanded') === 'true';
+  if (!wasExpanded && link) {
+    link.scrollIntoView({ block: 'center' });
+    link.click();
+  }
+  return { found: true, tabId: target.id, wasExpanded };
 });
-console.log('DEBUG all accordion tabs:', JSON.stringify(allAcc));
+console.log('Opportunity types accordion:', JSON.stringify(oppAcc));
+await new Promise(r => setTimeout(r, 500));
 
-// 1) Išskleidžiam Status accordion'ą (lankstus ieškojimas per id arba tekstą)
+// 2) Paspaudžiam "Contract" checkbox'ą šiame accordion'e
+const contractPicked = await page.evaluate(() => {
+  const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+  const target = tabs.find(t => /doc_type_code/i.test(t.id || ''));
+  if (!target) return { ok: false, reason: 'accordion not found' };
+
+  const labels = Array.from(target.querySelectorAll('.p-checkbox-label'));
+  const label = labels.find(l => {
+    const t = (l.textContent || '').trim();
+    return t === 'Contract' || t.startsWith('Contract ') || t.startsWith('Contract(');
+  });
+  if (!label) {
+    const available = labels.map(l => (l.textContent || '').trim()).filter(Boolean);
+    return { ok: false, reason: 'Contract label not found', available };
+  }
+
+  const wrapper = label.closest('.p-checkbox-wrapper') || label.parentElement;
+  const box =
+    wrapper?.querySelector('.p-checkbox-box') ||
+    wrapper?.querySelector('.p-checkbox') ||
+    wrapper;
+  if (!box) return { ok: false, reason: 'checkbox box not found' };
+
+  box.scrollIntoView({ block: 'center' });
+  box.click();
+  return { ok: true };
+});
+console.log('Selected opportunity type "Contract":', JSON.stringify(contractPicked));
+
+// --- TENDER STATUS: Open for offers ---
+
+// 1) Atidarom "Tender status" accordion'ą
 const statusAcc = await page.evaluate(() => {
   const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
-  let target = tabs.find(t => /status/i.test(t.id || ''));
-  if (!target) {
-    target = tabs.find(t => {
-      const link = t.querySelector('.p-accordion-header-link');
-      const text = link ? (link.textContent || '').trim() : '';
-      return /\bstatus\b/i.test(text);
-    });
-  }
+  const target = tabs.find(t => /tender_status/i.test(t.id || ''));
   if (!target) return { found: false };
-
   const link = target.querySelector('.p-accordion-header-link');
   const wasExpanded = link?.getAttribute('aria-expanded') === 'true';
   if (!wasExpanded && link) {
@@ -416,59 +419,52 @@ const statusAcc = await page.evaluate(() => {
 console.log('Status accordion:', JSON.stringify(statusAcc));
 await new Promise(r => setTimeout(r, 500));
 
-// 2) Atidarom Status MultiSelect'ą
-const openedMs = await page.evaluate(() => {
-  const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
-  const target =
-    tabs.find(t => /status/i.test(t.id || '')) ||
-    tabs.find(t => {
-      const link = t.querySelector('.p-accordion-header-link');
-      return /\bstatus\b/i.test(((link?.textContent) || '').trim());
+// 2) Paspaudžiam "Open for offers" ir "No time limit" checkbox'us
+const statusesToPick = ['Open for offers', 'No time limit'];
+const statusResults = [];
+
+for (const wanted of statusesToPick) {
+  const res = await page.evaluate((name) => {
+    const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+    const target = tabs.find(t => /tender_status/i.test(t.id || ''));
+    if (!target) return { ok: false, reason: 'status accordion not found' };
+
+    const labels = Array.from(target.querySelectorAll('.p-checkbox-label'));
+
+    // match: tikslus, prasideda vardu + tarpas/(, arba "Open for offer" be s
+    const label = labels.find(l => {
+      const t = (l.textContent || '').trim();
+      return t === name ||
+             t.startsWith(name + ' ') ||
+             t.startsWith(name + '(') ||
+             (name === 'Open for offers' && t.startsWith('Open for offer'));
     });
-  if (!target) return { ok: false, reason: 'status tab not found' };
 
-  const ms = target.querySelector('.p-multiselect');
-  if (!ms) {
-    const innerClasses = Array.from(target.querySelectorAll('[class]'))
-      .map(e => (typeof e.className === 'string' ? e.className : '').slice(0, 80))
-      .filter(c => c.startsWith('p-'))
-      .slice(0, 15);
-    return { ok: false, reason: 'no multiselect in status tab', innerClasses };
-  }
+    if (!label) {
+      const available = labels.map(l => (l.textContent || '').trim()).filter(Boolean);
+      return { ok: false, reason: `${name} label not found`, available };
+    }
 
-  ms.scrollIntoView({ block: 'center' });
-  ms.click();
-  return { ok: true };
-});
-console.log('Opened status multiselect:', JSON.stringify(openedMs));
+    const wrapper = label.closest('.p-checkbox-wrapper') || label.parentElement;
+    const box =
+      wrapper?.querySelector('.p-checkbox-box') ||
+      wrapper?.querySelector('.p-checkbox') ||
+      wrapper;
+    if (!box) return { ok: false, reason: 'checkbox box not found' };
 
-await page.waitForSelector('li.p-multiselect-item', { timeout: 5000 }).catch(() => {
-  console.log('WARN: multiselect items did not appear in 5s');
-});
-await new Promise(r => setTimeout(r, 300));
+    box.scrollIntoView({ block: 'center' });
+    box.click();
+    return { ok: true };
+  }, wanted);
 
-// 3) Paspaudžiam "Open for offers" opciją
-const statusPicked = await page.evaluate(() => {
-  const items = Array.from(document.querySelectorAll('li.p-multiselect-item'));
-  const item = items.find(li => {
-    const span = li.querySelector('span');
-    return span && (span.textContent || '').trim().startsWith('Open for offers');
-  });
-  if (!item) {
-    const available = items
-      .map(li => (li.querySelector('span')?.textContent || '').trim())
-      .filter(Boolean);
-    return { ok: false, reason: 'option not found', available };
-  }
-  const box = item.querySelector('.p-checkbox-box') || item;
-  box.scrollIntoView({ block: 'center' });
-  box.click();
-  return { ok: true };
-});
-console.log('Selected status "Open for offers":', JSON.stringify(statusPicked));
+  console.log(`Selected status "${wanted}":`, JSON.stringify(res));
+  statusResults.push({ name: wanted, ...res });
 
-// Uždarom dropdown'ą
-await page.keyboard.press('Escape').catch(() => {});
+  // trumpa pauzė tarp paspaudimų, kad DOM stabilizuotųsi
+  await new Promise(r => setTimeout(r, 250));
+}
+
+
 await browser.close()
 return res.status(200).json({ ok: true });
 
