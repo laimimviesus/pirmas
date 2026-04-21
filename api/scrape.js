@@ -20,7 +20,7 @@ page.setDefaultTimeout(120000);
 
     // ---- LOGIN (2-step) ----
     await page.goto('https://app.mercell.com/', { 
-       waitUntil: 'documentloaded',
+       waitUntil: 'domcontentloaded',
        timeour: 120000,
      });
 
