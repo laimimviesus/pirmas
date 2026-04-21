@@ -73,18 +73,11 @@ if (signInBtn) {
   if (!clicked) throw new Error('Sign-in button not found on password step');
 }
 
-
-// laukiam, kol atsiras kažkas “po login”
-await Promise.race([
-  page.waitForSelector('a[href*="explore"]', { timeout: 60000 }),
-  page.waitForSelector('[data-testid="user-menu"]', { timeout: 60000 }),
-]);
-
-// laukiam, kol atsiras kažkas “po login”
-await Promise.race([
-  page.waitForSelector('a[href*="explore"]', { timeout: 60000 }),
-  page.waitForSelector('[data-testid="user-menu"]', { timeout: 60000 }),
-]);
+// laikina post-login patikra: laukiam, kol išeis iš /auth/login
+await page.waitForFunction(
+  () => !location.pathname.includes('/auth/login'),
+  { timeout: 60000 }
+);
 
 await signInBtn.click();
 
@@ -93,7 +86,17 @@ await signInBtn.click();
     return res.status(200).json({ ok: true });
   } catch (e) {
     const debug = { errorMessage: e?.message || String(e) };
-
+try {
+  if (page) {
+    debug.url = page.url();
+    const html = await page.content();
+    debug.htmlSnippet = html.slice(0, 12000);
+    const screenshot = await page.screenshot({ type: 'png', fullPage: true });
+    debug.screenshotBase64 = screenshot.toString('base64');
+  }
+} catch (dbgErr) {
+  debug.debugCaptureError = dbgErr?.message || String(dbgErr);
+}
     try {
       if (page) {
         const screenshot = await page.screenshot({ type: 'png', fullPage: false });
