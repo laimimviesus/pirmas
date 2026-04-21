@@ -23,22 +23,65 @@ module.exports = async (req, res) => {
     try {
   await page.goto('https://app.mercell.com/', { waitUntil: 'networkidle' });
 
-  // užpildom el. pašto lauką pagal id="email"
+  // STEP 1: email page
+  await page.waitForSelector('#email', { timeout: 15000 });
   await page.fill('#email', process.env.MERCELL_USERNAME);
 
-  // slaptažodžio lauką – kol kas per type="password"
-  await page.fill('input[type="password"]', process.env.MERCELL_PASSWORD);
+  // click continue/next (try a few common variants)
+  const continueBtn =
+    (await page.$('button:has-text("Continue")')) ||
+    (await page.$('button:has-text("Next")')) ||
+    (await page.$('button[type="submit"]'));
 
-  // login mygtukas – kol kas per type="submit"
-  await page.click('button[type="submit"]');
+  if (!continueBtn) throw new Error('Continue/Next button not found after entering email');
+  await continueBtn.click();
 
-  await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 });
+  // STEP 2: password page (your selector)
+  await page.waitForSelector('input[name="password"][type="password"]', { timeout: 15000 });
+  await page.fill('input[name="password"][type="password"]', process.env.MERCELL_PASSWORD);
+
+  const signInBtn =
+    (await page.$('button:has-text("Sign in")')) ||
+    (await page.$('button:has-text("Log in")')) ||
+    (await page.$('button:has-text("Login")')) ||
+    (await page.$('button[type="submit"]'));
+
+  if (!signInBtn) throw new Error('Sign-in button not found on password step');
+
+  await Promise.all([
+    signInBtn.click(),
+    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => null),
+  ]);
+
+  // post-login check (adjust later if needed)
+  const loggedIn =
+    (await page.$('text=Explore')) ||
+    (await page.$('a[href*="explore"]')) ||
+    (await page.$('[data-testid="user-menu"]'));
+
+  if (!loggedIn) {
+    throw new Error('Login appears unsuccessful — no post-login selector found');
+  }
 } catch (e) {
-  summary.errors.push('Mercell login failed: ' + e.message);
+  try {
+    const screenshot = await page.screenshot({ type: 'png', fullPage: false });
+    const screenshotBase64 = screenshot.toString('base64');
+    const html = await page.content();
+
+    summary.errors.push('Mercell login failed: ' + e.message);
+    summary.debug = {
+      screenshotBase64,
+      htmlSnippet: html.slice(0, 2000),
+    };
+  } catch (dbgErr) {
+    summary.errors.push('Mercell login failed and debug capture failed: ' + dbgErr.message);
+  }
+
   await browser.close();
   await sendReportEmail(summary);
-  return res.status(500).json({ ok: false, error: 'Login failed' });
+  return res.status(500).json({ ok: false, error: 'Login failed', debug: summary.debug || null });
 }
+
 
 
     // 2. TODO: Perėjimas į „Explore“ ir filtrų pritaikymas
