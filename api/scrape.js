@@ -138,7 +138,22 @@ await page.waitForFunction(() => {
          !pub.classList.contains('p-disabled');
 }, { timeout: 30000 });
 // c) atidarom Location dropdown
+// sąrašas šalių
+const countries = [
+  'Norway', 'Denmark', 'Sweden', 'Finland', 'The Netherlands',
+  'Austria', 'Belgium', 'Estonia', 'France', 'Germany',
+  'Liechtenstein', 'Luxembourg', 'Portugal', 'Spain',
+  'Switzerland', 'United Kingdom',
+];
+
+// atidarom Location dropdown (bet dabar jau be .p-disabled)
 await page.click('div[data-testid="location-dropdown"] .p-treeselect-trigger');
+
+// paprastam variante pabandom tiesiog spausti šalių pavadinimus eilės tvarka
+for (const country of countries) {
+  const ok = await clickButtonContainsText(page, country);
+  console.log('Selected country?', country, ok);
+}
 
 
 
