@@ -1,9 +1,17 @@
 const chromium = require('@sparticuz/chromium');
 const puppeteer = require('puppeteer-core');
-async function $xFirst(page, xpath) {
-  const arr = await page.$x(xpath);
-  return arr[0] || null;
+async function clickButtonContainsText(page, text) {
+  const ok = await page.evaluate((t) => {
+    const buttons = Array.from(document.querySelectorAll('button'));
+    const el = buttons.find(b => (b.textContent || '').trim().includes(t));
+    if (!el) return false;
+    el.click();
+    return true;
+  }, text);
+
+  return ok;
 }
+
 module.exports = async (req, res) => {
   const summary = { errors: [] };
   let browser;
@@ -31,14 +39,18 @@ page.setDefaultTimeout(120000);
 await page.click('#email', { clickCount: 3 });
 await page.type('#email', process.env.MERCELL_USERNAME, { delay: 20 });
 
-    const continueBtn =
-  (await $xFirst(page, `//button[contains(normalize-space(.), "Continue")]`)) ||
-  (await $xFirst(page, `//button[contains(normalize-space(.), "Next")]`)) ||
-  (await page.$('button[type="submit"]'));
-
-    if (!continueBtn) throw new Error('Continue/Next button not found after entering email');
 await Promise.all([
-  continueBtn.click(),
+  (async () => {
+    const clicked =
+      (await clickButtonContainsText(page, 'Continue')) ||
+      (await clickButtonContainsText(page, 'Next'));
+
+    if (!clicked) {
+      const submit = await page.$('button[type="submit"]');
+      if (!submit) throw new Error('Continue/Next button not found after entering email');
+      await submit.click();
+    }
+  })(),
   page.waitForSelector('input[name="password"][type="password"]', { timeout: 60000 }),
 ]);
 
