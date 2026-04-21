@@ -22,6 +22,60 @@ async function clickSpanContainsText(page, text) {
 
   return ok;
 }
+// Pažymi checkbox'ą šalia tree node'o pagal jo pavadinimą.
+// Nespaudžia label'o, kad nesusipainiotų su expand toggler'iu.
+// Jei medis virtualizuotas — pascroll'ina konteinerį, kol elementą suranda.
+async function checkTreeNodeByName(page, name) {
+  return await page.evaluate(async (n) => {
+    const container =
+      document.querySelector('.p-tree-container') ||
+      document.querySelector('.p-tree-wrapper') ||
+      document.querySelector('.p-tree');
+
+    const findLabel = () => {
+      const labels = Array.from(document.querySelectorAll('span.p-treenode-label'));
+      return labels.find(s => {
+        const t = (s.textContent || '').trim();
+        return t === n || t.startsWith(n + ' ') || t.startsWith(n + '(');
+      });
+    };
+
+    let label = findLabel();
+
+    // jei nerado — scroll'inam medį iš viršaus žemyn, kol atsiras
+    if (!label && container) {
+      container.scrollTop = 0;
+      await new Promise(r => setTimeout(r, 80));
+      const max = container.scrollHeight;
+      for (let y = 0; y <= max; y += 120) {
+        container.scrollTop = y;
+        await new Promise(r => setTimeout(r, 60));
+        label = findLabel();
+        if (label) break;
+      }
+    }
+
+    if (!label) return { ok: false, reason: 'label not found' };
+
+    // iš label'io keliaujam į .p-treenode-content ir randam checkbox'ą
+    const content =
+      label.closest('.p-treenode-content') ||
+      label.parentElement;
+    if (!content) return { ok: false, reason: 'content not found' };
+
+    const checkbox =
+      content.querySelector('.p-checkbox-box') ||
+      content.querySelector('[role="checkbox"]') ||
+      content.querySelector('.p-checkbox');
+
+    if (!checkbox) return { ok: false, reason: 'checkbox not found' };
+
+    checkbox.scrollIntoView({ block: 'center' });
+    checkbox.click();
+    return { ok: true };
+  }, name);
+}
+
 
 module.exports = async (req, res) => {
   const summary = { errors: [] };
@@ -173,17 +227,12 @@ console.log('Clicked Location label?', locOk);
 // 3) laukiam, kol atsiras šalių medis
 await page.waitForSelector('span.p-treenode-label', { timeout: 15000 });
 
-// 4) spaudžiam šalis vieną po kitos
+// 4) pažymim šalių checkbox'us (neišskleidžiant sub-regionų)
 for (const country of countries) {
-  const ok = await page.evaluate((c) => {
-    const labels = Array.from(document.querySelectorAll('span.p-treenode-label'));
-    const el = labels.find(span => (span.textContent || '').trim().startsWith(c));
-    if (!el) return false;
-    el.click();
-    return true;
-  }, country);
-
-  console.log('Selected country via tree label?', country, ok);
+  const res = await checkTreeNodeByName(page, country);
+  console.log('Checked country checkbox?', country, JSON.stringify(res));
+  // trumpa pauzė, kad medis suspėtų perrenderinti po kiekvieno pažymėjimo
+  await new Promise(r => setTimeout(r, 250));
 }
 
 
@@ -194,9 +243,6 @@ console.log('Selected opportunity type Contract?', oppClicked);
 // Status: Open for offers (tikslus tekstas gali būti "Open for offers" ar pan.)
 const statusClicked = await clickSpanContainsText(page, 'Open for offers');
 console.log('Selected status Open for offers?', statusClicked);
-
-
-
 
 
 await browser.close()
