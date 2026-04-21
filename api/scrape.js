@@ -1,4 +1,5 @@
-const { chromium } = require('playwright');
+const chromium = require('@sparticuz/chromium');
+const puppeteer = require ('puppeteer-core');
 const { google } = require('googleapis');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
@@ -12,9 +13,13 @@ module.exports = async (req, res) => {
 
   try {
     // 1. Prisijungimas prie Mercell
-    const browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
-
+    const browser = await puppeteer.launch({ 
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+ });
+    
     try {
       await page.goto('https://app.mercell.com/', { waitUntil: 'networkidle' });
       await page.fill('input[type="email"]', process.env.MERCELL_USERNAME);
