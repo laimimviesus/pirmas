@@ -281,6 +281,54 @@ const treeDebug = await page.evaluate(() => {
   return { labelCount: labels.length, labels, scrollables };
 });
 console.log('DEBUG tree snapshot:', JSON.stringify(treeDebug));
+// DEBUG: kas dar yra sidebar panelėje (mygtukai, input'ai, "more/all" tekstai)
+const sidebarDebug = await page.evaluate(() => {
+  const sidebar = document.querySelector('.p-sidebar-content');
+  if (!sidebar) return { error: 'no sidebar' };
+
+  const buttons = Array.from(sidebar.querySelectorAll('button'))
+    .map(b => ({
+      text: (b.textContent || '').trim().slice(0, 100),
+      testid: b.getAttribute('data-testid') || null,
+      cls: (typeof b.className === 'string' ? b.className : '').slice(0, 120),
+      ariaLabel: b.getAttribute('aria-label') || null,
+    }))
+    .slice(0, 40);
+
+  const inputs = Array.from(sidebar.querySelectorAll('input'))
+    .map(i => ({
+      type: i.type,
+      placeholder: i.placeholder || null,
+      name: i.name || null,
+      testid: i.getAttribute('data-testid') || null,
+      ariaLabel: i.getAttribute('aria-label') || null,
+    }));
+
+  // bet kokie elementai su "show more / all / more" tekstu
+  const hintTexts = Array.from(sidebar.querySelectorAll('*'))
+    .filter(el => {
+      const t = (el.textContent || '').trim().toLowerCase();
+      return t.length < 60 &&
+        /(show more|show all|view all|see all|all countries|all locations|more locations|more countries|load more|expand)/i
+          .test(t);
+    })
+    .slice(0, 10)
+    .map(el => ({
+      tag: el.tagName,
+      text: (el.textContent || '').trim(),
+      cls: (typeof el.className === 'string' ? el.className : '').slice(0, 120),
+    }));
+
+  return {
+    buttons,
+    inputs,
+    hintTexts,
+    sidebarHTMLSnippet: sidebar.innerHTML.slice(0, 4000),
+  };
+});
+console.log('DEBUG sidebar contents:', JSON.stringify(sidebarDebug));
+
+
 for (const country of countries) {
   const res = await checkTreeNodeByName(page, country);
   console.log('Checked country checkbox?', country, JSON.stringify(res));
