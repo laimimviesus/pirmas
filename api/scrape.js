@@ -1,6 +1,9 @@
 const chromium = require('@sparticuz/chromium');
 const puppeteer = require('puppeteer-core');
-
+async function $xFirst(page, xpath) {
+  const arr = await page.$x(xpath);
+  return arr[0] || null;
+}
 module.exports = async (req, res) => {
   const summary = { errors: [] };
   let browser;
@@ -25,12 +28,13 @@ page.setDefaultTimeout(120000);
      });
 
     await page.waitForSelector('#email', { timeout: 15000 });
-    await page.fill('#email', process.env.MERCELL_USERNAME);
+await page.click('#email', { clickCount: 3 });
+await page.type('#email', process.env.MERCELL_USERNAME, { delay: 20 });
 
     const continueBtn =
-      (await page.$('button:has-text("Continue")')) ||
-      (await page.$('button:has-text("Next")')) ||
-      (await page.$('button[type="submit"]'));
+  (await $xFirst(page, `//button[contains(normalize-space(.), "Continue")]`)) ||
+  (await $xFirst(page, `//button[contains(normalize-space(.), "Next")]`)) ||
+  (await page.$('button[type="submit"]'));
 
     if (!continueBtn) throw new Error('Continue/Next button not found after entering email');
 await Promise.all([
@@ -39,7 +43,8 @@ await Promise.all([
 ]);
 
     await page.waitForSelector('input[name="password"][type="password"]', { timeout: 15000 });
-    await page.fill('input[name="password"][type="password"]', process.env.MERCELL_PASSWORD);
+await page.click('input[name="password"][type="password"]', { clickCount: 3 });
+await page.type('input[name="password"][type="password"]', process.env.MERCELL_PASSWORD, { delay: 20 });
 
     const signInBtn =
       (await page.$('button:has-text("Sign in")')) ||
@@ -51,10 +56,11 @@ await Promise.all([
 
 
 // laukiam, kol atsiras kažkas “po login”
-await page.waitForSelector(
-  'text=Explore, a[href*="explore"], [data-testid="user-menu"]',
-  { timeout: 60000 }
-);
+await Promise.race([
+  page.waitForSelector('a[href*="explore"]', { timeout: 60000 }),
+  page.waitForSelector('[data-testid="user-menu"]', { timeout: 60000 }),
+  page.waitForXPath(`//*[contains(normalize-space(.), "Explore")]`, { timeout: 60000 }),
+]);
 
 // laukiam, kol atsiras kažkas “po login”
 await page.waitForSelector(
