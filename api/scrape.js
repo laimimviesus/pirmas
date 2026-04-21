@@ -538,6 +538,80 @@ const cpvPickerDebug = await page.evaluate(() => {
   };
 });
 console.log('DEBUG CPV picker:', JSON.stringify(cpvPickerDebug));
+// --- CPV pasirinkimas: IT services 72000000 ---
+
+// Įrašom "72000000" į CPV modal'o paieškos input'ą
+await page.waitForSelector('input[data-testid="cpv-tree-modal-search"]', { timeout: 5000 });
+await page.click('input[data-testid="cpv-tree-modal-search"]', { clickCount: 3 });
+await page.type('input[data-testid="cpv-tree-modal-search"]', '72000000', { delay: 20 });
+await new Promise(r => setTimeout(r, 1000));
+
+// Pažymim 72000000 kategorijos checkbox'ą dialog'e
+const cpvPicked = await page.evaluate(() => {
+  const dialog = document.querySelector('.p-dialog[role="dialog"]');
+  if (!dialog) return { ok: false, reason: 'dialog not found' };
+
+  const candidates = Array.from(dialog.querySelectorAll('li, tr, div, span, label'))
+    .filter(el => {
+      const t = (el.textContent || '').trim();
+      return t.includes('72000000') && t.length < 300;
+    });
+
+  if (candidates.length === 0) {
+    const codes = Array.from(dialog.querySelectorAll('span, li, label'))
+      .map(e => (e.textContent || '').trim())
+      .filter(t => /\d{8}/.test(t))
+      .slice(0, 20);
+    return { ok: false, reason: '72000000 not found after search', visibleCodes: codes };
+  }
+
+  // imam "siauriausią" kandidatą
+  candidates.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
+  const target = candidates[0];
+
+  // randam artimiausią checkbox'ą per tėvus
+  let parent = target;
+  let box = null;
+  for (let i = 0; i < 6 && parent; i++) {
+    box = parent.querySelector?.('.p-checkbox-box, [role="checkbox"]');
+    if (box) break;
+    parent = parent.parentElement;
+  }
+  if (!box) return { ok: false, reason: 'checkbox not found near 72000000' };
+
+  box.scrollIntoView({ block: 'center' });
+  box.click();
+  return { ok: true, targetText: (target.textContent || '').trim().slice(0, 120) };
+});
+console.log('CPV 72000000 picked:', JSON.stringify(cpvPicked));
+await new Promise(r => setTimeout(r, 600));
+
+// Paspaudžiam confirm mygtuką dialog'e (Save / Apply / Done / Add)
+const cpvConfirmed = await page.evaluate(() => {
+  const dialog = document.querySelector('.p-dialog[role="dialog"]');
+  if (!dialog) return { ok: false, reason: 'dialog not found' };
+
+  const buttons = Array.from(dialog.querySelectorAll('button'));
+  const availableLabels = buttons
+    .map(b => ({
+      text: (b.textContent || '').trim(),
+      testid: b.getAttribute('data-testid') || null,
+    }))
+    .filter(x => x.text);
+
+  const btn = buttons.find(b => {
+    const t = (b.textContent || '').trim();
+    return /^(save|apply|done|confirm|ok|add|select|finish|submit|add categor)/i.test(t);
+  });
+
+  if (!btn) return { ok: false, reason: 'confirm button not found', availableLabels };
+
+  const label = (btn.textContent || '').trim();
+  btn.click();
+  return { ok: true, label };
+});
+console.log('CPV confirmed:', JSON.stringify(cpvConfirmed));
+await new Promise(r => setTimeout(r, 1000));
 
 await browser.close()
 return res.status(200).json({ ok: true });
