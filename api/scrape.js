@@ -463,7 +463,81 @@ for (const wanted of statusesToPick) {
   // trumpa pauzė tarp paspaudimų, kad DOM stabilizuotųsi
   await new Promise(r => setTimeout(r, 250));
 }
+// --- CATEGORIES (CPV): IT services 72000000 ---
 
+// 1) Išskleidžiam "Categories (CPV)" accordion'ą
+const cpvAcc = await page.evaluate(() => {
+  const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+  const target = tabs.find(t => /cpv_codes/i.test(t.id || ''));
+  if (!target) return { found: false };
+  const link = target.querySelector('.p-accordion-header-link');
+  const wasExpanded = link?.getAttribute('aria-expanded') === 'true';
+  if (!wasExpanded && link) {
+    link.scrollIntoView({ block: 'center' });
+    link.click();
+  }
+  return { found: true, tabId: target.id, wasExpanded };
+});
+console.log('CPV accordion:', JSON.stringify(cpvAcc));
+await new Promise(r => setTimeout(r, 500));
+
+// 2) Paspaudžiam "Add categories" mygtuką accordion'e
+const clickedAdd = await page.evaluate(() => {
+  const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+  const target = tabs.find(t => /cpv_codes/i.test(t.id || ''));
+  if (!target) return { ok: false, reason: 'CPV tab not found' };
+
+  const buttons = Array.from(target.querySelectorAll('button'));
+  const btn = buttons.find(b => /add\s+categor/i.test((b.textContent || '').trim()));
+  if (!btn) {
+    const available = buttons.map(b => (b.textContent || '').trim()).filter(Boolean);
+    return { ok: false, reason: 'Add categories button not found', available };
+  }
+  btn.scrollIntoView({ block: 'center' });
+  btn.click();
+  return { ok: true };
+});
+console.log('Clicked "Add categories":', JSON.stringify(clickedAdd));
+
+// palaukiam, kad atsidarytų picker'is (dialog / sidebar / overlay)
+await new Promise(r => setTimeout(r, 1500));
+
+// 3) DEBUG: kas atsirado po "Add categories"
+const cpvPickerDebug = await page.evaluate(() => {
+  const dialogs = Array.from(document.querySelectorAll(
+    '[role="dialog"], .p-dialog, .p-sidebar, .p-overlaypanel, [data-pc-name="dialog"]'
+  ));
+  const visible = dialogs.filter(d => {
+    const rect = d.getBoundingClientRect();
+    const cs = getComputedStyle(d);
+    return rect.width > 0 && rect.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  });
+
+  return {
+    dialogCount: visible.length,
+    dialogs: visible.slice(0, 3).map(d => ({
+      tag: d.tagName,
+      cls: (typeof d.className === 'string' ? d.className : '').slice(0, 160),
+      role: d.getAttribute('role'),
+      inputs: Array.from(d.querySelectorAll('input')).slice(0, 10).map(i => ({
+        type: i.type,
+        placeholder: i.placeholder || null,
+        ariaLabel: i.getAttribute('aria-label') || null,
+      })),
+      buttons: Array.from(d.querySelectorAll('button')).slice(0, 15).map(b => ({
+        text: (b.textContent || '').trim().slice(0, 60),
+        testid: b.getAttribute('data-testid') || null,
+      })),
+      // viršutiniai ~20 teksto elementų, kad pamatyti kaip CPV kodai pateikiami
+      texts: Array.from(d.querySelectorAll('span, p, li, label'))
+        .map(e => (e.textContent || '').trim())
+        .filter(t => t && t.length < 120)
+        .slice(0, 25),
+      sample: d.innerHTML.slice(0, 3500),
+    })),
+  };
+});
+console.log('DEBUG CPV picker:', JSON.stringify(cpvPickerDebug));
 
 await browser.close()
 return res.status(200).json({ ok: true });
