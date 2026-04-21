@@ -359,10 +359,67 @@ for (const country of countries) {
 const oppClicked = await clickSpanContainsText(page, 'Contract');
 console.log('Selected opportunity type Contract?', oppClicked);
 
-// Status: Open for offers (tikslus tekstas gali būti "Open for offers" ar pan.)
-const statusClicked = await clickSpanContainsText(page, 'Open for offers');
-console.log('Selected status Open for offers?', statusClicked);
+// --- STATUS (MultiSelect dropdown'as) ---
 
+// 1) Išskleidžiam Status accordion'ą (jei uždarytas)
+const statusAcc = await page.evaluate(() => {
+  const headers = Array.from(document.querySelectorAll('.p-accordion-header-link'));
+  const header = headers.find(h => /^\s*status\s*$/i.test((h.textContent || '').trim()));
+  if (!header) return { found: false };
+  const wasExpanded = header.getAttribute('aria-expanded') === 'true';
+  if (!wasExpanded) header.click();
+  return { found: true, wasExpanded };
+});
+console.log('Status accordion:', JSON.stringify(statusAcc));
+await new Promise(r => setTimeout(r, 400));
+
+// 2) Atidarom Status MultiSelect, kad atsirastų opcijos DOM'e
+const openedMs = await page.evaluate(() => {
+  const headers = Array.from(document.querySelectorAll('.p-accordion-header-link'));
+  const header = headers.find(h => /^\s*status\s*$/i.test((h.textContent || '').trim()));
+  if (!header) return { ok: false, reason: 'status header not found' };
+  const tab = header.closest('.p-accordion-tab');
+  if (!tab) return { ok: false, reason: 'no accordion tab' };
+  const ms = tab.querySelector('.p-multiselect');
+  if (!ms) return { ok: false, reason: 'no multiselect inside status' };
+  ms.scrollIntoView({ block: 'center' });
+  ms.click();
+  return { ok: true };
+});
+console.log('Opened status multiselect:', JSON.stringify(openedMs));
+
+// palaukiam, kol atsiras multiselect opcijos
+await page.waitForSelector('li.p-multiselect-item', { timeout: 5000 }).catch(() => {
+  console.log('WARN: multiselect items did not appear in 5s');
+});
+await new Promise(r => setTimeout(r, 300));
+
+// 3) Paspaudžiam "Open for offers" opciją
+const statusPicked = await page.evaluate(() => {
+  const items = Array.from(document.querySelectorAll('li.p-multiselect-item'));
+  const item = items.find(li => {
+    const span = li.querySelector('span');
+    const t = (span?.textContent || '').trim();
+    return t.startsWith('Open for offers');
+  });
+
+  if (!item) {
+    const available = items
+      .map(li => (li.querySelector('span')?.textContent || '').trim())
+      .filter(Boolean);
+    return { ok: false, reason: 'option not found', available };
+  }
+
+  // PrimeReact'e click ant li arba ant checkbox box'o abu veikia
+  const box = item.querySelector('.p-checkbox-box') || item;
+  box.scrollIntoView({ block: 'center' });
+  box.click();
+  return { ok: true };
+});
+console.log('Selected status "Open for offers":', JSON.stringify(statusPicked));
+
+// 4) Uždarom dropdown'ą paspausdami ESC, kad neliktų atidarytas
+await page.keyboard.press('Escape').catch(() => {});
 
 await browser.close()
 return res.status(200).json({ ok: true });
