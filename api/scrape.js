@@ -164,6 +164,24 @@ for (const country of countries) {
 
   console.log('Selected country via tree label?', country, ok);
 }
+for (const country of countries) {
+  const ok = await page.evaluate((c) => {
+    const labels = Array.from(document.querySelectorAll('span.p-treenode-label'));
+    const el = labels.find(span => (span.textContent || '').trim().startsWith(c));
+    if (!el) return false;
+    el.click();
+    return true;
+  }, country);
+
+  console.log('Selected country via tree label?', country, ok);
+}
+// Opportunity type: Contract
+const oppClicked = await clickSpanContainsText(page, 'Contract');
+console.log('Selected opportunity type Contract?', oppClicked);
+
+// Status: Open for offers (tikslus tekstas gali būti "Open for offers" ar pan.)
+const statusClicked = await clickSpanContainsText(page, 'Open for offers');
+console.log('Selected status Open for offers?', statusClicked);
 
 
 
