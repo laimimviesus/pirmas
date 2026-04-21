@@ -63,16 +63,44 @@ module.exports = async (req, res) => {
     throw new Error('Login appears unsuccessful — no post-login selector found');
   }
 } catch (e) {
-  try {
-    const screenshot = await page.screenshot({ type: 'png', fullPage: false });
-    const screenshotBase64 = screenshot.toString('base64');
-    const html = await page.content();
+  console.error('Mercell login failed:', e);
 
-    summary.errors.push('Mercell login failed: ' + e.message);
-    summary.debug = {
-      screenshotBase64,
-      htmlSnippet: html.slice(0, 2000),
-    };
+  const debug = { errorMessage: e?.message || String(e) };
+
+  // užtikrinam summary struktūrą (jei jos nėra)
+  if (typeof summary !== 'object' || !summary) summary = {};
+  if (!Array.isArray(summary.errors)) summary.errors = [];
+  summary.errors.push('Mercell login failed: ' + debug.errorMessage);
+
+  // bandome paimti screenshot + HTML tik jei yra page
+  if (page) {
+    try {
+      const screenshot = await page.screenshot({ type: 'png', fullPage: false });
+      debug.screenshotBase64 = screenshot.toString('base64');
+    } catch (ssErr) {
+      console.error('Screenshot capture failed:', ssErr);
+      debug.screenshotError = ssErr?.message || String(ssErr);
+    }
+
+    try {
+      const html = await page.content();
+      debug.htmlSnippet = html.slice(0, 4000);
+    } catch (htmlErr) {
+      console.error('HTML capture failed:', htmlErr);
+      debug.htmlError = htmlErr?.message || String(htmlErr);
+    }
+  } else {
+    debug.note = 'page is null/undefined (failure happened before page was created)';
+  }
+
+  summary.debug = debug;
+
+  try { if (browser) await browser.close(); } catch (closeErr) { console.error('Browser close failed:', closeErr); }
+  try { await sendReportEmail(summary); } catch (mailErr) { console.error('sendReportEmail failed:', mailErr); }
+
+  return res.status(500).json({ ok: false, error: 'Login failed', debug });
+}
+
   } catch (dbgErr) {
     summary.errors.push('Mercell login failed and debug capture failed: ' + dbgErr.message);
   }
