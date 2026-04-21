@@ -19,7 +19,7 @@ page.setDefaultNavigationTimeout(120000);
 page.setDefaultTimeout(120000);
 
     // ---- LOGIN (2-step) ----
-    await page.goto('https://app.mercell.com/', { 
+    await page.goto('https://app.mercell.com/auth/login/challenge/password', { 
        waitUntil: 'domcontentloaded',
        timeour: 120000,
      });
