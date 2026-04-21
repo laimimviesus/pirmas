@@ -1,247 +1,78 @@
 const chromium = require('@sparticuz/chromium');
-const puppeteer = require ('puppeteer-core');
-const { google } = require('googleapis');
-const nodemailer = require('nodemailer');
-const crypto = require('crypto');
+const puppeteer = require('puppeteer-core');
 
 module.exports = async (req, res) => {
-  const summary = {
-    newTenders: 0,
-    skipped: 0,
-    errors: [],
-  };
-export default async function handler(req, res) {
+  const summary = { errors: [] };
+  let browser;
+  let page;
+
   try {
-    // 1. Prisijungimas prie Mercell
-    const browser = await puppeteer.launch({ 
+    browser = await puppeteer.launch({
       args: chromium.args,
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
- });
-    
-    try {
-  await page.goto('https://app.mercell.com/', { waitUntil: 'networkidle' });
+    });
 
-  // STEP 1: email page
-  await page.waitForSelector('#email', { timeout: 15000 });
-  await page.fill('#email', process.env.MERCELL_USERNAME);
+    page = await browser.newPage();
 
-  // click continue/next (try a few common variants)
-  const continueBtn =
-    (await page.$('button:has-text("Continue")')) ||
-    (await page.$('button:has-text("Next")')) ||
-    (await page.$('button[type="submit"]'));
+    // ---- LOGIN (2-step) ----
+    await page.goto('https://app.mercell.com/', { waitUntil: 'networkidle' });
 
-  if (!continueBtn) throw new Error('Continue/Next button not found after entering email');
-  await continueBtn.click();
+    await page.waitForSelector('#email', { timeout: 15000 });
+    await page.fill('#email', process.env.MERCELL_USERNAME);
 
-  // STEP 2: password page (your selector)
-  await page.waitForSelector('input[name="password"][type="password"]', { timeout: 15000 });
-  await page.fill('input[name="password"][type="password"]', process.env.MERCELL_PASSWORD);
+    const continueBtn =
+      (await page.$('button:has-text("Continue")')) ||
+      (await page.$('button:has-text("Next")')) ||
+      (await page.$('button[type="submit"]'));
 
-  const signInBtn =
-    (await page.$('button:has-text("Sign in")')) ||
-    (await page.$('button:has-text("Log in")')) ||
-    (await page.$('button:has-text("Login")')) ||
-    (await page.$('button[type="submit"]'));
+    if (!continueBtn) throw new Error('Continue/Next button not found after entering email');
+    await continueBtn.click();
 
-  if (!signInBtn) throw new Error('Sign-in button not found on password step');
+    await page.waitForSelector('input[name="password"][type="password"]', { timeout: 15000 });
+    await page.fill('input[name="password"][type="password"]', process.env.MERCELL_PASSWORD);
 
-  await Promise.all([
-    signInBtn.click(),
-    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => null),
-  ]);
+    const signInBtn =
+      (await page.$('button:has-text("Sign in")')) ||
+      (await page.$('button:has-text("Log in")')) ||
+      (await page.$('button:has-text("Login")')) ||
+      (await page.$('button[type="submit"]'));
 
-  // post-login check (adjust later if needed)
-  const loggedIn =
-    (await page.$('text=Explore')) ||
-    (await page.$('a[href*="explore"]')) ||
-    (await page.$('[data-testid="user-menu"]'));
+    if (!signInBtn) throw new Error('Sign-in button not found on password step');
 
-  if (!loggedIn) {
-    throw new Error('Login appears unsuccessful — no post-login selector found');
-  }
-} catch (e) {
-  console.error('Mercell login failed:', e);
-  return res.status(500).json({ ok: false, error: e?.message || String(e) });
- }
-}
+    await Promise.all([
+      signInBtn.click(),
+      page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => null),
+    ]);
 
-  const debug = { errorMessage: e?.message || String(e) };
+    const loggedIn =
+      (await page.$('text=Explore')) ||
+      (await page.$('a[href*="explore"]')) ||
+      (await page.$('[data-testid="user-menu"]'));
 
-  // užtikrinam summary struktūrą (jei jos nėra)
-  if (typeof summary !== 'object' || !summary) summary = {};
-  if (!Array.isArray(summary.errors)) summary.errors = [];
-  summary.errors.push('Mercell login failed: ' + debug.errorMessage);
-
-  // bandome paimti screenshot + HTML tik jei yra page
-  if (page) {
-    try {
-      const screenshot = await page.screenshot({ type: 'png', fullPage: false });
-      debug.screenshotBase64 = screenshot.toString('base64');
-    } catch (ssErr) {
-      console.error('Screenshot capture failed:', ssErr);
-      debug.screenshotError = ssErr?.message || String(ssErr);
-    }
-
-    try {
-      const html = await page.content();
-      debug.htmlSnippet = html.slice(0, 4000);
-    } catch (htmlErr) {
-      console.error('HTML capture failed:', htmlErr);
-      debug.htmlError = htmlErr?.message || String(htmlErr);
-    }
-  } else {
-    debug.note = 'page is null/undefined (failure happened before page was created)';
-  }
-
-  summary.debug = debug;
-
-  try { if (browser) await browser.close(); } catch (closeErr) { console.error('Browser close failed:', closeErr); }
-  try { await sendReportEmail(summary); } catch (mailErr) { console.error('sendReportEmail failed:', mailErr); }
-
-  return res.status(500).json({ ok: false, error: 'Login failed', debug });
-}
-
-  } catch (dbgErr) {
-    summary.errors.push('Mercell login failed and debug capture failed: ' + dbgErr.message);
-  }
-
-  await browser.close();
-  await sendReportEmail(summary);
-  return res.status(500).json({ ok: false, error: 'Login failed', debug: summary.debug || null });
-}
-
-
-
-    // 2. TODO: Perėjimas į „Explore“ ir filtrų pritaikymas
-    // await applyFilters(page);
-
-    // 3. TODO: Nuskaityti konkursų sąrašą
-    const tenders = []; // čia vėliau bus realus sąrašas
-
-    // 4. Google Sheets klientas
-    const sheets = await getSheetsClient();
-
-    // 5. Jau esantys ID
-    const existingIds = await getExistingIds(sheets);
-
-    for (const tender of tenders) {
-      try {
-        // 6. TODO: „Go to source“ ir detalės
-        // const detailed = await scrapeTenderDetails(tender);
-
-        const uniqueId = crypto
-          .createHash('sha256')
-          .update(tender.mercellId + '|' + tender.sourceUrl)
-          .digest('hex');
-
-        if (existingIds.has(uniqueId)) {
-          summary.skipped++;
-          continue;
-        }
-
-        // 7. TODO: filtrai (biudžetas, remote, SaaS ir t. t.)
-        // if (!passesFilters(detailed)) { summary.skipped++; continue; }
-
-        // 8. Įrašas į Google Sheets
-        await appendRow(sheets, {
-          uniqueId,
-          // TODO: čia sudėsi visus laukus (title, budget, url ir t. t.)
-        });
-
-        summary.newTenders++;
-      } catch (e) {
-        summary.errors.push('Tender processing error: ' + e.message);
-      }
-    }
+    if (!loggedIn) throw new Error('Login appears unsuccessful — no post-login selector found');
 
     await browser.close();
-
-    // 9. Dienos ataskaita el. paštu
-    await sendReportEmail(summary);
-
-    return res.status(200).json({ ok: true, summary });
+    return res.status(200).json({ ok: true });
   } catch (e) {
-    summary.errors.push('General error: ' + e.message);
-    await sendReportEmail(summary);
-    return res.status(500).json({ ok: false, error: e.message });
+    const debug = { errorMessage: e?.message || String(e) };
+
+    try {
+      if (page) {
+        const screenshot = await page.screenshot({ type: 'png', fullPage: false });
+        debug.screenshotBase64 = screenshot.toString('base64');
+
+        const html = await page.content();
+        debug.htmlSnippet = html.slice(0, 4000);
+      }
+    } catch (dbgErr) {
+      debug.debugCaptureError = dbgErr?.message || String(dbgErr);
+    }
+
+    try { if (browser) await browser.close(); } catch (_) {}
+
+    return res.status(500).json({ ok: false, error: 'Login failed', debug });
   }
 };
-
-// ---- Pagalbinės funkcijos (kol kas paprasti stub’ai, kad viskas veiktų) ----
-
-async function getSheetsClient() {
-  const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
-  const scopes = ['https://www.googleapis.com/auth/spreadsheets'];
-  const jwt = new google.auth.JWT(
-    creds.client_email,
-    null,
-    creds.private_key,
-    scopes
-  );
-  await jwt.authorize();
-  return google.sheets({ version: 'v4', auth: jwt });
-}
-
-async function getExistingIds(sheets) {
-  const sheetId = process.env.GOOGLE_SHEET_ID;
-  const resp = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId,
-    range: 'Tenders!A2:A',
-  });
-  const rows = resp.data.values || [];
-  const set = new Set();
-  for (const row of rows) {
-    if (row[0]) set.add(row[0]);
-  }
-  return set;
-}
-
-async function appendRow(sheets, data) {
-  const sheetId = process.env.GOOGLE_SHEET_ID;
-  const values = [
-    [
-      data.uniqueId || '',
-      // čia vėliau pridėsim likusius stulpelius
-    ],
-  ];
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: sheetId,
-    range: 'Tenders!A2',
-    valueInputOption: 'RAW',
-    requestBody: { values },
-  });
-}
-
-async function sendReportEmail(summary) {
-  const transporter = nodemailer.createTransport({
-    host: process.env.EMAIL_SMTP_HOST,
-    port: Number(process.env.EMAIL_SMTP_PORT),
-    secure: false,
-    auth: {
-      user: process.env.EMAIL_SMTP_USER,
-      pass: process.env.EMAIL_SMTP_PASS,
-    },
-  });
-
-  const text = [
-    `New tenders: ${summary.newTenders}`,
-    `Skipped: ${summary.skipped}`,
-    summary.errors.length ? `Errors:\n- ${summary.errors.join('\n- ')}` : 'No errors.',
-  ].join('\n');
-
-  await transporter.sendMail({
-    from: process.env.EMAIL_SMTP_USER,
-    to: 'monika.bataityte@cornercasetech.com',
-    subject: 'Daily Mercell tender report',
-    text,
-  });
-}
-
-// Šitos funkcijos kol kas tuščios – vėliau pildysim scraping logiką
-async function applyFilters(page) {}
-async function scrapeTenderDetails(tender) {}
-function passesFilters(detailed) { return true; }
 
