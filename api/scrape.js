@@ -99,17 +99,6 @@ await Promise.race([
   ),
 
   // 3) atsiranda blokavimo/captcha tekstas (jei Mercell taip rodo)
-  page.waitForFunction(
-    () => /captcha|robot|blocked|challenge/i.test(document.body.innerText),
-    { timeout: 120000 }
-  ),
-]);
-
-const stillOnLogin = page.url().includes('/auth/login');
-if (stillOnLogin) {
-  throw new Error('Still on login page after submit (credentials error / captcha / SSO)');
-}
-
 
 await Promise.race([
   page.waitForFunction(() => !location.pathname.includes('/auth/login'), { timeout: 120000 }),
