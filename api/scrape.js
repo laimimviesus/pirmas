@@ -361,34 +361,87 @@ console.log('Selected opportunity type Contract?', oppClicked);
 
 // --- STATUS (MultiSelect dropdown'as) ---
 
-// 1) Išskleidžiam Status accordion'ą (jei uždarytas)
+// --- STATUS (MultiSelect dropdown'as) ---
+
+// Palaukiam po Contract, kad sidebar'as stabilizuotųsi
+await new Promise(r => setTimeout(r, 800));
+
+// Scroll'inam sidebar'ą iki apačios – priverčiam visus accordion tab'us į DOM'ą
+await page.evaluate(async () => {
+  const sidebar = document.querySelector('.p-sidebar-content');
+  if (!sidebar) return;
+  for (let y = 0; y <= sidebar.scrollHeight + 1000; y += 200) {
+    sidebar.scrollTop = y;
+    sidebar.dispatchEvent(new Event('scroll', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 60));
+  }
+  sidebar.scrollTop = 0;
+});
+
+// DEBUG: parodo VISUS accordion tabs (id, tekstas, ar išplėsti)
+const allAcc = await page.evaluate(() => {
+  const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+  return tabs.map(t => {
+    const link = t.querySelector('.p-accordion-header-link');
+    return {
+      id: t.id || null,
+      text: link ? (link.textContent || '').trim().slice(0, 80) : null,
+      expanded: link?.getAttribute('aria-expanded') || null,
+    };
+  });
+});
+console.log('DEBUG all accordion tabs:', JSON.stringify(allAcc));
+
+// 1) Išskleidžiam Status accordion'ą (lankstus ieškojimas per id arba tekstą)
 const statusAcc = await page.evaluate(() => {
-  const headers = Array.from(document.querySelectorAll('.p-accordion-header-link'));
-  const header = headers.find(h => /^\s*status\s*$/i.test((h.textContent || '').trim()));
-  if (!header) return { found: false };
-  const wasExpanded = header.getAttribute('aria-expanded') === 'true';
-  if (!wasExpanded) header.click();
-  return { found: true, wasExpanded };
+  const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+  let target = tabs.find(t => /status/i.test(t.id || ''));
+  if (!target) {
+    target = tabs.find(t => {
+      const link = t.querySelector('.p-accordion-header-link');
+      const text = link ? (link.textContent || '').trim() : '';
+      return /\bstatus\b/i.test(text);
+    });
+  }
+  if (!target) return { found: false };
+
+  const link = target.querySelector('.p-accordion-header-link');
+  const wasExpanded = link?.getAttribute('aria-expanded') === 'true';
+  if (!wasExpanded && link) {
+    link.scrollIntoView({ block: 'center' });
+    link.click();
+  }
+  return { found: true, tabId: target.id, wasExpanded };
 });
 console.log('Status accordion:', JSON.stringify(statusAcc));
-await new Promise(r => setTimeout(r, 400));
+await new Promise(r => setTimeout(r, 500));
 
-// 2) Atidarom Status MultiSelect, kad atsirastų opcijos DOM'e
+// 2) Atidarom Status MultiSelect'ą
 const openedMs = await page.evaluate(() => {
-  const headers = Array.from(document.querySelectorAll('.p-accordion-header-link'));
-  const header = headers.find(h => /^\s*status\s*$/i.test((h.textContent || '').trim()));
-  if (!header) return { ok: false, reason: 'status header not found' };
-  const tab = header.closest('.p-accordion-tab');
-  if (!tab) return { ok: false, reason: 'no accordion tab' };
-  const ms = tab.querySelector('.p-multiselect');
-  if (!ms) return { ok: false, reason: 'no multiselect inside status' };
+  const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+  const target =
+    tabs.find(t => /status/i.test(t.id || '')) ||
+    tabs.find(t => {
+      const link = t.querySelector('.p-accordion-header-link');
+      return /\bstatus\b/i.test(((link?.textContent) || '').trim());
+    });
+  if (!target) return { ok: false, reason: 'status tab not found' };
+
+  const ms = target.querySelector('.p-multiselect');
+  if (!ms) {
+    const innerClasses = Array.from(target.querySelectorAll('[class]'))
+      .map(e => (typeof e.className === 'string' ? e.className : '').slice(0, 80))
+      .filter(c => c.startsWith('p-'))
+      .slice(0, 15);
+    return { ok: false, reason: 'no multiselect in status tab', innerClasses };
+  }
+
   ms.scrollIntoView({ block: 'center' });
   ms.click();
   return { ok: true };
 });
 console.log('Opened status multiselect:', JSON.stringify(openedMs));
 
-// palaukiam, kol atsiras multiselect opcijos
 await page.waitForSelector('li.p-multiselect-item', { timeout: 5000 }).catch(() => {
   console.log('WARN: multiselect items did not appear in 5s');
 });
@@ -399,18 +452,14 @@ const statusPicked = await page.evaluate(() => {
   const items = Array.from(document.querySelectorAll('li.p-multiselect-item'));
   const item = items.find(li => {
     const span = li.querySelector('span');
-    const t = (span?.textContent || '').trim();
-    return t.startsWith('Open for offers');
+    return span && (span.textContent || '').trim().startsWith('Open for offers');
   });
-
   if (!item) {
     const available = items
       .map(li => (li.querySelector('span')?.textContent || '').trim())
       .filter(Boolean);
     return { ok: false, reason: 'option not found', available };
   }
-
-  // PrimeReact'e click ant li arba ant checkbox box'o abu veikia
   const box = item.querySelector('.p-checkbox-box') || item;
   box.scrollIntoView({ block: 'center' });
   box.click();
@@ -418,9 +467,8 @@ const statusPicked = await page.evaluate(() => {
 });
 console.log('Selected status "Open for offers":', JSON.stringify(statusPicked));
 
-// 4) Uždarom dropdown'ą paspausdami ESC, kad neliktų atidarytas
+// Uždarom dropdown'ą
 await page.keyboard.press('Escape').catch(() => {});
-
 await browser.close()
 return res.status(200).json({ ok: true });
 
