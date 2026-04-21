@@ -21,17 +21,25 @@ module.exports = async (req, res) => {
  });
     
     try {
-      await page.goto('https://app.mercell.com/', { waitUntil: 'networkidle' });
-      await page.fill('input[type="email"]', process.env.MERCELL_USERNAME);
-      await page.fill('input[type="password"]', process.env.MERCELL_PASSWORD);
-      await page.click('button[type="submit"]');
-      await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 });
-    } catch (e) {
-      summary.errors.push('Mercell login failed: ' + e.message);
-      await browser.close();
-      await sendReportEmail(summary);
-      return res.status(500).json({ ok: false, error: 'Login failed' });
-    }
+  await page.goto('https://app.mercell.com/', { waitUntil: 'networkidle' });
+
+  // užpildom el. pašto lauką pagal id="email"
+  await page.fill('#email', process.env.MERCELL_USERNAME);
+
+  // slaptažodžio lauką – kol kas per type="password"
+  await page.fill('input[type="password"]', process.env.MERCELL_PASSWORD);
+
+  // login mygtukas – kol kas per type="submit"
+  await page.click('button[type="submit"]');
+
+  await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 });
+} catch (e) {
+  summary.errors.push('Mercell login failed: ' + e.message);
+  await browser.close();
+  await sendReportEmail(summary);
+  return res.status(500).json({ ok: false, error: 'Login failed' });
+}
+
 
     // 2. TODO: Perėjimas į „Explore“ ir filtrų pritaikymas
     // await applyFilters(page);
