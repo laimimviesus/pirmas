@@ -78,14 +78,14 @@ if (signInBtn) {
 await Promise.race([
   page.waitForSelector('a[href*="explore"]', { timeout: 60000 }),
   page.waitForSelector('[data-testid="user-menu"]', { timeout: 60000 }),
-  page.waitForXPath(`//*[contains(normalize-space(.), "Explore")]`, { timeout: 60000 }),
 ]);
 
 // laukiam, kol atsiras kažkas “po login”
-await page.waitForSelector(
-  'text=Explore, a[href*="explore"], [data-testid="user-menu"]',
-  { timeout: 60000 }
-);
+await Promise.race([
+  page.waitForSelector('a[href*="explore"]', { timeout: 60000 }),
+  page.waitForSelector('[data-testid="user-menu"]', { timeout: 60000 }),
+]);
+
 await signInBtn.click();
 
 
