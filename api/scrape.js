@@ -113,7 +113,6 @@ if (stillOnLogin) {
   throw new Error('Still on login page after submit (credentials error / captcha / SSO)');
 }
 
-    await browser.close();
     await page.goto('https://app.mercell.com/tender/explore', {
   waitUntil: 'networkidle0',
   timeout: 120000,
@@ -141,21 +140,33 @@ await page.waitForFunction(() => {
 // c) atidarom Location dropdown
 await page.click('div[data-testid="location-dropdown"] .p-treeselect-trigger');
 
+
+
+
+
+await browser.close()
 return res.status(200).json({ ok: true });
 
 } catch (e) {
-  const debug = { errorMessage: e?.message || String(e) };
+  const msg = e?.message || String(e);
+  const debug = { errorMessage: msg };
 
+  // jei jau esam dashboard'e ir tik frame atsijungė – laikom kaip sėkmingą login
   try {
     if (page) {
-      debug.url = page.url();
+      const currentUrl = page.url();
+      debug.url = currentUrl;
+
+      if (currentUrl.includes('/dashboard') && msg.includes('detached Frame')) {
+        try { if (browser) await browser.close(); } catch (_) {}
+        return res.status(200).json({ ok: true, note: 'Login ok, frame detached after redirect' });
+      }
+
       debug.path = await page.evaluate(() => location.pathname);
       debug.bodyText = await page.evaluate(
         () => (document.body?.innerText || '').slice(0, 4000)
       );
-
       debug.htmlSnippet = (await page.content()).slice(0, 30000);
-
       const screenshot = await page.screenshot({ type: 'png', fullPage: true });
       debug.screenshotBase64 = screenshot.toString('base64');
     }
