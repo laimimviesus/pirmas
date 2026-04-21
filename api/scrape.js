@@ -17,7 +17,7 @@ module.exports = async (req, res) => {
     page = await browser.newPage();
 
     // ---- LOGIN (2-step) ----
-    await page.goto('https://app.mercell.com/', { waitUntil: 'networkidle' });
+    await page.goto('https://app.mercell.com/', { waitUntil: 'networkidle2' });
 
     await page.waitForSelector('#email', { timeout: 15000 });
     await page.fill('#email', process.env.MERCELL_USERNAME);
@@ -43,7 +43,7 @@ module.exports = async (req, res) => {
 
     await Promise.all([
       signInBtn.click(),
-      page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => null),
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => null),
     ]);
 
     const loggedIn =
