@@ -11,6 +11,17 @@ async function clickButtonContainsText(page, text) {
 
   return ok;
 }
+async function clickSpanContainsText(page, text) {
+  const ok = await page.evaluate((t) => {
+    const spans = Array.from(document.querySelectorAll('span'));
+    const el = spans.find(s => (s.textContent || '').trim().startsWith(t));
+    if (!el) return false;
+    el.click();
+    return true;
+  }, text);
+
+  return ok;
+}
 
 module.exports = async (req, res) => {
   const summary = { errors: [] };
@@ -146,6 +157,11 @@ const countries = [
   'Switzerland', 'United Kingdom',
 ];
 
+// palaukiam, kol Location dropdown apskritai bus DOM’e
+await page.waitForSelector('div[data-testid="location-dropdown"] .p-treeselect-trigger', {
+  timeout: 15000,
+});
+
 // atidarom Location dropdown
 await page.click('div[data-testid="location-dropdown"] .p-treeselect-trigger');
 
@@ -164,17 +180,8 @@ for (const country of countries) {
 
   console.log('Selected country via tree label?', country, ok);
 }
-for (const country of countries) {
-  const ok = await page.evaluate((c) => {
-    const labels = Array.from(document.querySelectorAll('span.p-treenode-label'));
-    const el = labels.find(span => (span.textContent || '').trim().startsWith(c));
-    if (!el) return false;
-    el.click();
-    return true;
-  }, country);
 
-  console.log('Selected country via tree label?', country, ok);
-}
+
 // Opportunity type: Contract
 const oppClicked = await clickSpanContainsText(page, 'Contract');
 console.log('Selected opportunity type Contract?', oppClicked);
