@@ -625,7 +625,7 @@ await new Promise(r => setTimeout(r, 1000));
 // - package.json: "googleapis": "^144.0.0"
 // - viršuje (kartu su kitais require):
 //     const { google } = require('googleapis');
-// - env: GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE.SHEET_ID, (opt.) SHEET_TAB_NAME
+// - env: GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID, (opt.) SHEET_TAB_NAME
 // =====================================================================
 
 // --- SMOKE TEST RIBOS ----------------------------------------------------
@@ -863,8 +863,8 @@ console.log('ENV CHECK:', {
   hasServiceAccountKey: !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY,
   serviceAccountKeyLength: (process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '').length,
   serviceAccountStartsWith: (process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '').slice(0, 30),
-  hasSheetId: !!process.env.GOOGLE.SHEET_ID,
-  sheetIdLength: (process.env.GOOGLE.SHEET_ID || '').length,
+  hasSheetId: !!process.env.GOOGLE_SHEET_ID,
+  sheetIdLength: (process.env.GOOGLE_SHEET_ID || '').length,
   sheetTabName: process.env.SHEET_TAB_NAME || '(not set, will use Sheet1)',
   // visi env var'ai, kurių vardai prasideda GOOGLE / SHEET / MERCELL (be reikšmių, saugumo sumetimais)
   relatedEnvKeys: Object.keys(process.env).filter(k => /^(GOOGLE|SHEET|MERCELL)/i.test(k)),
@@ -877,7 +877,7 @@ if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
     'make sure it is set for Production env, and redeploy.'
   );
 }
-if (!process.env.GOOGLE.SHEET_ID) {
+if (!process.env.GOOGLE_SHEET_ID) {
   throw new Error('SHEET_ID env var is missing.');
 }
 const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
@@ -888,7 +888,7 @@ const jwt = new google.auth.JWT({
 });
 await jwt.authorize();
 const sheets = google.sheets({ version: 'v4', auth: jwt });
-const GOOGLE.SHEET_ID = process.env.GOOGLE.SHEET_ID;
+const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const TAB_NAME = process.env.SHEET_TAB_NAME || 'Sheet1';
 
 const SHEET_HEADERS = [
@@ -914,7 +914,7 @@ const SHEET_HEADERS = [
 let existingIds = new Set();
 try {
   const existing = await sheets.spreadsheets.values.get({
-    spreadsheetId: GOOGLE.SHEET_ID,
+    spreadsheetId: SHEET_ID,
     range: `${TAB_NAME}!A1:P`,
   });
   const rows = existing.data.values || [];
@@ -923,7 +923,7 @@ try {
   if (!hasHeader && rows.length === 0) {
     // tuščias lapas — įrašom header
     await sheets.spreadsheets.values.update({
-      spreadsheetId: GOOGLE.SHEET_ID,
+      spreadsheetId: SHEET_ID,
       range: `${TAB_NAME}!A1`,
       valueInputOption: 'RAW',
       requestBody: { values: [SHEET_HEADERS] },
@@ -1111,7 +1111,7 @@ if (toFetch[0]?.details?.fullTextSnippet) {
 
 if (rows.length > 0) {
   const appendRes = await sheets.spreadsheets.values.append({
-    spreadsheetId: GOOGLE.SHEET_ID,
+    spreadsheetId: SHEET_ID,
     range: `${TAB_NAME}!A:P`,
     valueInputOption: 'RAW',
     insertDataOption: 'INSERT_ROWS',
