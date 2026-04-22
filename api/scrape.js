@@ -625,7 +625,7 @@ await new Promise(r => setTimeout(r, 1000));
 // - package.json: "googleapis": "^144.0.0"
 // - viršuje (kartu su kitais require):
 //     const { google } = require('googleapis');
-// - env: GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID, (opt.) SHEET_TAB_NAME
+// - env: GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE.SHEET_ID, (opt.) SHEET_TAB_NAME
 // =====================================================================
 
 // --- SMOKE TEST RIBOS ----------------------------------------------------
@@ -863,8 +863,8 @@ console.log('ENV CHECK:', {
   hasServiceAccountKey: !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY,
   serviceAccountKeyLength: (process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '').length,
   serviceAccountStartsWith: (process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '').slice(0, 30),
-  hasSheetId: !!process.env.SHEET_ID,
-  sheetIdLength: (process.env.SHEET_ID || '').length,
+  hasSheetId: !!process.env.GOOGLE.SHEET_ID,
+  sheetIdLength: (process.env.GOOGLE.SHEET_ID || '').length,
   sheetTabName: process.env.SHEET_TAB_NAME || '(not set, will use Sheet1)',
   // visi env var'ai, kurių vardai prasideda GOOGLE / SHEET / MERCELL (be reikšmių, saugumo sumetimais)
   relatedEnvKeys: Object.keys(process.env).filter(k => /^(GOOGLE|SHEET|MERCELL)/i.test(k)),
@@ -877,7 +877,7 @@ if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
     'make sure it is set for Production env, and redeploy.'
   );
 }
-if (!process.env.SHEET_ID) {
+if (!process.env.GOOGLE.SHEET_ID) {
   throw new Error('SHEET_ID env var is missing.');
 }
 const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
@@ -888,7 +888,7 @@ const jwt = new google.auth.JWT({
 });
 await jwt.authorize();
 const sheets = google.sheets({ version: 'v4', auth: jwt });
-const SHEET_ID = process.env.SHEET_ID;
+const GOOGLE.SHEET_ID = process.env.GOOGLE.SHEET_ID;
 const TAB_NAME = process.env.SHEET_TAB_NAME || 'Sheet1';
 
 const SHEET_HEADERS = [
@@ -914,7 +914,7 @@ const SHEET_HEADERS = [
 let existingIds = new Set();
 try {
   const existing = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
+    spreadsheetId: GOOGLE.SHEET_ID,
     range: `${TAB_NAME}!A1:P`,
   });
   const rows = existing.data.values || [];
@@ -923,7 +923,7 @@ try {
   if (!hasHeader && rows.length === 0) {
     // tuščias lapas — įrašom header
     await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID,
+      spreadsheetId: GOOGLE.SHEET_ID,
       range: `${TAB_NAME}!A1`,
       valueInputOption: 'RAW',
       requestBody: { values: [SHEET_HEADERS] },
@@ -950,11 +950,56 @@ console.log(`New tenders to fetch details for: ${newTenders.length} (${allTender
 
 // --- 5) DETALĖS — tik naujiems tender'iams, bet ne daugiau nei DETAILS_LIMIT
 
+// =====================================================================
+// 2 PATAISYMAI
+// =====================================================================
+
+// --- PATAISYMAS 1: SHEET_ID → GOOGLE_SHEET_ID -----------------------
+//
+// Raskite jūsų kode VISAS vietas, kur yra `process.env.SHEET_ID`
+// ir pakeiskite į `process.env.GOOGLE_SHEET_ID`.
+//
+// Turi būti 4 vietos:
+//
+// 1) env debug snippet'e:
+//      hasSheetId: !!process.env.GOOGLE_SHEET_ID,                   // <-- pakeisti
+//      sheetIdLength: (process.env.GOOGLE_SHEET_ID || '').length,   // <-- pakeisti
+//
+//    if (!process.env.GOOGLE_SHEET_ID) {                            // <-- pakeisti
+//      throw new Error('GOOGLE_SHEET_ID env var is missing.');
+//    }
+//
+// 2) Google Sheets klientui inicializuoti:
+//      const SHEET_ID = process.env.GOOGLE_SHEET_ID;                // <-- pakeisti
+
+
+// --- PATAISYMAS 2: DETALIŲ GREITINIMAS ------------------------------
+//
+// Raskite `fetchTenderDetails` funkciją ir PAKEISKITE ją šia versija.
+// Pagrindiniai pakeitimai:
+// - `waitUntil: 'networkidle2'` → `'domcontentloaded'` (jau yra)
+// - Sumažinta pauzė nuo 1500ms iki 500ms
+// - Page timeout sumažintas nuo 60s iki 30s
+// - Pridėtas request blocking (nebegrūda paveiksliukų, font'ų, CSS)
+// - Tai mažina puslapio krovimo laiką ~3x
+
 async function fetchTenderDetails(page, tenderUrl) {
   try {
-    await page.goto(tenderUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForSelector('body', { timeout: 10000 });
-    await new Promise(r => setTimeout(r, 1500));
+    // Blokuojam ne-esminius resursus kad greičiau krautųsi
+    await page.setRequestInterception(true);
+    const blockHandler = (req) => {
+      const type = req.resourceType();
+      if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    };
+    page.on('request', blockHandler);
+
+    await page.goto(tenderUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForSelector('body', { timeout: 5000 });
+    await new Promise(r => setTimeout(r, 500));
 
     const details = await page.evaluate(() => {
       const bodyText = (document.body.innerText || '').trim();
@@ -1010,12 +1055,17 @@ async function fetchTenderDetails(page, tenderUrl) {
       };
     });
 
+    // Išjungiam interception kad neprikrautų kitų fetch'ų (detalių funkc. iškviesta cikle)
+    page.off('request', blockHandler);
+    await page.setRequestInterception(false);
+
     return details;
   } catch (e) {
+    // Net jei užlūžta interception — atjungiam, kad ateities fetch'ai veiktų
+    try { await page.setRequestInterception(false); } catch (_) {}
     return { error: e.message || String(e) };
   }
 }
-
 const toFetch = newTenders.slice(0, DETAILS_LIMIT);
 console.log(`Fetching details for ${toFetch.length} tenders...`);
 
@@ -1061,7 +1111,7 @@ if (toFetch[0]?.details?.fullTextSnippet) {
 
 if (rows.length > 0) {
   const appendRes = await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
+    spreadsheetId: GOOGLE.SHEET_ID,
     range: `${TAB_NAME}!A:P`,
     valueInputOption: 'RAW',
     insertDataOption: 'INSERT_ROWS',
