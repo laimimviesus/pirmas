@@ -1,74 +1,64 @@
-name: Mercell Tender Scraper
+name: Mercell Scraper
 
 on:
+  # Rankinis paleidimas per GitHub UI (Actions tab → Run workflow)
   workflow_dispatch:
     inputs:
-      mode:
-        description: 'Run mode (test or run)'
-        required: true
-        default: 'test'
-  schedule:
-    - cron: '0 8 * * *' # Every day at 08:00 UTC
+      test_mode:
+        description: 'Test mode (tik 2 tender\iai jei true, visi jei false)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
-env:
-  NODE_OPTIONS: --no-experimental-fetch
+  # Automatinis paleidimas kasdien 04:00 UTC (07:00 Vilniaus laiku)
+  schedule:
+    - cron: '0 4 * * *'
 
 jobs:
-  build-and-run:
+  scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60   # max 1 valanda - daugiau nei užteks
 
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Use Node.js 18.x
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18
-
-      - name: Cache node modules
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
+          node-version: '20'
+          cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
-      - name: Prepare credentials
-        if: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY != '' }}
+      - name: Install Chromium dependencies
         run: |
-          echo "$GOOGLE_SERVICE_ACCOUNT_KEY" > ./gcloud-service-key.json
-        env:
-          GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+            libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64
 
-      - name: Run scraper (test or run)
+      - name: Run scraper
         env:
           MERCELL_USERNAME: ${{ secrets.MERCELL_USERNAME }}
           MERCELL_PASSWORD: ${{ secrets.MERCELL_PASSWORD }}
           GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          EMAIL_SMTP_HOST: ${{ secrets.EMAIL_SMTP_HOST }}
-          EMAIL_SMTP_PORT: ${{ secrets.EMAIL_SMTP_PORT }}
-          EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
-          EMAIL_SMTP_PASS: ${{ secrets.EMAIL_SMTP_PASS }}
-        run: |
-          MODE="${{ github.event.inputs.mode || 'test' }}"
-          echo "Running scraper in mode: $MODE"
-          if [ "$MODE" = "test" ] then
-            node scripts/scraper.js --test
-          else
-            node scripts/scraper.js
-          fi
+          SHEET_TAB_NAME: ${{ secrets.SHEET_TAB_NAME || 'Sheet1' }}
+          TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+        run: node scripts/scraper.js
 
-      - name: Upload logs (artifact)
-        if: always()
+      - name: Upload logs on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: mercell-scraper-logs
+          name: scraper-logs
           path: |
-            ./scraper-log-*.log
-            ./debug-*.json
+            /tmp/*.log
+            screenshot-*.png
+          retention-days: 7
