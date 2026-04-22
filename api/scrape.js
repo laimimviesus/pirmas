@@ -763,8 +763,34 @@ console.log(`Collected ${allTenders.length} tenders total`);
 console.log('Sample tender from list:', JSON.stringify(allTenders[0], null, 2).slice(0, 1500));
 
 // --- 4) PIRMA PASITIKRINAM Google Sheets ir IŠFILTRUOJAM dublikatus ------
+// =====================================================================
+// ĮTERPTI PRIEŠ eilutę:
+//   const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+// =====================================================================
 
-const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+// --- DEBUG: env vars patikra ---
+console.log('ENV CHECK:', {
+  hasServiceAccountKey: !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY,
+  serviceAccountKeyLength: (process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '').length,
+  serviceAccountStartsWith: (process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '').slice(0, 30),
+  hasSheetId: !!process.env.SHEET_ID,
+  sheetIdLength: (process.env.SHEET_ID || '').length,
+  sheetTabName: process.env.SHEET_TAB_NAME || '(not set, will use Sheet1)',
+  // visi env var'ai, kurių vardai prasideda GOOGLE / SHEET / MERCELL (be reikšmių, saugumo sumetimais)
+  relatedEnvKeys: Object.keys(process.env).filter(k => /^(GOOGLE|SHEET|MERCELL)/i.test(k)),
+});
+
+if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+  throw new Error(
+    'GOOGLE_SERVICE_ACCOUNT_KEY env var is missing. ' +
+    'Check Vercel → Settings → Environment Variables, ' +
+    'make sure it is set for Production env, and redeploy.'
+  );
+}
+if (!process.env.SHEET_ID) {
+  throw new Error('SHEET_ID env var is missing.');
+}
+const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
 const jwt = new google.auth.JWT({
   email: serviceAccount.client_email,
   key: serviceAccount.private_key,
