@@ -20,7 +20,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 60   # max 1 valanda - daugiau nei užteks
+    timeout-minutes: 600   # max 10 valanda - daugiau nei užteks
 
     steps:
       - name: Checkout code
