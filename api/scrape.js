@@ -612,6 +612,435 @@ const cpvConfirmed = await page.evaluate(() => {
 });
 console.log('CPV confirmed:', JSON.stringify(cpvConfirmed));
 await new Promise(r => setTimeout(r, 1000));
+// =====================================================================
+// DALIS 2 — Apply filters + rezultatų nuskaitymas + Google Sheets append
+// ĮTERPTI po: console.log('CPV confirmed:', JSON.stringify(cpvConfirmed));
+//          ir PRIEŠ: await browser.close()
+// =====================================================================
+
+// --- 0) Reikia pridėti priklausomybę (VIRŠUJE, prie puppeteer importų):
+// const { google } = require('googleapis');
+//
+// Ir package.json -> "dependencies": { ..., "googleapis": "^144.0.0" }
+
+// --- 1) APPLY FILTERS ---------------------------------------------------
+// Mercell sidebar'e apačioje yra "Apply filters" / "Apply" / "Show results" mygtukas.
+// Kartais jis yra sticky footer'yje — paieškom pagal tekstą, ne tik selector.
+
+const appliedFilters = await page.evaluate(() => {
+  // pirma bandom rasti sidebar footer
+  const sidebar = document.querySelector('.p-sidebar-content, [role="dialog"], .p-sidebar');
+  const root = sidebar || document;
+
+  const buttons = Array.from(root.querySelectorAll('button'));
+  const btn = buttons.find(b => {
+    const t = (b.textContent || '').trim().toLowerCase();
+    return /^(apply filters|apply|show results|show \d+ results|search)$/i.test(t)
+        || /apply\s+filter/i.test(t)
+        || /show\s+\d+\s+result/i.test(t);
+  });
+
+  if (!btn) {
+    const available = buttons.map(b => (b.textContent || '').trim()).filter(Boolean).slice(0, 30);
+    return { ok: false, reason: 'Apply button not found', available };
+  }
+
+  btn.scrollIntoView({ block: 'center' });
+  btn.click();
+  return { ok: true, label: (btn.textContent || '').trim() };
+});
+console.log('Apply filters:', JSON.stringify(appliedFilters));
+
+if (!appliedFilters.ok) {
+  throw new Error('Could not click Apply filters: ' + JSON.stringify(appliedFilters));
+}
+
+// Palaukiam kol užsidarys sidebar ir atsinaujins rezultatai.
+// Sidebar užsidarius — .p-sidebar-mask dings arba sidebar gaus "exit" klasę.
+await new Promise(r => setTimeout(r, 2500));
+
+// --- 2) DEBUG: paimam rezultatų konteinerio struktūrą -------------------
+// Kad žinotume, kokiais selector'iais paimti korteles.
+const resultsDebug = await page.evaluate(() => {
+  // tipiški PrimeReact / custom variantai:
+  const candidates = [
+    '[data-testid*="tender"]',
+    '[data-testid*="result"]',
+    '[data-testid*="card"]',
+    'a[href*="/tender/"]',
+    'a[href*="/opportunity/"]',
+    'a[href*="/procurement/"]',
+    '.p-datatable-tbody tr',
+    'article',
+  ];
+
+  const counts = {};
+  for (const sel of candidates) {
+    try {
+      counts[sel] = document.querySelectorAll(sel).length;
+    } catch (_) { counts[sel] = -1; }
+  }
+
+  // paieškom bet kokio mygtuko su "next" / puslapio paginacijos
+  const pagButtons = Array.from(document.querySelectorAll('button, a'))
+    .filter(el => {
+      const t = (el.textContent || '').trim().toLowerCase();
+      const al = (el.getAttribute('aria-label') || '').toLowerCase();
+      return /next|page|›|»/i.test(t) || /next page|pagination/i.test(al);
+    })
+    .slice(0, 10)
+    .map(el => ({
+      tag: el.tagName,
+      text: (el.textContent || '').trim().slice(0, 40),
+      aria: el.getAttribute('aria-label') || null,
+      testid: el.getAttribute('data-testid') || null,
+      cls: (typeof el.className === 'string' ? el.className : '').slice(0, 120),
+    }));
+
+  // imam pirmą kortelės kandidatą ir paimam jos HTML pavyzdį
+  const firstLink = document.querySelector('a[href*="/tender/"], a[href*="/opportunity/"], a[href*="/procurement/"]');
+  const firstCard = firstLink ? firstLink.closest('article, li, tr, .p-card, [data-testid]') || firstLink.parentElement : null;
+
+  return {
+    url: location.href,
+    counts,
+    pagButtons,
+    firstCardHTML: firstCard ? firstCard.outerHTML.slice(0, 3000) : null,
+    firstLinkHref: firstLink?.getAttribute('href') || null,
+  };
+});
+console.log('DEBUG results page:', JSON.stringify(resultsDebug));
+
+// --- 3) Pagalbinės funkcijos --------------------------------------------
+
+// ištrauks tekstą pagal label'ą kortelėje/detalių puslapyje (fallback'as, jei struktūra nepastovi)
+async function extractByLabel(page, scopeSelector, labels) {
+  return await page.evaluate((scopeSel, wantedLabels) => {
+    const scope = scopeSel ? document.querySelector(scopeSel) : document;
+    if (!scope) return {};
+    const result = {};
+    const all = Array.from(scope.querySelectorAll('dt, th, label, span, p, div'));
+    for (const wanted of wantedLabels) {
+      const re = new RegExp('^\\s*' + wanted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*:?\\s*$', 'i');
+      const labelEl = all.find(el => re.test((el.textContent || '').trim()) && el.textContent.length < 80);
+      if (!labelEl) { result[wanted] = null; continue; }
+      // value: next sibling / dd / td
+      let val = null;
+      if (labelEl.tagName === 'DT') val = labelEl.nextElementSibling?.textContent;
+      else if (labelEl.tagName === 'TH') val = labelEl.parentElement?.querySelector('td')?.textContent
+                                        || labelEl.nextElementSibling?.textContent;
+      else val = labelEl.nextElementSibling?.textContent
+             || labelEl.parentElement?.nextElementSibling?.textContent;
+      result[wanted] = (val || '').trim() || null;
+    }
+    return result;
+  }, scopeSelector, labels);
+}
+
+// laukia kol paginacijos next taps disabled arba puslapis pasikeis
+async function goToNextPage(page) {
+  // tipiniai paginator variantai PrimeReact: .p-paginator-next
+  const clicked = await page.evaluate(() => {
+    const next =
+      document.querySelector('.p-paginator-next:not(.p-disabled)') ||
+      document.querySelector('button[aria-label="Next Page" i]:not([disabled])') ||
+      document.querySelector('button[aria-label*="next" i]:not([disabled])');
+    if (!next) return false;
+    next.scrollIntoView({ block: 'center' });
+    next.click();
+    return true;
+  });
+  if (!clicked) return false;
+  await new Promise(r => setTimeout(r, 1500)); // palaukiam naujų rezultatų
+  return true;
+}
+
+// --- 4) SURENKAM VISŲ PUSLAPIŲ TENDER'IŲ SĄRAŠĄ ------------------------
+
+const allTenders = [];
+const seenHrefs = new Set();
+const MAX_PAGES = 50;        // safety limit
+const MAX_TENDERS = 500;     // safety limit
+
+for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum++) {
+  // palaukiam kol kortelės atsiras
+  try {
+    await page.waitForFunction(() => {
+      return document.querySelectorAll('a[href*="/tender/"], a[href*="/opportunity/"], a[href*="/procurement/"]').length > 0;
+    }, { timeout: 15000 });
+  } catch (_) {
+    console.log(`Page ${pageNum}: no results found, stopping`);
+    break;
+  }
+
+  const pageTenders = await page.evaluate(() => {
+    const links = Array.from(document.querySelectorAll(
+      'a[href*="/tender/"], a[href*="/opportunity/"], a[href*="/procurement/"]'
+    ));
+    // dedupe pagal href, tik unikalūs per vieną puslapį
+    const byHref = new Map();
+    for (const a of links) {
+      const href = a.getAttribute('href');
+      if (!href || byHref.has(href)) continue;
+      const card = a.closest('article, li, tr, [data-testid]') || a.parentElement;
+      const txt = (card?.innerText || a.innerText || '').trim();
+
+      // pavadinimas = ilgiausia pirma eilutė arba link'o tekstas
+      const title = (a.innerText || '').trim() || (txt.split('\n')[0] || '').trim();
+
+      // deadline: ieškom "DD.MM.YYYY" arba "DD Month YYYY" pattern'o
+      const deadlineMatch = txt.match(/\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{1,2}\s+\w+\s+\d{4})\b[^\n]*\b(?:\d{1,2}:\d{2})?/);
+
+      // šalis — paprastai viena iš: Norway, Sweden, etc. tekste
+      const countryMatch = txt.match(/\b(Norway|Sweden|Denmark|Finland|Netherlands|Austria|Belgium|Estonia|France|Germany|Liechtenstein|Luxembourg|Portugal|Spain|Switzerland|United Kingdom|Ireland|Italy|Poland|Iceland|Lithuania|Latvia|Czech|Slovakia|Hungary|Greece|Romania|Bulgaria|Croatia|Slovenia)\b/i);
+
+      // organizacija — dažnai po title arba prieš šalį. Heuristika:
+      const lines = txt.split('\n').map(s => s.trim()).filter(Boolean);
+      // org = 2-oji eilutė, jei ji nėra data ir nėra šalis ir nėra title
+      let org = null;
+      for (const l of lines.slice(1, 5)) {
+        if (l === title) continue;
+        if (/^\d/.test(l)) continue;
+        if (countryMatch && l === countryMatch[1]) continue;
+        if (l.length > 120) continue;
+        org = l; break;
+      }
+
+      // ref. nr.: "Reference: XYZ" arba patterns
+      const refMatch = txt.match(/(?:Reference|Ref\.?|Reference no\.?|Reference number)[:\s]+([A-Z0-9\-\/_.]+)/i);
+
+      // publikacijos data: "Published" / "Publication" prefix
+      const pubMatch = txt.match(/(?:Published|Publication date)[:\s]+(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{1,2}\s+\w+\s+\d{4})/i);
+
+      byHref.set(href, {
+        href,
+        title,
+        organisation: org,
+        country: countryMatch ? countryMatch[1] : null,
+        deadlineRaw: deadlineMatch ? deadlineMatch[0] : null,
+        referenceNumber: refMatch ? refMatch[1] : null,
+        publicationDate: pubMatch ? pubMatch[1] : null,
+        rawText: txt.slice(0, 800), // debug'ui ir detalių papildymui
+      });
+    }
+    return Array.from(byHref.values());
+  });
+
+  let newOnThisPage = 0;
+  for (const t of pageTenders) {
+    if (seenHrefs.has(t.href)) continue;
+    seenHrefs.add(t.href);
+    // absoliutus URL
+    const url = t.href.startsWith('http') ? t.href : new URL(t.href, 'https://app.mercell.com').toString();
+    allTenders.push({ ...t, url });
+    newOnThisPage++;
+    if (allTenders.length >= MAX_TENDERS) break;
+  }
+  console.log(`Page ${pageNum}: collected ${newOnThisPage} new tenders (total: ${allTenders.length})`);
+
+  if (allTenders.length >= MAX_TENDERS) {
+    console.log('Hit MAX_TENDERS limit, stopping pagination');
+    break;
+  }
+  if (newOnThisPage === 0) {
+    console.log('No new tenders on this page, assuming end of list');
+    break;
+  }
+
+  const hasNext = await goToNextPage(page);
+  if (!hasNext) {
+    console.log('No next page button, pagination finished');
+    break;
+  }
+}
+
+console.log(`TOTAL tenders collected: ${allTenders.length}`);
+
+// --- 5) DETALĖS: įeinam į kiekvieną tender'io puslapį --------------------
+// Šie laukai paprastai NĖRA sąrašo kortelėje:
+//   MAX BUDGET, DURATION, REQUIREMENTS, QUALIFICATION, WEIGHING, SCOPE, TECH STACK
+// Todėl einam į kiekvieno detalės puslapį.
+
+async function fetchTenderDetails(page, tenderUrl) {
+  try {
+    await page.goto(tenderUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForSelector('body', { timeout: 10000 });
+    await new Promise(r => setTimeout(r, 1200)); // hydration
+
+    // Paimam visą matomą tekstą — tada ieškom pattern'ų
+    const details = await page.evaluate(() => {
+      const bodyText = (document.body.innerText || '').trim();
+
+      // utility: ieškom sekcijos pagal antraštę
+      const sectionText = (labels) => {
+        const all = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, dt, th, strong, label'));
+        for (const lab of labels) {
+          const re = new RegExp('^\\s*' + lab + '\\s*:?\\s*$', 'i');
+          const el = all.find(e => re.test((e.textContent || '').trim()) && e.textContent.length < 100);
+          if (!el) continue;
+          // imam sibling arba tėvo sibling
+          let val = el.nextElementSibling?.innerText
+                 || el.parentElement?.nextElementSibling?.innerText
+                 || el.parentElement?.querySelector('dd, td, p, span')?.innerText;
+          if (val && val.trim()) return val.trim();
+        }
+        return null;
+      };
+
+      // budget
+      const budgetMatch = bodyText.match(
+        /(?:estimated value|contract value|maximum value|max(?:imum)? budget|budget|value)[^\n]{0,30}?[:\s]+([€$£]?\s*[\d.,]+(?:\s*(?:EUR|USD|GBP|NOK|SEK|DKK))?)/i
+      );
+
+      // duration: "24 months", "2 years", "Duration: ..."
+      const durationMatch = bodyText.match(
+        /(?:duration|contract period|contract length|agreement duration|term)[^\n]{0,30}?[:\s]+([^\n.]{1,80})/i
+      ) || bodyText.match(/(\d+)\s*(months?|years?|mths?|yrs?)/i);
+
+      // deadline: daugiau tikslus nei list'e
+      const deadlineMatch = bodyText.match(
+        /(?:deadline|closing date|offer deadline|submission deadline|tender deadline)[^\n]{0,30}?[:\s]+([^\n]{1,80})/i
+      );
+
+      // publication
+      const pubMatch = bodyText.match(
+        /(?:published|publication date|date published)[^\n]{0,30}?[:\s]+([^\n]{1,60})/i
+      );
+
+      // reference
+      const refMatch = bodyText.match(
+        /(?:reference(?:\s+number|\s+no\.?)?|ref\.?\s*no\.?)[:\s]+([A-Z0-9\-\/_.]+)/i
+      );
+
+      return {
+        title: document.querySelector('h1')?.innerText?.trim() || null,
+        organisation: sectionText(['buyer', 'contracting authority', 'contracting entity', 'purchaser', 'organisation']),
+        country: sectionText(['country', 'location']),
+        deadline: deadlineMatch ? deadlineMatch[1].trim() : null,
+        publicationDate: pubMatch ? pubMatch[1].trim() : null,
+        referenceNumber: refMatch ? refMatch[1].trim() : null,
+        maxBudget: budgetMatch ? budgetMatch[1].trim() : null,
+        duration: durationMatch ? (durationMatch[1] || `${durationMatch[1]} ${durationMatch[2]}`).trim() : null,
+        requirementsForSupplier: sectionText(['requirements for supplier', 'supplier requirements', 'general requirements', 'requirements']),
+        qualificationRequirements: sectionText(['qualification requirements', 'qualifications', 'eligibility', 'selection criteria']),
+        offerWeighingCriteria: sectionText(['award criteria', 'evaluation criteria', 'weighing criteria', 'offer evaluation', 'criteria for award']),
+        scopeOfAgreement: sectionText(['scope', 'scope of agreement', 'scope of contract', 'description', 'object of the contract', 'subject matter']),
+        technicalStack: sectionText(['technical stack', 'technology', 'technical requirements', 'technologies']),
+        // full text fallback — jei reikės vėliau parse'inti rankiniu budu
+        fullTextSnippet: bodyText.slice(0, 2000),
+      };
+    });
+
+    return details;
+  } catch (e) {
+    return { error: e.message || String(e) };
+  }
+}
+
+// einam į detales — ribojam, kad nelaukus valandos
+const DETAILS_LIMIT = Math.min(allTenders.length, 100);
+console.log(`Fetching details for ${DETAILS_LIMIT} tenders...`);
+
+for (let i = 0; i < DETAILS_LIMIT; i++) {
+  const t = allTenders[i];
+  console.log(`[${i + 1}/${DETAILS_LIMIT}] ${t.url}`);
+  const d = await fetchTenderDetails(page, t.url);
+  allTenders[i].details = d;
+  // trumpa pauzė, kad neprovokuotume rate limit'o
+  await new Promise(r => setTimeout(r, 300));
+}
+
+// --- 6) RAŠOM Į GOOGLE SHEETS ------------------------------------------
+
+// headers tiksliai kaip prašei
+const SHEET_HEADERS = [
+  'DATE OF WHEN ADDED TO THE LIST',
+  'BIDDING ANNOUCEMENT DATE',
+  'LINK TO THE PAGE TENDER WAS PUBLISHED ON',
+  'TENDER NAME',
+  'BIDDING ORGANISATION',
+  'BIDDING DEADLINE DATE',
+  'COUNTRY',
+  'MAX BUDGET EUR without VAT',
+  'DURATION OF AGREEMENT (months)',
+  'REQUIREMENTS FOR SUPPLIER',
+  'QUALIFICATION REQUIREMENTS',
+  'OFFER WEIGHING CRITERIA',
+  'SCOPE OF AGREEMENT',
+  'TECHNICAL STACK',
+  'Source URL',
+  'Reference number',
+];
+
+const nowIso = new Date().toISOString().slice(0, 10);
+
+const rows = allTenders.map(t => {
+  const d = t.details || {};
+  return [
+    nowIso,                                                          // 1. when added
+    d.publicationDate || t.publicationDate || '',                   // 2. announcement
+    t.url,                                                           // 3. link
+    d.title || t.title || '',                                        // 4. name
+    d.organisation || t.organisation || '',                          // 5. org
+    d.deadline || t.deadlineRaw || '',                               // 6. deadline
+    d.country || t.country || '',                                    // 7. country
+    d.maxBudget || '',                                               // 8. budget
+    d.duration || '',                                                // 9. duration
+    d.requirementsForSupplier || '',                                 // 10. requirements
+    d.qualificationRequirements || '',                               // 11. qualif
+    d.offerWeighingCriteria || '',                                   // 12. weighing
+    d.scopeOfAgreement || '',                                        // 13. scope
+    d.technicalStack || '',                                          // 14. tech stack
+    t.url,                                                           // 15. source URL (same as link)
+    d.referenceNumber || t.referenceNumber || '',                    // 16. ref. no.
+  ];
+});
+
+// Google Sheets klientas
+const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+const jwt = new google.auth.JWT({
+  email: serviceAccount.client_email,
+  key: serviceAccount.private_key,
+  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+});
+await jwt.authorize();
+const sheets = google.sheets({ version: 'v4', auth: jwt });
+
+const SHEET_ID = process.env.SHEET_ID;
+const TAB_NAME = process.env.SHEET_TAB_NAME || 'Sheet1';
+
+// 1) užtikrinam, kad header eilutė yra (jei lapas tuščias — įrašom)
+const firstRow = await sheets.spreadsheets.values.get({
+  spreadsheetId: SHEET_ID,
+  range: `${TAB_NAME}!A1:P1`,
+});
+const hasHeader = firstRow.data.values && firstRow.data.values[0] && firstRow.data.values[0].length > 0;
+
+if (!hasHeader) {
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `${TAB_NAME}!A1`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [SHEET_HEADERS] },
+  });
+  console.log('Header row inserted');
+}
+
+// 2) append eilutes
+if (rows.length > 0) {
+  const appendRes = await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `${TAB_NAME}!A:P`,
+    valueInputOption: 'RAW',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values: rows },
+  });
+  console.log(`Appended ${rows.length} rows. Updated range: ${appendRes.data.updates?.updatedRange}`);
+}
+
+summary.tendersCollected = allTenders.length;
+summary.rowsAppended = rows.length;
+
 
 await browser.close()
 return res.status(200).json({ ok: true });
