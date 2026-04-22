@@ -210,17 +210,34 @@ async function fetchTenderDetails(page, tenderUrl) {
   let blockHandler = null;
   try {
     await page.setRequestInterception(true);
-    blockHandler = (req) => {
-      const type = req.resourceType();
-      if (['image', 'media', 'font'].includes(type)) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    };
-    page.on('request', blockHandler);
+blockHandler = (req) => {
+  const type = req.resourceType();
+  if (['image', 'media', 'font'].includes(type)) {
+    req.abort();
+  } else {
+    req.continue();
+  }
+};
+page.on('request', blockHandler);
 
-    await page.goto(tenderUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+// laukiame API atsakymo + DOMContentLoaded, bet su trumpu timeout
+const apiPromise = page
+  .waitForResponse(
+    (res) =>
+      res.url().includes('/api/tender') && // <- ČIA ĮDĖK TIKSLŲ PATH, pvz. '/api/tenders/'
+      res.ok(),
+    { timeout: 10000 }
+  )
+  .catch(() => null);
+
+const navPromise = page.goto(tenderUrl, {
+  waitUntil: 'domcontentloaded',
+  timeout: 15000,
+});
+
+// laukiam, kol įvyks bent vienas iš: navigacija arba API atsakymas
+await Promise.race([apiPromise, navPromise]);
+
 
     await page.waitForFunction(() => {
       const h1 = document.querySelector('h1');
@@ -351,6 +368,11 @@ async function runScraper() {
 
   try {
     const page = await browser.newPage();
+    page.on('response', (res) => {
+  if (res.url().includes('mercell.com') && res.request().resourceType() === 'xhr') {
+    console.log('XHR:', res.url());
+  }
+});
     page.setDefaultNavigationTimeout(120000);
     page.setDefaultTimeout(120000);
 
