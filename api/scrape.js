@@ -978,21 +978,22 @@ console.log(`New tenders to fetch details for: ${newTenders.length} (${allTender
 
 // --- PATAISYMAS 2: DETALIŲ GREITINIMAS ------------------------------
 //
-// Raskite `fetchTenderDetails` funkciją ir PAKEISKITE ją šia versija.
-// Pagrindiniai pakeitimai:
-// - `waitUntil: 'networkidle2'` → `'domcontentloaded'` (jau yra)
-// - Sumažinta pauzė nuo 1500ms iki 500ms
-// - Page timeout sumažintas nuo 60s iki 30s
-// - Pridėtas request blocking (nebegrūda paveiksliukų, font'ų, CSS)
-// - Tai mažina puslapio krovimo laiką ~3x
+// =====================================================================
+// PATAISYMAS: fetchTenderDetails daugiau laiko hidration'ui
+// + laukia kol atsiras pagrindinis content (ne tik body)
+// + jei fullTextSnippet per trumpas — bando dar kartą
+// =====================================================================
+//
+// Pakeiskite visą `fetchTenderDetails` funkciją į šią versiją:
 
 async function fetchTenderDetails(page, tenderUrl) {
+  let blockHandler = null;
   try {
-    // Blokuojam ne-esminius resursus kad greičiau krautųsi
+    // Blokuojam ne-esminius resursus
     await page.setRequestInterception(true);
-    const blockHandler = (req) => {
+    blockHandler = (req) => {
       const type = req.resourceType();
-      if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+      if (['image', 'media', 'font'].includes(type)) {
         req.abort();
       } else {
         req.continue();
@@ -1000,15 +1001,32 @@ async function fetchTenderDetails(page, tenderUrl) {
     };
     page.on('request', blockHandler);
 
-    await page.goto(tenderUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForSelector('body', { timeout: 5000 });
-    await new Promise(r => setTimeout(r, 500));
+    // Einam į puslapį
+    await page.goto(tenderUrl, { waitUntil: 'networkidle2', timeout: 45000 });
+
+    // Laukiam kol atsiras realus tender content (ne tik loading spinner)
+    // Bandysim kelis galimus selector'ius — Mercell gali turėti kelias struktūras
+    await page.waitForFunction(() => {
+      const text = (document.body.innerText || '').trim();
+      // tikrinam ar puslapis jau turi reikšmingo turinio (>500 simbolių)
+      // ir ar tai NE CloudFront/loading screen
+      if (text.length < 500) return false;
+      if (/414 ERROR|CloudFront|Request could not be satisfied/i.test(text)) return false;
+      if (/loading|please wait/i.test(text.slice(0, 200)) && text.length < 1000) return false;
+      // Laukiam kol atsiras h1 arba didelis content
+      return !!document.querySelector('h1') || text.length > 1500;
+    }, { timeout: 20000 }).catch(() => {
+      console.log(`  WARN: content didn't load fully for ${tenderUrl}`);
+    });
+
+    // Papildoma pauzė kad React komponentai spėtų rendertis
+    await new Promise(r => setTimeout(r, 1500));
 
     const details = await page.evaluate(() => {
       const bodyText = (document.body.innerText || '').trim();
 
       const sectionText = (labels) => {
-        const all = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, dt, th, strong, label, div'));
+        const all = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6, dt, th, strong, label, div, span, p'));
         for (const lab of labels) {
           const re = new RegExp('^\\s*' + lab + '\\s*:?\\s*$', 'i');
           const el = all.find(e => {
@@ -1018,57 +1036,87 @@ async function fetchTenderDetails(page, tenderUrl) {
           if (!el) continue;
           const val = el.nextElementSibling?.innerText
                    || el.parentElement?.nextElementSibling?.innerText
-                   || el.parentElement?.querySelector('dd, td, p, span')?.innerText;
-          if (val && val.trim()) return val.trim().slice(0, 2000);
+                   || el.parentElement?.querySelector('dd, td, p, span, div')?.innerText;
+          if (val && val.trim() && val.trim() !== el.textContent.trim()) {
+            return val.trim().slice(0, 2000);
+          }
         }
         return null;
       };
 
       const budgetMatch = bodyText.match(
-        /(?:estimated value|contract value|max(?:imum)?\s*(?:budget|value)|budget|value\s*\(excl)[^\n]{0,40}?[:\s]+([€$£]?\s*[\d.,\s]+(?:\s*(?:EUR|USD|GBP|NOK|SEK|DKK))?)/i
+        /(?:estimated value|contract value|max(?:imum)?\s*(?:budget|value)|total value|budget|value\s*\(excl)[^\n]{0,40}?[:\s]+([€$£]?\s*[\d.,\s]+(?:\s*(?:EUR|USD|GBP|NOK|SEK|DKK))?)/i
       );
       const durationMatch = bodyText.match(
-        /(?:duration|contract\s*period|contract\s*length|agreement\s*duration|term)[^\n]{0,40}?[:\s]+([^\n.]{1,80})/i
-      ) || bodyText.match(/(\d+)\s*(months?|years?)/i);
+        /(?:duration|contract\s*period|contract\s*length|agreement\s*duration|term\s*of\s*contract)[^\n]{0,40}?[:\s]+([^\n.]{1,80})/i
+      ) || bodyText.match(/(\d+)\s*(months?|years?|kk|kuukautta|vuotta)/i);
       const deadlineMatch = bodyText.match(
-        /(?:deadline|closing\s*date|offer\s*deadline|submission\s*deadline|tender\s*deadline)[^\n]{0,40}?[:\s]+([^\n]{1,80})/i
+        /(?:deadline|closing\s*date|offer\s*deadline|submission\s*deadline|tender\s*deadline|määräaika)[^\n]{0,40}?[:\s]+([^\n]{1,80})/i
       );
       const pubMatch = bodyText.match(
-        /(?:published|publication\s*date|date\s*published)[^\n]{0,40}?[:\s]+([^\n]{1,60})/i
+        /(?:published|publication\s*date|date\s*published|julkaistu)[^\n]{0,40}?[:\s]+([^\n]{1,60})/i
       );
       const refMatch = bodyText.match(
-        /(?:reference(?:\s+number|\s+no\.?)?|ref\.?\s*no\.?)[:\s]+([A-Z0-9\-\/_.]+)/i
+        /(?:reference(?:\s+number|\s+no\.?)?|ref\.?\s*no\.?|hankintailmoituksen\s*numero)[:\s]+([A-Z0-9\-\/_.]+)/i
       );
 
       return {
-        title: document.querySelector('h1')?.innerText?.trim() || null,
-        organisation: sectionText(['buyer', 'contracting authority', 'contracting entity', 'purchaser', 'organisation']),
-        country: sectionText(['country', 'location']),
+        title: document.querySelector('h1')?.innerText?.trim()
+            || document.querySelector('[data-testid*="title"]')?.innerText?.trim()
+            || null,
+        organisation: sectionText([
+          'buyer', 'contracting authority', 'contracting entity', 'purchaser', 'organisation',
+          'hankintayksikkö', 'tilaaja', 'awarding authority'
+        ]),
+        country: sectionText(['country', 'location', 'maa', 'sijainti']),
         deadline: deadlineMatch ? deadlineMatch[1].trim() : null,
         publicationDate: pubMatch ? pubMatch[1].trim() : null,
         referenceNumber: refMatch ? refMatch[1].trim() : null,
         maxBudget: budgetMatch ? budgetMatch[1].trim() : null,
         duration: durationMatch ? (durationMatch[1] + (durationMatch[2] ? ' ' + durationMatch[2] : '')).trim() : null,
-        requirementsForSupplier: sectionText(['requirements for supplier', 'supplier requirements', 'requirements']),
-        qualificationRequirements: sectionText(['qualification requirements', 'qualifications', 'eligibility', 'selection criteria']),
-        offerWeighingCriteria: sectionText(['award criteria', 'evaluation criteria', 'weighing criteria', 'criteria for award']),
-        scopeOfAgreement: sectionText(['scope', 'scope of agreement', 'description', 'object of the contract', 'subject matter']),
-        technicalStack: sectionText(['technical stack', 'technology', 'technical requirements']),
-        fullTextSnippet: bodyText.slice(0, 2000),
+        requirementsForSupplier: sectionText([
+          'requirements for supplier', 'supplier requirements', 'requirements',
+          'vaatimukset', 'tarjoajan vaatimukset'
+        ]),
+        qualificationRequirements: sectionText([
+          'qualification requirements', 'qualifications', 'eligibility', 'selection criteria',
+          'soveltuvuusvaatimukset'
+        ]),
+        offerWeighingCriteria: sectionText([
+          'award criteria', 'evaluation criteria', 'weighing criteria', 'criteria for award',
+          'valintaperusteet', 'vertailuperusteet'
+        ]),
+        scopeOfAgreement: sectionText([
+          'scope', 'scope of agreement', 'description', 'object of the contract', 'subject matter',
+          'hankinnan kohde', 'kuvaus', 'laajuus'
+        ]),
+        technicalStack: sectionText([
+          'technical stack', 'technology', 'technical requirements', 'technologies',
+          'tekniset vaatimukset'
+        ]),
+        fullTextSnippet: bodyText.slice(0, 3000),
+        // DEBUG: kokie antraščių variantai yra puslapyje
+        headingsDebug: Array.from(document.querySelectorAll('h1, h2, h3, h4, strong, dt, label'))
+          .map(h => (h.textContent || '').trim())
+          .filter(t => t && t.length < 80 && t.length > 2)
+          .slice(0, 30),
       };
     });
 
-    // Išjungiam interception kad neprikrautų kitų fetch'ų (detalių funkc. iškviesta cikle)
     page.off('request', blockHandler);
     await page.setRequestInterception(false);
-
     return details;
+
   } catch (e) {
-    // Net jei užlūžta interception — atjungiam, kad ateities fetch'ai veiktų
-    try { await page.setRequestInterception(false); } catch (_) {}
+    try {
+      if (blockHandler) page.off('request', blockHandler);
+      await page.setRequestInterception(false);
+    } catch (_) {}
     return { error: e.message || String(e) };
   }
 }
+
+
 
 // =====================================================================
 // 2 PATAISYMAI (clean URL + CloudFront retry)
