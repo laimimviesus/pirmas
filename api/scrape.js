@@ -992,20 +992,7 @@ console.log(`New tenders to fetch details for: ${newTenders.length} (${allTender
 // =====================================================================
 
 // --- PATAISYMAS 1: SMOKE TEST RIBOS sumažinam iki 2 -------------------
-// Raskite savo kode:
-//   const MAX_TENDERS = TEST_MODE ? 5 : 500;
-//   const DETAILS_LIMIT = TEST_MODE ? 5 : 200;
-//
-// Pakeiskite į:
 
-const TEST_MODE = true;
-const MAX_PAGES = TEST_MODE ? 1 : 50;
-const MAX_TENDERS = TEST_MODE ? 2 : 500;
-const DETAILS_LIMIT = TEST_MODE ? 2 : 200;
-
-
-// --- PATAISYMAS 2: greitesnė fetchTenderDetails ----------------------
-// Pakeiskite VISĄ fetchTenderDetails funkciją į šią versiją:
 
 async function fetchTenderDetails(page, tenderUrl) {
   let blockHandler = null;
