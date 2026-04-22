@@ -634,6 +634,13 @@ const MAX_PAGES = TEST_MODE ? 1 : 50;
 const MAX_TENDERS = TEST_MODE ? 5 : 500;
 const DETAILS_LIMIT = TEST_MODE ? 5 : 200;
 
+// =====================================================================
+// PATAISYTAS FRAGMENTAS: Apply filters + patikimesnis laukimas
+//
+// Šis fragmentas PAKEIČIA pirmą dalį smoketest kodo — konkrečiai
+// nuo "// --- 1) APPLY FILTERS" iki "--- 2) PAGALBINĖS FUNKCIJOS"
+// =====================================================================
+
 // --- 1) APPLY FILTERS ----------------------------------------------------
 const appliedFilters = await page.evaluate(() => {
   const sidebar = document.querySelector('.p-sidebar-content, [role="dialog"], .p-sidebar');
@@ -658,12 +665,95 @@ if (!appliedFilters.ok) {
   throw new Error('Could not click Apply filters: ' + JSON.stringify(appliedFilters));
 }
 
-// laukiam kol rezultatai persifiltruos ir sidebar užsidarys
+// --- 1b) PATIKIMAS LAUKIMAS, KOL REZULTATAI ATSIRAS ---------------------
+// Pirma laukiam kol sidebar užsidarys (jei vis dar atidarytas)
 await page.waitForFunction(() => {
-  return document.querySelectorAll('[data-testid="tender-name"]').length > 0;
-}, { timeout: 20000 }).catch(() => console.log('WARN: tender-name cards not found in 20s'));
-await new Promise(r => setTimeout(r, 1500));
+  const mask = document.querySelector('.p-sidebar-mask');
+  return !mask || !mask.isConnected;
+}, { timeout: 15000 }).catch(() => console.log('WARN: sidebar mask still visible'));
 
+// Tada laukiam bet kurio iš galimų tender'io selector'ių
+const waitedForResults = await page.waitForFunction(() => {
+  const candidates = [
+    '[data-testid="tender-name"]',
+    '[data-testid*="tender-card"]',
+    '[data-testid*="search-result"]',
+    'a[href^="/tender/"]',
+  ];
+  for (const sel of candidates) {
+    try {
+      if (document.querySelectorAll(sel).length > 0) {
+        return { sel, count: document.querySelectorAll(sel).length };
+      }
+    } catch (_) {}
+  }
+  return false;
+}, { timeout: 60000 }).then(async r => {
+  const val = await r.jsonValue();
+  console.log('Results appeared:', JSON.stringify(val));
+  return true;
+}).catch(() => {
+  console.log('WARN: no result cards after 60s');
+  return false;
+});
+
+// Jei vis tiek nieko — ištraukiam lapo būseną, kad matytume KAS yra
+if (!waitedForResults) {
+  const pageState = await page.evaluate(() => {
+    // visi elementai su 'tender' testid
+    const testidElems = Array.from(document.querySelectorAll('[data-testid]'))
+      .filter(el => /tender|result|card|search/i.test(el.getAttribute('data-testid')))
+      .slice(0, 20)
+      .map(el => ({
+        testid: el.getAttribute('data-testid'),
+        tag: el.tagName,
+        text: (el.innerText || '').slice(0, 80),
+      }));
+
+    // visi link'ai į /tender/
+    const tenderLinks = Array.from(document.querySelectorAll('a[href*="/tender/"]'))
+      .slice(0, 10)
+      .map(a => ({
+        href: a.getAttribute('href').slice(0, 100),
+        text: (a.innerText || '').slice(0, 80),
+        parentTag: a.parentElement?.tagName,
+      }));
+
+    // ar matosi loading spinner
+    const spinners = Array.from(document.querySelectorAll('[class*="spinner"], [class*="loading"], [role="progressbar"]'))
+      .slice(0, 5)
+      .map(el => ({
+        tag: el.tagName,
+        cls: (typeof el.className === 'string' ? el.className : '').slice(0, 100),
+      }));
+
+    // ar yra klaidos pranešimas
+    const errors = Array.from(document.querySelectorAll('[class*="error"], [role="alert"]'))
+      .slice(0, 5)
+      .map(el => ({
+        tag: el.tagName,
+        text: (el.innerText || '').slice(0, 120),
+      }));
+
+    // bendras body teksto pradžia — ar čia apskritai rezultatų lapas?
+    const bodySample = (document.body.innerText || '').slice(0, 800);
+
+    return {
+      url: location.href,
+      testidElems,
+      tenderLinksCount: document.querySelectorAll('a[href*="/tender/"]').length,
+      tenderLinks,
+      spinners,
+      errors,
+      bodySample,
+    };
+  });
+  console.log('DEBUG page state after Apply:', JSON.stringify(pageState, null, 2));
+  throw new Error('No result cards appeared after 60s — check DEBUG page state above');
+}
+
+// papildoma pauzė, kad visi kortelės pilnai užsikrautų
+await new Promise(r => setTimeout(r, 1500));
 // --- 2) PAGALBINĖS FUNKCIJOS --------------------------------------------
 
 // Ištraukia tender ID iš URL, pvz. /tender/904149649?... → 904149649
