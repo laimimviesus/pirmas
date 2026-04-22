@@ -240,15 +240,16 @@ await Promise.race([apiPromise, navPromise]);
 
 
     await page.waitForFunction(() => {
-      const h1 = document.querySelector('h1');
-      if (h1 && (h1.innerText || '').trim().length > 5) return true;
-      const text = (document.body.innerText || '').trim();
-      return text.length > 1000 && !/414 ERROR|CloudFront/i.test(text);
-    }, { timeout: 15000 }).catch(() => {
-      console.log(`  WARN: no h1/content for ${tenderUrl}`);
-    });
+  const h1 = document.querySelector('h1');
+  if (h1 && (h1.innerText || '').trim().length > 5) return true;
+  const text = (document.body.innerText || '').trim();
+  return text.length > 500 && !/414 ERROR|CloudFront/i.test(text);
+}, { timeout: 8000 }).catch(() => {
+  console.log(`  WARN: no h1/content for ${tenderUrl}`);
+});
 
-    await new Promise(r => setTimeout(r, 1500));
+await new Promise(r => setTimeout(r, 500));
+
 
     const details = await page.evaluate(() => {
       const bodyText = (document.body.innerText || '').trim();
