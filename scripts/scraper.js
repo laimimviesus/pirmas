@@ -12,9 +12,9 @@ const { google } = require('googleapis');
 
 // --- Config ------------------------------------------------------------
 const TEST_MODE = process.env.TEST_MODE === 'true';
-const MAX_PAGES = TEST_MODE ? 1 : 100;
-const MAX_TENDERS = TEST_MODE ? 2 : 2000;
-const DETAILS_LIMIT = TEST_MODE ? 2 : 2000;
+const MAX_PAGES = TEST_MODE ? 1 : 10;
+const MAX_TENDERS = TEST_MODE ? 2 : 200;
+const DETAILS_LIMIT = TEST_MODE ? 2 : 200;
 
 // --- Pagalbinės funkcijos ----------------------------------------------
 
