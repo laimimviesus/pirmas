@@ -761,6 +761,9 @@ function extractTenderId(urlOrHref) {
   const m = (urlOrHref || '').match(/\/tender\/(\d+)/);
   return m ? m[1] : null;
 }
+function getCleanTenderUrl(tenderId) {
+  return `https://app.mercell.com/tender/${tenderId}`;
+}
 
 async function goToNextPage(page) {
   const clicked = await page.evaluate(() => {
@@ -1066,14 +1069,56 @@ async function fetchTenderDetails(page, tenderUrl) {
     return { error: e.message || String(e) };
   }
 }
+
+// =====================================================================
+// 2 PATAISYMAI (clean URL + CloudFront retry)
+// =====================================================================
+
+// --- PATAISYMAS 1: švarus URL detalių fetch'ui -----------------------
+//
+// Jūsų kode jau yra funkcija `extractTenderId`. Pridėkite po jos
+// šią naują funkciją:
+
+function getCleanTenderUrl(tenderId) {
+  // Paprasta forma be filter parametrų — CloudFront nebelieka 414
+  return `https://app.mercell.com/tender/${tenderId}`;
+}
+
+// --- PATAISYMAS 2: pataisyti detalių ciklą ---------------------------
+//
+// Raskite šią vietą kode:
+//
+//   const toFetch = newTenders.slice(0, DETAILS_LIMIT);
+//   console.log(`Fetching details for ${toFetch.length} tenders...`);
+//
+//   for (let i = 0; i < toFetch.length; i++) {
+//     console.log(`[${i + 1}/${toFetch.length}] ${toFetch[i].url.slice(0, 80)}...`);
+//     toFetch[i].details = await fetchTenderDetails(page, toFetch[i].url);
+//     await new Promise(r => setTimeout(r, 300));
+//   }
+//
+// IR PAKEISKITE į:
+
 const toFetch = newTenders.slice(0, DETAILS_LIMIT);
 console.log(`Fetching details for ${toFetch.length} tenders...`);
 
 for (let i = 0; i < toFetch.length; i++) {
-  console.log(`[${i + 1}/${toFetch.length}] ${toFetch[i].url.slice(0, 80)}...`);
-  toFetch[i].details = await fetchTenderDetails(page, toFetch[i].url);
-  await new Promise(r => setTimeout(r, 300));
+  // Naudojam ŠVARŲ URL (be filter params) — CloudFront nebetrukdys
+  const cleanUrl = getCleanTenderUrl(toFetch[i].tenderId);
+  console.log(`[${i + 1}/${toFetch.length}] ${cleanUrl}`);
+  toFetch[i].details = await fetchTenderDetails(page, cleanUrl);
+
+  // Check: ar gavom tikrą puslapį, ar vėl CloudFront klaidą
+  const snippet = (toFetch[i].details?.fullTextSnippet || '').slice(0, 100);
+  if (/414 ERROR|CloudFront|Bad request/i.test(snippet)) {
+    console.log(`  ⚠️ CloudFront error for ${toFetch[i].tenderId}, retrying with delay...`);
+    await new Promise(r => setTimeout(r, 3000));
+    toFetch[i].details = await fetchTenderDetails(page, cleanUrl);
+  }
+
+  await new Promise(r => setTimeout(r, 500));
 }
+
 
 // --- 6) FORMAT ROWS & APPEND --------------------------------------------
 
