@@ -1,5 +1,6 @@
 // =====================================================================
 // MERCELL SCRAPER — GitHub Actions version
+// With pagination v2 fix integrated
 // =====================================================================
 // Paleidimas: node scripts/scraper.js
 // Env vars: MERCELL_USERNAME, MERCELL_PASSWORD, GOOGLE_SERVICE_ACCOUNT_KEY,
@@ -122,29 +123,29 @@ async function goToNextPage(page) {
     const first = document.querySelector('[data-testid="tender-name"] a, a[href*="/tender/"]');
     return first?.getAttribute('href') || null;
   });
- 
+
   // Debug info apie pagination mygtuką
   const paginationInfo = await page.evaluate(() => {
     const nextBtn = document.querySelector('.p-paginator-next');
     if (!nextBtn) return { found: false };
- 
+
     const classes = nextBtn.className || '';
     const disabled = nextBtn.hasAttribute('disabled') ||
                      classes.includes('p-disabled') ||
                      classes.includes('p-paginator-element-disabled') ||
                      nextBtn.getAttribute('aria-disabled') === 'true';
- 
+
     const allPages = Array.from(document.querySelectorAll('.p-paginator-page'))
       .map(el => el.innerText?.trim())
       .filter(Boolean);
- 
+
     const currentPage = document.querySelector('.p-paginator-page.p-highlight')?.innerText?.trim() || 'unknown';
- 
+
     return { found: true, disabled, currentPage, allPages };
   });
- 
+
   console.log('  Pagination:', JSON.stringify(paginationInfo));
- 
+
   if (!paginationInfo.found) {
     console.log('  No pagination button - assuming single page');
     return false;
@@ -153,7 +154,7 @@ async function goToNextPage(page) {
     console.log('  Next button disabled - last page reached');
     return false;
   }
- 
+
   // Paspaudžiam Next
   const clicked = await page.evaluate(() => {
     const next = document.querySelector('.p-paginator-next');
@@ -167,13 +168,13 @@ async function goToNextPage(page) {
     next.click();
     return true;
   });
- 
+
   if (!clicked) {
     console.log('  Click failed');
     return false;
   }
- 
-  // Laukiam kol URL arba pirmasis tender'is pasikeis (patikimas požymis, kad nauji rezultatai atsiuntė)
+
+  // Laukiam kol URL arba pirmasis tender'is pasikeis
   try {
     await page.waitForFunction(
       ({ urlBefore, firstTenderBefore }) => {
@@ -189,20 +190,19 @@ async function goToNextPage(page) {
     console.log('  WARN: Neither URL nor first tender changed within 20s');
     return false;
   }
- 
+
   // Laukiam kol nauji rezultatai tikrai atsiras
   await page.waitForFunction(() => {
     return document.querySelectorAll('[data-testid="tender-name"]').length > 0;
   }, { timeout: 15000 }).catch(() => {});
- 
+
   // Papildoma pauzė kad DOM stabilizuotųsi
   await new Promise(r => setTimeout(r, 2000));
- 
+
   const urlAfter = page.url();
   console.log(`  ✓ Moved to page (URL change: ${urlBefore !== urlAfter})`);
   return true;
 }
- 
 
 // --- Detalių puslapio nuskaitymas --------------------------------------
 
@@ -327,7 +327,6 @@ async function runScraper() {
   console.log('Test mode:', TEST_MODE);
   console.log('Max tenders:', MAX_TENDERS);
 
-  // Env vars check
   console.log('ENV CHECK:', {
     hasServiceAccountKey: !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY,
     hasSheetId: !!process.env.GOOGLE_SHEET_ID,
@@ -362,7 +361,6 @@ async function runScraper() {
       timeout: 120000,
     });
 
-    // Cookie banner
     try {
       await page.waitForFunction(
         () => /Cookie preferences|Accept all|Accept essentials/i.test(document.body.innerText),
@@ -373,7 +371,6 @@ async function runScraper() {
       await clickButtonContainsText(page, 'Accept');
     } catch (_) {}
 
-    // Email
     await page.waitForSelector('#email', { timeout: 15000 });
     await page.click('#email', { clickCount: 3 });
     await page.type('#email', process.env.MERCELL_USERNAME, { delay: 20 });
@@ -392,7 +389,6 @@ async function runScraper() {
       page.waitForSelector('input[name="password"][type="password"]', { timeout: 60000 }),
     ]);
 
-    // Password
     await page.waitForSelector('input[name="password"][type="password"]', { timeout: 15000 });
     await page.click('input[name="password"][type="password"]', { clickCount: 3 });
     await page.type('input[name="password"][type="password"]', process.env.MERCELL_PASSWORD, { delay: 20 });
@@ -442,7 +438,6 @@ async function runScraper() {
              !pub.classList.contains('p-disabled');
     }, { timeout: 30000 });
 
-    // Countries
     const countries = [
       'Norway', 'Denmark', 'Sweden', 'Finland', 'The Netherlands',
       'Austria', 'Belgium', 'Estonia', 'France', 'Germany',
@@ -456,7 +451,6 @@ async function runScraper() {
     await clickSpanContainsText(page, 'Location');
     await page.waitForSelector('span.p-treenode-label', { timeout: 15000 });
 
-    // Expand all countries
     await page.evaluate(() => {
       const btn = document.querySelector('button[data-testid="show-more-button"]');
       if (btn) { btn.scrollIntoView({ block: 'center' }); btn.click(); }
@@ -608,7 +602,6 @@ async function runScraper() {
     console.log('Apply filters:', JSON.stringify(appliedFilters));
     if (!appliedFilters.ok) throw new Error('Could not click Apply filters');
 
-    // Wait for sidebar to close and results to appear
     await page.waitForFunction(() => {
       const mask = document.querySelector('.p-sidebar-mask');
       return !mask || !mask.isConnected;
@@ -627,115 +620,18 @@ async function runScraper() {
     const allTenders = [];
     const seenIds = new Set();
 
-   
-let emptyPagesInRow = 0;
-const MAX_EMPTY_PAGES_IN_ROW = 2;  // jei 2 puslapiai iš eilės be naujų — tada tikrai pabaiga
- 
-for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum++) {
-  try {
-    await page.waitForFunction(() => {
-      return document.querySelectorAll('[data-testid="tender-name"]').length > 0;
-    }, { timeout: 15000 });
-  } catch (_) {
-    console.log(`Page ${pageNum}: no results loaded, stopping`);
-    break;
-  }
- 
-  const pageTenders = await page.evaluate(() => {
-    const cards = Array.from(document.querySelectorAll('[data-testid^="search-result-card:"]'));
-    return cards.map(card => {
-      const nameEl = card.querySelector('[data-testid="tender-name"]');
-      const linkEl = nameEl?.querySelector('a[href*="/tender/"]') || nameEl?.querySelector('a');
-      const href = linkEl?.getAttribute('href') || null;
-      const title = (nameEl?.innerText || '').trim();
- 
-      const pubDateRaw = card.querySelector('[data-testid="tender-header__publication-date"]')?.innerText?.trim() || '';
-      const status = card.querySelector('[data-testid="tender-header__tender-status"]')?.innerText?.trim() || '';
-      const docType = card.querySelector('[data-testid="tender-header__doc-type-code"]')?.innerText?.trim() || '';
-      const publicationDate = pubDateRaw.replace(/^Published\s*/i, '').trim() || null;
- 
-      const cardText = (card.innerText || '').trim();
-      const lines = cardText.split('\n').map(s => s.trim()).filter(Boolean);
- 
-      const deadlineLine = lines.find(l =>
-        /^\d{1,2}\/\d{1,2}\/\d{4}(\s+\d{1,2}:\d{2})?$/.test(l) ||
-        /^\d{1,2}\.\d{1,2}\.\d{4}/.test(l)
-      );
- 
-      const orgCountryLine = lines.find(l => {
-        if (l === title) return false;
-        return /,\s*(Norway|Sweden|Denmark|Finland|Netherlands|Austria|Belgium|Estonia|France|Germany|Liechtenstein|Luxembourg|Portugal|Spain|Switzerland|United Kingdom|Ireland|Italy|Poland|Iceland|Lithuania|Latvia|Czech|Slovakia|Hungary|Greece|Romania|Bulgaria|Croatia|Slovenia)(\s|$)/i.test(l);
-      });
- 
-      let organisation = null;
-      let country = null;
-      if (orgCountryLine) {
-        const m = orgCountryLine.match(/^(.+),\s*([A-Za-z\s]+)$/);
-        if (m) {
-          organisation = m[1].trim();
-          country = m[2].trim();
-        }
+    let emptyPagesInRow = 0;
+    const MAX_EMPTY_PAGES_IN_ROW = 2;
+
+    for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum++) {
+      try {
+        await page.waitForFunction(() => {
+          return document.querySelectorAll('[data-testid="tender-name"]').length > 0;
+        }, { timeout: 15000 });
+      } catch (_) {
+        console.log(`Page ${pageNum}: no results loaded, stopping`);
+        break;
       }
- 
-      if (!country) {
-        const locEl = card.querySelector('[data-testid="search-result-card__locations"]');
-        const locText = (locEl?.innerText || '').trim();
-        const countryMatch = locText.match(/\b(Norway|Sweden|Denmark|Finland|Netherlands|Austria|Belgium|Estonia|France|Germany|Liechtenstein|Luxembourg|Portugal|Spain|Switzerland|United Kingdom|Ireland|Italy|Poland|Iceland|Lithuania|Latvia|Czech|Slovakia|Hungary|Greece|Romania|Bulgaria|Croatia|Slovenia)\b/i);
-        if (countryMatch) country = countryMatch[1];
-      }
- 
-      return {
-        href, title, organisation, country,
-        deadlineRaw: deadlineLine || null,
-        publicationDate, docType, status,
-      };
-    }).filter(t => t.href);
-  });
- 
-  // DEBUG: parodyk, kiek unique href radom ir kiek jų nauji
-  const foundHrefs = pageTenders.map(t => t.href).slice(0, 3);
-  console.log(`Page ${pageNum}: found ${pageTenders.length} cards on page, first hrefs: ${JSON.stringify(foundHrefs)}`);
- 
-  let newOnThisPage = 0;
-  let dupesOnThisPage = 0;
-  for (const t of pageTenders) {
-    const id = extractTenderId(t.href);
-    if (!id) continue;
-    if (seenIds.has(id)) {
-      dupesOnThisPage++;
-      continue;
-    }
-    seenIds.add(id);
-    const url = getCleanTenderUrl(id);
-    allTenders.push({ ...t, tenderId: id, url });
-    newOnThisPage++;
-    if (allTenders.length >= MAX_TENDERS) break;
-  }
-  console.log(`Page ${pageNum}: +${newOnThisPage} new, ${dupesOnThisPage} duplicates (total: ${allTenders.length})`);
- 
-  if (allTenders.length >= MAX_TENDERS) {
-    console.log(`Hit MAX_TENDERS limit (${MAX_TENDERS})`);
-    break;
-  }
- 
-  // Tolerantiškas sustojimas: leidžiam 2 tuščius puslapius iš eilės
-  if (newOnThisPage === 0) {
-    emptyPagesInRow++;
-    console.log(`  (${emptyPagesInRow}/${MAX_EMPTY_PAGES_IN_ROW} empty pages in a row)`);
-    if (emptyPagesInRow >= MAX_EMPTY_PAGES_IN_ROW) {
-      console.log('Too many empty pages - stopping pagination');
-      break;
-    }
-  } else {
-    emptyPagesInRow = 0;
-  }
- 
-  const hasNext = await goToNextPage(page);
-  if (!hasNext) {
-    console.log('No next page available');
-    break;
-  }
-}
 
       const pageTenders = await page.evaluate(() => {
         const cards = Array.from(document.querySelectorAll('[data-testid^="search-result-card:"]'));
@@ -788,22 +684,49 @@ for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum++) {
         }).filter(t => t.href);
       });
 
+      // DEBUG: parodyk pirmuosius href'us kad matytume ar keičiasi
+      const foundHrefs = pageTenders.slice(0, 3).map(t => (t.href || '').slice(0, 60));
+      console.log(`Page ${pageNum}: found ${pageTenders.length} cards, first hrefs: ${JSON.stringify(foundHrefs)}`);
+
       let newOnThisPage = 0;
+      let dupesOnThisPage = 0;
       for (const t of pageTenders) {
         const id = extractTenderId(t.href);
-        if (!id || seenIds.has(id)) continue;
+        if (!id) continue;
+        if (seenIds.has(id)) {
+          dupesOnThisPage++;
+          continue;
+        }
         seenIds.add(id);
         const url = getCleanTenderUrl(id);
         allTenders.push({ ...t, tenderId: id, url });
         newOnThisPage++;
         if (allTenders.length >= MAX_TENDERS) break;
       }
-      console.log(`Page ${pageNum}: +${newOnThisPage} tenders (total: ${allTenders.length})`);
+      console.log(`Page ${pageNum}: +${newOnThisPage} new, ${dupesOnThisPage} dupes (total: ${allTenders.length})`);
 
-      if (allTenders.length >= MAX_TENDERS) break;
-      if (newOnThisPage === 0) break;
+      if (allTenders.length >= MAX_TENDERS) {
+        console.log(`Hit MAX_TENDERS limit (${MAX_TENDERS})`);
+        break;
+      }
+
+      // Tolerantiškas sustojimas: leidžiam 2 tuščius puslapius iš eilės
+      if (newOnThisPage === 0) {
+        emptyPagesInRow++;
+        console.log(`  (${emptyPagesInRow}/${MAX_EMPTY_PAGES_IN_ROW} empty pages in a row)`);
+        if (emptyPagesInRow >= MAX_EMPTY_PAGES_IN_ROW) {
+          console.log('Too many empty pages - stopping');
+          break;
+        }
+      } else {
+        emptyPagesInRow = 0;
+      }
+
       const hasNext = await goToNextPage(page);
-      if (!hasNext) break;
+      if (!hasNext) {
+        console.log('No next page available');
+        break;
+      }
     }
 
     console.log(`✓ Collected ${allTenders.length} tenders total`);
@@ -843,7 +766,6 @@ for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum++) {
       'Reference number',
     ];
 
-    // Check existing IDs for dedup
     let existingIds = new Set();
     try {
       const existing = await sheets.spreadsheets.values.get({
