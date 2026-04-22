@@ -794,40 +794,64 @@ for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum++) {
     break;
   }
 
-  const pageTenders = await page.evaluate(() => {
-    const cards = Array.from(document.querySelectorAll('[data-testid="tender-name"]'));
-
-    return cards.map(nameEl => {
-      const linkEl = nameEl.querySelector('a[href*="/tender/"]') || nameEl.closest('a');
-      const href = linkEl?.getAttribute('href') || null;
-      const title = (nameEl.innerText || '').trim();
-
-      // pasirenkam visą kortelės konteinerį, kad gautume meta-duomenis
-      const card = nameEl.closest('[data-testid*="card"], article, li') ||
-                   nameEl.parentElement?.parentElement ||
-                   nameEl.parentElement;
-      const cardText = (card?.innerText || '').trim();
-
-      // meta paieška kortelės viduje
-      const organisation =
-        card?.querySelector('[data-testid*="buyer"], [data-testid*="organization"], [data-testid*="publisher"]')?.innerText?.trim() ||
-        null;
-
-      const countryMatch = cardText.match(/\b(Norway|Sweden|Denmark|Finland|Netherlands|Austria|Belgium|Estonia|France|Germany|Liechtenstein|Luxembourg|Portugal|Spain|Switzerland|United Kingdom|Ireland|Italy|Poland|Iceland|Lithuania|Latvia|Czech|Slovakia|Hungary|Greece|Romania|Bulgaria|Croatia|Slovenia)\b/i);
-
-      const deadlineMatch = cardText.match(/(?:deadline|closes|closing)[^\n]{0,40}?(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})/i) ||
-                             cardText.match(/\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\b/);
-
-      return {
-        href,
-        title,
-        organisation,
-        country: countryMatch ? countryMatch[1] : null,
-        deadlineRaw: deadlineMatch ? (deadlineMatch[1] || deadlineMatch[0]) : null,
-        cardText: cardText.slice(0, 1000),
-      };
-    }).filter(t => t.href);
-  });
+const pageTenders = await page.evaluate(() => {
+  const cards = Array.from(document.querySelectorAll('[data-testid^="search-result-card:"]'));
+ 
+  return cards.map(card => {
+    const nameEl = card.querySelector('[data-testid="tender-name"]');
+    const linkEl = nameEl?.querySelector('a[href*="/tender/"]') || nameEl?.querySelector('a');
+    const href = linkEl?.getAttribute('href') || null;
+    const title = (nameEl?.innerText || '').trim();
+ 
+    const pubDateRaw = card.querySelector('[data-testid="tender-header__publication-date"]')?.innerText?.trim() || '';
+    const status = card.querySelector('[data-testid="tender-header__tender-status"]')?.innerText?.trim() || '';
+    const docType = card.querySelector('[data-testid="tender-header__doc-type-code"]')?.innerText?.trim() || '';
+ 
+    const publicationDate = pubDateRaw.replace(/^Published\s*/i, '').trim() || null;
+ 
+    const cardText = (card.innerText || '').trim();
+    const lines = cardText.split('\n').map(s => s.trim()).filter(Boolean);
+ 
+    const deadlineLine = lines.find(l =>
+      /^\d{1,2}\/\d{1,2}\/\d{4}(\s+\d{1,2}:\d{2})?$/.test(l) ||
+      /^\d{1,2}\.\d{1,2}\.\d{4}/.test(l)
+    );
+ 
+    const orgCountryLine = lines.find(l => {
+      if (l === title) return false;
+      return /,\s*(Norway|Sweden|Denmark|Finland|Netherlands|Austria|Belgium|Estonia|France|Germany|Liechtenstein|Luxembourg|Portugal|Spain|Switzerland|United Kingdom|Ireland|Italy|Poland|Iceland|Lithuania|Latvia|Czech|Slovakia|Hungary|Greece|Romania|Bulgaria|Croatia|Slovenia)(\s|$)/i.test(l);
+    });
+ 
+    let organisation = null;
+    let country = null;
+    if (orgCountryLine) {
+      const m = orgCountryLine.match(/^(.+),\s*([A-Za-z\s]+)$/);
+      if (m) {
+        organisation = m[1].trim();
+        country = m[2].trim();
+      }
+    }
+ 
+    if (!country) {
+      const locEl = card.querySelector('[data-testid="search-result-card__locations"]');
+      const locText = (locEl?.innerText || '').trim();
+      const countryMatch = locText.match(/\b(Norway|Sweden|Denmark|Finland|Netherlands|Austria|Belgium|Estonia|France|Germany|Liechtenstein|Luxembourg|Portugal|Spain|Switzerland|United Kingdom|Ireland|Italy|Poland|Iceland|Lithuania|Latvia|Czech|Slovakia|Hungary|Greece|Romania|Bulgaria|Croatia|Slovenia)\b/i);
+      if (countryMatch) country = countryMatch[1];
+    }
+ 
+    return {
+      href,
+      title,
+      organisation,
+      country,
+      deadlineRaw: deadlineLine || null,
+      publicationDate,
+      docType,
+      status,
+      cardText: cardText.slice(0, 1200),
+    };
+  }).filter(t => t.href);
+});
 
   let newOnThisPage = 0;
   for (const t of pageTenders) {
@@ -1191,24 +1215,25 @@ const nowIso = new Date().toISOString().slice(0, 10);
 const rows = toFetch.map(t => {
   const d = t.details || {};
   return [
-    nowIso,
-    d.publicationDate || '',
-    t.url,
-    d.title || t.title || '',
-    d.organisation || t.organisation || '',
-    d.deadline || t.deadlineRaw || '',
-    d.country || t.country || '',
-    d.maxBudget || '',
-    d.duration || '',
-    d.requirementsForSupplier || '',
-    d.qualificationRequirements || '',
-    d.offerWeighingCriteria || '',
-    d.scopeOfAgreement || '',
-    d.technicalStack || '',
-    t.url,
-    d.referenceNumber || '',
+    nowIso,                                                         // 1. DATE ADDED
+    d.publicationDate || t.publicationDate || '',                  // 2. ANNOUCEMENT DATE
+    t.url,                                                          // 3. LINK
+    d.title || t.title || '',                                       // 4. TENDER NAME
+    d.organisation || t.organisation || '',                         // 5. ORG
+    d.deadline || t.deadlineRaw || '',                              // 6. DEADLINE
+    d.country || t.country || '',                                   // 7. COUNTRY
+    d.maxBudget || '',                                              // 8. BUDGET
+    d.duration || '',                                               // 9. DURATION
+    d.requirementsForSupplier || '',                                // 10. REQUIREMENTS
+    d.qualificationRequirements || '',                              // 11. QUALIFICATION
+    d.offerWeighingCriteria || '',                                  // 12. WEIGHING
+    d.scopeOfAgreement || '',                                       // 13. SCOPE
+    d.technicalStack || '',                                         // 14. TECH STACK
+    t.url,                                                          // 15. Source URL
+    d.referenceNumber || t.tenderId || '',                          // 16. REF NO
   ];
 });
+
 
 // DEBUG: parodyk pirmą eilutę, kurią rašysi
 if (rows.length > 0) {
