@@ -631,8 +631,8 @@ await new Promise(r => setTimeout(r, 1000));
 // --- SMOKE TEST RIBOS ----------------------------------------------------
 const TEST_MODE = true;
 const MAX_PAGES = TEST_MODE ? 1 : 50;
-const MAX_TENDERS = TEST_MODE ? 5 : 500;
-const DETAILS_LIMIT = TEST_MODE ? 5 : 200;
+const MAX_TENDERS = TEST_MODE ? 2 : 500;
+const DETAILS_LIMIT = TEST_MODE ? 2 : 200;
 
 // =====================================================================
 // PATAISYTAS FRAGMENTAS: Apply filters + patikimesnis laukimas
@@ -986,14 +986,34 @@ console.log(`New tenders to fetch details for: ${newTenders.length} (${allTender
 //
 // Pakeiskite visą `fetchTenderDetails` funkciją į šią versiją:
 
+// =====================================================================
+// SMOKE TEST v3 — 2 tender'iai, ~20s per detalę
+// Tikslas: per 300s gauti bent 2 užpildytas eilutes + debug log'us
+// =====================================================================
+
+// --- PATAISYMAS 1: SMOKE TEST RIBOS sumažinam iki 2 -------------------
+// Raskite savo kode:
+//   const MAX_TENDERS = TEST_MODE ? 5 : 500;
+//   const DETAILS_LIMIT = TEST_MODE ? 5 : 200;
+//
+// Pakeiskite į:
+
+const TEST_MODE = true;
+const MAX_PAGES = TEST_MODE ? 1 : 50;
+const MAX_TENDERS = TEST_MODE ? 2 : 500;
+const DETAILS_LIMIT = TEST_MODE ? 2 : 200;
+
+
+// --- PATAISYMAS 2: greitesnė fetchTenderDetails ----------------------
+// Pakeiskite VISĄ fetchTenderDetails funkciją į šią versiją:
+
 async function fetchTenderDetails(page, tenderUrl) {
   let blockHandler = null;
   try {
-    // Blokuojam ne-esminius resursus
     await page.setRequestInterception(true);
     blockHandler = (req) => {
       const type = req.resourceType();
-      if (['image', 'media', 'font'].includes(type)) {
+      if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
         req.abort();
       } else {
         req.continue();
@@ -1001,26 +1021,20 @@ async function fetchTenderDetails(page, tenderUrl) {
     };
     page.on('request', blockHandler);
 
-    // Einam į puslapį
-    await page.goto(tenderUrl, { waitUntil: 'networkidle2', timeout: 45000 });
+    // ĮSIDĖMĖK: 'domcontentloaded' daug greičiau nei 'networkidle2'
+    await page.goto(tenderUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
 
-    // Laukiam kol atsiras realus tender content (ne tik loading spinner)
-    // Bandysim kelis galimus selector'ius — Mercell gali turėti kelias struktūras
+    // Laukiam max 8s kol atsiras h1 arba reikšmingas content
     await page.waitForFunction(() => {
+      const h1 = document.querySelector('h1');
+      if (h1 && (h1.innerText || '').trim().length > 5) return true;
       const text = (document.body.innerText || '').trim();
-      // tikrinam ar puslapis jau turi reikšmingo turinio (>500 simbolių)
-      // ir ar tai NE CloudFront/loading screen
-      if (text.length < 500) return false;
-      if (/414 ERROR|CloudFront|Request could not be satisfied/i.test(text)) return false;
-      if (/loading|please wait/i.test(text.slice(0, 200)) && text.length < 1000) return false;
-      // Laukiam kol atsiras h1 arba didelis content
-      return !!document.querySelector('h1') || text.length > 1500;
-    }, { timeout: 20000 }).catch(() => {
-      console.log(`  WARN: content didn't load fully for ${tenderUrl}`);
+      return text.length > 1000 && !/414 ERROR|CloudFront/i.test(text);
+    }, { timeout: 8000 }).catch(() => {
+      console.log(`  WARN: no h1/content for ${tenderUrl}`);
     });
 
-    // Papildoma pauzė kad React komponentai spėtų rendertis
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, 800));
 
     const details = await page.evaluate(() => {
       const bodyText = (document.body.innerText || '').trim();
@@ -1045,25 +1059,23 @@ async function fetchTenderDetails(page, tenderUrl) {
       };
 
       const budgetMatch = bodyText.match(
-        /(?:estimated value|contract value|max(?:imum)?\s*(?:budget|value)|total value|budget|value\s*\(excl)[^\n]{0,40}?[:\s]+([€$£]?\s*[\d.,\s]+(?:\s*(?:EUR|USD|GBP|NOK|SEK|DKK))?)/i
+        /(?:estimated value|contract value|max(?:imum)?\s*(?:budget|value)|total value|budget|hankinnan arvo|arvio)[^\n]{0,40}?[:\s]+([€$£]?\s*[\d.,\s]+(?:\s*(?:EUR|USD|GBP|NOK|SEK|DKK))?)/i
       );
       const durationMatch = bodyText.match(
-        /(?:duration|contract\s*period|contract\s*length|agreement\s*duration|term\s*of\s*contract)[^\n]{0,40}?[:\s]+([^\n.]{1,80})/i
-      ) || bodyText.match(/(\d+)\s*(months?|years?|kk|kuukautta|vuotta)/i);
+        /(?:duration|contract\s*period|contract\s*length|sopimuskausi|sopimuksen kesto|kesto)[^\n]{0,40}?[:\s]+([^\n.]{1,80})/i
+      ) || bodyText.match(/(\d+)\s*(months?|years?|kuukautta|vuotta)/i);
       const deadlineMatch = bodyText.match(
-        /(?:deadline|closing\s*date|offer\s*deadline|submission\s*deadline|tender\s*deadline|määräaika)[^\n]{0,40}?[:\s]+([^\n]{1,80})/i
+        /(?:deadline|closing\s*date|submission\s*deadline|määräaika|tarjousaika)[^\n]{0,40}?[:\s]+([^\n]{1,80})/i
       );
       const pubMatch = bodyText.match(
-        /(?:published|publication\s*date|date\s*published|julkaistu)[^\n]{0,40}?[:\s]+([^\n]{1,60})/i
+        /(?:published|publication\s*date|julkaistu|julkaisupäivä)[^\n]{0,40}?[:\s]+([^\n]{1,60})/i
       );
       const refMatch = bodyText.match(
-        /(?:reference(?:\s+number|\s+no\.?)?|ref\.?\s*no\.?|hankintailmoituksen\s*numero)[:\s]+([A-Z0-9\-\/_.]+)/i
+        /(?:reference(?:\s+number|\s+no\.?)?|ref\.?\s*no\.?|viitenumero|hankintailmoituksen\s*numero)[:\s]+([A-Z0-9\-\/_.]+)/i
       );
 
       return {
-        title: document.querySelector('h1')?.innerText?.trim()
-            || document.querySelector('[data-testid*="title"]')?.innerText?.trim()
-            || null,
+        title: document.querySelector('h1')?.innerText?.trim() || null,
         organisation: sectionText([
           'buyer', 'contracting authority', 'contracting entity', 'purchaser', 'organisation',
           'hankintayksikkö', 'tilaaja', 'awarding authority'
@@ -1091,15 +1103,15 @@ async function fetchTenderDetails(page, tenderUrl) {
           'hankinnan kohde', 'kuvaus', 'laajuus'
         ]),
         technicalStack: sectionText([
-          'technical stack', 'technology', 'technical requirements', 'technologies',
+          'technical stack', 'technology', 'technical requirements',
           'tekniset vaatimukset'
         ]),
         fullTextSnippet: bodyText.slice(0, 3000),
-        // DEBUG: kokie antraščių variantai yra puslapyje
+        // Svarbus DEBUG: kokios antraštės yra puslapyje
         headingsDebug: Array.from(document.querySelectorAll('h1, h2, h3, h4, strong, dt, label'))
           .map(h => (h.textContent || '').trim())
           .filter(t => t && t.length < 80 && t.length > 2)
-          .slice(0, 30),
+          .slice(0, 40),
       };
     });
 
@@ -1116,6 +1128,31 @@ async function fetchTenderDetails(page, tenderUrl) {
   }
 }
 
+
+// --- PATAISYMAS 3: log'ai su daugiau detalių kiekviename tender'yje --
+
+for (let i = 0; i < toFetch.length; i++) {
+  const cleanUrl = getCleanTenderUrl(toFetch[i].tenderId);
+  console.log(`[${i + 1}/${toFetch.length}] ${cleanUrl}`);
+  const t0 = Date.now();
+  toFetch[i].details = await fetchTenderDetails(page, cleanUrl);
+  const elapsed = Date.now() - t0;
+
+  const d = toFetch[i].details || {};
+  console.log(`  → ${elapsed}ms | title: ${(d.title || 'NONE').slice(0, 50)}`);
+  console.log(`  → snippet start: ${(d.fullTextSnippet || '').slice(0, 200).replace(/\n/g, ' | ')}`);
+  console.log(`  → headings found: ${JSON.stringify((d.headingsDebug || []).slice(0, 15))}`);
+
+  // jei gavom CloudFront — bandom dar kartą
+  const snippet = (d.fullTextSnippet || '').slice(0, 200);
+  if (/414 ERROR|CloudFront|Bad request/i.test(snippet)) {
+    console.log(`  ⚠️ CloudFront, retry in 3s...`);
+    await new Promise(r => setTimeout(r, 3000));
+    toFetch[i].details = await fetchTenderDetails(page, cleanUrl);
+  }
+
+  await new Promise(r => setTimeout(r, 400));
+}
 
 
 // =====================================================================
@@ -1134,39 +1171,32 @@ function getCleanTenderUrl(tenderId) {
 
 // --- PATAISYMAS 2: pataisyti detalių ciklą ---------------------------
 //
-// Raskite šią vietą kode:
-//
-//   const toFetch = newTenders.slice(0, DETAILS_LIMIT);
-//   console.log(`Fetching details for ${toFetch.length} tenders...`);
-//
-//   for (let i = 0; i < toFetch.length; i++) {
-//     console.log(`[${i + 1}/${toFetch.length}] ${toFetch[i].url.slice(0, 80)}...`);
-//     toFetch[i].details = await fetchTenderDetails(page, toFetch[i].url);
-//     await new Promise(r => setTimeout(r, 300));
-//   }
-//
-// IR PAKEISKITE į:
 
 const toFetch = newTenders.slice(0, DETAILS_LIMIT);
 console.log(`Fetching details for ${toFetch.length} tenders...`);
 
 for (let i = 0; i < toFetch.length; i++) {
-  // Naudojam ŠVARŲ URL (be filter params) — CloudFront nebetrukdys
   const cleanUrl = getCleanTenderUrl(toFetch[i].tenderId);
   console.log(`[${i + 1}/${toFetch.length}] ${cleanUrl}`);
+  const t0 = Date.now();
   toFetch[i].details = await fetchTenderDetails(page, cleanUrl);
-
-  // Check: ar gavom tikrą puslapį, ar vėl CloudFront klaidą
-  const snippet = (toFetch[i].details?.fullTextSnippet || '').slice(0, 100);
+  const elapsed = Date.now() - t0;
+ 
+  const d = toFetch[i].details || {};
+  console.log(`  → ${elapsed}ms | title: ${(d.title || 'NONE').slice(0, 50)}`);
+  console.log(`  → snippet start: ${(d.fullTextSnippet || '').slice(0, 200).replace(/\n/g, ' | ')}`);
+  console.log(`  → headings found: ${JSON.stringify((d.headingsDebug || []).slice(0, 15))}`);
+ 
+  // jei gavom CloudFront — bandom dar kartą
+  const snippet = (d.fullTextSnippet || '').slice(0, 200);
   if (/414 ERROR|CloudFront|Bad request/i.test(snippet)) {
-    console.log(`  ⚠️ CloudFront error for ${toFetch[i].tenderId}, retrying with delay...`);
+    console.log(`  ⚠️ CloudFront, retry in 3s...`);
     await new Promise(r => setTimeout(r, 3000));
     toFetch[i].details = await fetchTenderDetails(page, cleanUrl);
   }
-
-  await new Promise(r => setTimeout(r, 500));
+ 
+  await new Promise(r => setTimeout(r, 400));
 }
-
 
 // --- 6) FORMAT ROWS & APPEND --------------------------------------------
 
