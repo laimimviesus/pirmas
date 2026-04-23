@@ -1,6 +1,6 @@
 // =====================================================================
 // MERCELL SCRAPER — GitHub Actions version
-// With pagination v2 fix integrated
+// With "Go to source" page scraping
 // =====================================================================
 // Paleidimas: node scripts/scraper.js
 // Env vars: MERCELL_USERNAME, MERCELL_PASSWORD, GOOGLE_SERVICE_ACCOUNT_KEY,
@@ -15,6 +15,7 @@ const TEST_MODE = process.env.TEST_MODE === 'true';
 const MAX_PAGES = TEST_MODE ? 1 : 200;
 const MAX_TENDERS = TEST_MODE ? 2 : 4000;
 const DETAILS_LIMIT = TEST_MODE ? 2 : 4000;
+const SOURCE_NAV_TIMEOUT = 25000;
 
 // --- Pagalbinės funkcijos ----------------------------------------------
 
@@ -117,14 +118,12 @@ function getCleanTenderUrl(tenderId) {
 }
 
 async function goToNextPage(page) {
-  // Paimam "before" state
   const urlBefore = page.url();
   const firstTenderBefore = await page.evaluate(() => {
     const first = document.querySelector('[data-testid="tender-name"] a, a[href*="/tender/"]');
     return first?.getAttribute('href') || null;
   });
 
-  // Debug info apie pagination mygtuką
   const paginationInfo = await page.evaluate(() => {
     const nextBtn = document.querySelector('.p-paginator-next');
     if (!nextBtn) return { found: false };
@@ -155,7 +154,6 @@ async function goToNextPage(page) {
     return false;
   }
 
-  // Paspaudžiam Next
   const clicked = await page.evaluate(() => {
     const next = document.querySelector('.p-paginator-next');
     if (!next) return false;
@@ -174,7 +172,6 @@ async function goToNextPage(page) {
     return false;
   }
 
-  // Laukiam kol URL arba pirmasis tender'is pasikeis
   try {
     await page.waitForFunction(
       ({ urlBefore, firstTenderBefore }) => {
@@ -191,12 +188,10 @@ async function goToNextPage(page) {
     return false;
   }
 
-  // Laukiam kol nauji rezultatai tikrai atsiras
   await page.waitForFunction(() => {
     return document.querySelectorAll('[data-testid="tender-name"]').length > 0;
   }, { timeout: 15000 }).catch(() => {});
 
-  // Papildoma pauzė kad DOM stabilizuotųsi
   await new Promise(r => setTimeout(r, 2000));
 
   const urlAfter = page.url();
@@ -204,53 +199,312 @@ async function goToNextPage(page) {
   return true;
 }
 
-// --- Detalių puslapio nuskaitymas --------------------------------------
+// --- ŠALTINIO PUSLAPIO NUSKAITYMAS -------------------------------------
+//
+// Atidaro naują tabą, nueina į šaltinio URL, nuskaito kelis laukus pagal
+// daugiakalbius raktažodžius (EN/SV/NO/DA/FI/DE/FR/NL/ES/PT/IT) ir grąžina
+// objektą. Netrikdo pagrindinio `page` konteksto.
+// =====================================================================
 
-async function fetchTenderDetails(page, tenderUrl) {
+async function fetchSourcePageDetails(browser, sourceUrl) {
+  let srcPage = null;
+  try {
+    srcPage = await browser.newPage();
+    await srcPage.setDefaultNavigationTimeout(SOURCE_NAV_TIMEOUT);
+    await srcPage.setDefaultTimeout(SOURCE_NAV_TIMEOUT);
+
+    // Block heavy resources
+    await srcPage.setRequestInterception(true);
+    const blockHandler = (req) => {
+      const type = req.resourceType();
+      if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    };
+    srcPage.on('request', blockHandler);
+
+    try {
+      await srcPage.goto(sourceUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: SOURCE_NAV_TIMEOUT,
+      });
+    } catch (e) {
+      console.log(`    source nav warn: ${e.message}`);
+    }
+
+    // Trumpam palaukti kol renderis stabilizuosis
+    await srcPage.waitForFunction(() => {
+      const t = (document.body?.innerText || '').trim();
+      return t.length > 300;
+    }, { timeout: 8000 }).catch(() => {});
+    await new Promise(r => setTimeout(r, 400));
+
+    // Bandome uždaryti cookie banner'us, kurie dažnai uždengia turinį
+    await srcPage.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
+      const acc = btns.find(b => /accept|godkänn|godkend|aksepter|hyväksy|akzeptier|accepter|aanvaard|aceptar|accetta/i
+        .test((b.textContent || b.value || '').trim()));
+      acc?.click?.();
+    }).catch(() => {});
+    await new Promise(r => setTimeout(r, 200));
+
+    const result = await srcPage.evaluate(() => {
+      const bodyText = (document.body?.innerText || '').trim();
+
+      // --- helper: rasti reikšmę pagal etiketę ---
+      // ieškom po headerio / kito elemento su etikete — paimam kaimyno /
+      // <dd>/<td>/po-brolio tekstą.
+      const sectionText = (labels) => {
+        const all = Array.from(document.querySelectorAll(
+          'h1, h2, h3, h4, h5, h6, dt, th, strong, b, label, div, span, p, li'
+        ));
+        for (const labRaw of labels) {
+          const re = new RegExp('^\\s*' + labRaw + '\\s*:?\\s*$', 'i');
+          const el = all.find(e => {
+            const t = (e.textContent || '').trim();
+            return re.test(t) && t.length < 120;
+          });
+          if (!el) continue;
+          let val =
+            el.nextElementSibling?.innerText ||
+            (el.parentElement && el.parentElement.nextElementSibling?.innerText) ||
+            (el.tagName === 'DT' && el.nextElementSibling?.tagName === 'DD' ? el.nextElementSibling.innerText : null) ||
+            (el.tagName === 'TH' && el.parentElement?.querySelector('td')?.innerText) ||
+            (el.parentElement?.querySelector('dd, td, p, span, div')?.innerText);
+          if (val && val.trim() && val.trim() !== el.textContent.trim()) {
+            return val.trim().replace(/\s+\n/g, '\n').slice(0, 4000);
+          }
+        }
+        return null;
+      };
+
+      // --- helper: rasti tekstą kuris eina po header'io H2/H3 iki kito header'io ---
+      const sectionBlock = (labels) => {
+        const heads = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, strong, b'));
+        for (const labRaw of labels) {
+          const re = new RegExp('^\\s*' + labRaw + '\\s*:?\\s*$', 'i');
+          const h = heads.find(e => re.test((e.textContent || '').trim()));
+          if (!h) continue;
+          let out = '';
+          let cur = h.nextElementSibling;
+          let steps = 0;
+          while (cur && steps < 12) {
+            if (/^H[1-5]$/.test(cur.tagName)) break;
+            const t = (cur.innerText || '').trim();
+            if (t) out += (out ? '\n' : '') + t;
+            if (out.length > 3000) break;
+            cur = cur.nextElementSibling;
+            steps++;
+          }
+          if (out) return out.slice(0, 4000);
+        }
+        return null;
+      };
+
+      // MAX BUDGET
+      let maxBudget = null;
+      const budgetRegexes = [
+        // EN: estimated value / contract value / total value / budget
+        /(?:estimated\s*(?:total\s*)?value|contract\s*value|total\s*value|max(?:imum)?\s*(?:budget|value)|budget)[^\n]{0,40}?[:\s]+((?:€|EUR|kr|NOK|SEK|DKK|£|\$)?\s*[\d.,\s]+(?:\s*(?:EUR|SEK|NOK|DKK|USD|GBP))?)/i,
+        // SV/NO/DA
+        /(?:uppskattat\s*värde|kontraktsvärde|totalt?\s*värde|maxbudget|avtalsvärde|estimert\s*verdi|kontraktsverdi|estimeret\s*værdi|kontraktværdi)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|SEK|NOK|DKK|kr))?)/i,
+        // FI
+        /(?:arvioitu\s*arvo|hankinnan\s*arvo|sopimuksen\s*arvo|kokonaisarvo)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|€))?)/i,
+        // DE
+        /(?:geschätzter\s*(?:gesamt)?wert|auftragswert|vertragswert|maximalbudget)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|€))?)/i,
+        // FR
+        /(?:valeur\s*(?:totale\s*)?estimée|montant\s*estimé|valeur\s*du\s*marché|budget\s*maximum)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|€))?)/i,
+        // NL
+        /(?:geschatte\s*waarde|contractwaarde|totale\s*waarde|maximale\s*begroting)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|€))?)/i,
+        // ES/PT
+        /(?:valor\s*(?:total\s*)?estimado|importe\s*estimado|valor\s*do\s*contrato|presupuesto\s*máximo|orçamento\s*máximo)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|€))?)/i,
+        // IT
+        /(?:valore\s*(?:totale\s*)?stimato|importo\s*stimato|valore\s*del\s*contratto|budget\s*massimo)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|€))?)/i,
+      ];
+      for (const re of budgetRegexes) {
+        const m = bodyText.match(re);
+        if (m) { maxBudget = m[1].trim(); break; }
+      }
+
+      // DURATION
+      let duration = null;
+      const durationRegexes = [
+        /(\d+)\s*(months?|mån(?:ader)?|måneder|kuukautta|Monate|mois|maanden|meses|mesi)\b/i,
+        /(\d+)\s*(years?|år|vuotta|Jahre|ans|jaar|años|anos|anni)\b/i,
+        /(?:duration|contract\s*period|contract\s*length|avtalsperiod|avtalstid|kontraktsperiode|varighet|varighed|sopimuskausi|sopimuksen\s*kesto|kesto|vertragslaufzeit|laufzeit|durée\s*du\s*(?:contrat|marché)|looptijd|contractduur|duración\s*del\s*contrato|duração\s*do\s*contrato|durata\s*del\s*contratto)[^\n]{0,40}?[:\s]+([^\n.]{1,80})/i,
+      ];
+      for (const re of durationRegexes) {
+        const m = bodyText.match(re);
+        if (m) {
+          duration = (m[1] + (m[2] ? ' ' + m[2] : '')).trim();
+          break;
+        }
+      }
+
+      // REQUIREMENTS FOR SUPPLIER
+      const requirementsForSupplier =
+        sectionBlock([
+          'requirements for supplier', 'supplier requirements',
+          'krav på leverantör', 'krav til leverandør', 'krav til leverandøren',
+          'tarjoajan vaatimukset', 'anforderungen an (?:den )?(?:lieferant|bieter)',
+          'exigences pour le (?:fournisseur|soumissionnaire)',
+          'vereisten aan de (?:leverancier|inschrijver)',
+          'requisitos para el (?:proveedor|licitador)',
+          'requisitos para o (?:fornecedor|concorrente)',
+          'requisiti per il fornitore',
+        ]) ||
+        sectionText([
+          'requirements', 'vaatimukset', 'anforderungen', 'exigences',
+          'vereisten', 'requisitos', 'requisiti',
+        ]);
+
+      // QUALIFICATION REQUIREMENTS
+      const qualificationRequirements =
+        sectionBlock([
+          'qualification requirements', 'qualifications', 'eligibility',
+          'selection criteria', 'suitability criteria',
+          'soveltuvuusvaatimukset', 'soveltuvuus', 'kvalifikationskrav',
+          'kvalifikasjonskrav', 'eignungskriterien', 'teilnahmebedingungen',
+          'critères de qualification', 'critères de sélection',
+          'kwalificatiecriteria', 'geschiktheidseisen',
+          'criterios de calificación', 'criterios de selección',
+          'critérios de qualificação', 'critérios de seleção',
+          'criteri di qualificazione', 'criteri di selezione',
+        ]) ||
+        sectionText([
+          'qualifications', 'eligibility', 'soveltuvuus',
+        ]);
+
+      // OFFER WEIGHING CRITERIA / AWARD CRITERIA
+      const offerWeighingCriteria =
+        sectionBlock([
+          'award criteria', 'evaluation criteria', 'weighing criteria',
+          'criteria for award', 'contract award criteria',
+          'tilldelningskriterier', 'utvärderingskriterier',
+          'tildelingskriterier', 'evalueringskriterier',
+          'valintaperusteet', 'vertailuperusteet',
+          'zuschlagskriterien', 'bewertungskriterien',
+          'critères d.attribution', 'critères d.évaluation',
+          'gunningscriteria', 'beoordelingscriteria',
+          'criterios de adjudicación', 'criterios de evaluación',
+          'critérios de adjudicação', 'critérios de avaliação',
+          'criteri di aggiudicazione', 'criteri di valutazione',
+        ]) ||
+        sectionText(['award criteria', 'evaluation criteria']);
+
+      // SCOPE OF AGREEMENT
+      const scopeOfAgreement =
+        sectionBlock([
+          'scope of agreement', 'scope of contract', 'scope of the contract',
+          'scope', 'object of the contract', 'subject matter',
+          'description of the procurement', 'short description',
+          'omfattning', 'avtalets omfattning', 'beskrivning',
+          'omfang', 'avtalets omfang', 'beskrivelse', 'kort beskrivelse',
+          'hankinnan kohde', 'hankinnan kuvaus', 'kuvaus', 'laajuus',
+          'umfang', 'auftragsgegenstand', 'beschreibung',
+          'objet du (?:marché|contrat)', 'description', 'étendue',
+          'voorwerp van de opdracht', 'beschrijving', 'omvang',
+          'objeto del contrato', 'descripción', 'alcance',
+          'objeto do contrato', 'descrição', 'âmbito',
+          'oggetto del contratto', 'descrizione', 'portata',
+        ]) ||
+        sectionText(['scope', 'description', 'kuvaus', 'beskrivelse', 'beskrivning']);
+
+      // TECHNICAL STACK / TECHNICAL REQUIREMENTS
+      const technicalStack =
+        sectionBlock([
+          'technical stack', 'technology stack', 'tech stack',
+          'technical requirements', 'technical specifications',
+          'tekniset vaatimukset', 'tekniset spesifikaatiot',
+          'tekniska krav', 'teknisk specifikation',
+          'tekniske krav', 'teknisk spesifikasjon',
+          'technische anforderungen', 'technische spezifikationen',
+          'spécifications techniques', 'exigences techniques',
+          'technische vereisten', 'technische specificaties',
+          'requisitos técnicos', 'especificaciones técnicas',
+          'especificações técnicas',
+          'requisiti tecnici', 'specifiche tecniche',
+        ]) ||
+        sectionText([
+          'technical stack', 'technology', 'technical',
+          'tekninen', 'teknisk', 'technisch', 'technique', 'técnico', 'tecnico',
+        ]);
+
+      // Publication / reference / deadline — jei Mercell neturi
+      const refMatch = bodyText.match(
+        /(?:reference(?:\s+number|\s+no\.?)?|ref\.?\s*no\.?|ärende(?:nummer)?|viitenumero|saknummer|sagsnr|aktenzeichen|numéro\s*de\s*référence|kenmerk|número\s*de\s*referencia|numero\s*di\s*riferimento)[:\s]+([A-Z0-9\-\/_.]+)/i
+      );
+
+      return {
+        maxBudget,
+        duration,
+        requirementsForSupplier,
+        qualificationRequirements,
+        offerWeighingCriteria,
+        scopeOfAgreement,
+        technicalStack,
+        referenceNumberSource: refMatch ? refMatch[1].trim() : null,
+        sourceTitle: document.querySelector('h1')?.innerText?.trim() || null,
+        sourceHost: location.host,
+      };
+    });
+
+    srcPage.off('request', blockHandler);
+    try { await srcPage.setRequestInterception(false); } catch (_) {}
+    return result;
+  } catch (e) {
+    return { error: e.message || String(e) };
+  } finally {
+    if (srcPage) {
+      try { await srcPage.close(); } catch (_) {}
+    }
+  }
+}
+
+// --- Mercell detalių puslapio nuskaitymas ------------------------------
+
+async function fetchTenderDetails(browser, page, tenderUrl) {
   let blockHandler = null;
   try {
     await page.setRequestInterception(true);
-blockHandler = (req) => {
-  const type = req.resourceType();
-  if (['image', 'media', 'font'].includes(type)) {
-    req.abort();
-  } else {
-    req.continue();
-  }
-};
-page.on('request', blockHandler);
+    blockHandler = (req) => {
+      const type = req.resourceType();
+      if (['image', 'media', 'font'].includes(type)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    };
+    page.on('request', blockHandler);
 
-// laukiame API atsakymo + DOMContentLoaded, bet su trumpu timeout
-const apiPromise = page
-  .waitForResponse(
-    (res) =>
-      res.url().includes('/api/tender') && // <- ČIA ĮDĖK TIKSLŲ PATH, pvz. '/api/tenders/'
-      res.ok(),
-    { timeout: 10000 }
-  )
-  .catch(() => null);
+    const apiPromise = page
+      .waitForResponse(
+        (res) => res.url().includes('/api/tender') && res.ok(),
+        { timeout: 10000 }
+      )
+      .catch(() => null);
 
-const navPromise = page.goto(tenderUrl, {
-  waitUntil: 'domcontentloaded',
-  timeout: 15000,
-});
+    const navPromise = page.goto(tenderUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: 15000,
+    });
 
-// laukiam, kol įvyks bent vienas iš: navigacija arba API atsakymas
-await Promise.race([apiPromise, navPromise]);
-
+    await Promise.race([apiPromise, navPromise]);
 
     await page.waitForFunction(() => {
-  const h1 = document.querySelector('h1');
-  if (h1 && (h1.innerText || '').trim().length > 5) return true;
-  const text = (document.body.innerText || '').trim();
-  return text.length > 500 && !/414 ERROR|CloudFront/i.test(text);
-}, { timeout: 8000 }).catch(() => {
-  console.log(`  WARN: no h1/content for ${tenderUrl}`);
-});
+      const h1 = document.querySelector('h1');
+      if (h1 && (h1.innerText || '').trim().length > 5) return true;
+      const text = (document.body.innerText || '').trim();
+      return text.length > 500 && !/414 ERROR|CloudFront/i.test(text);
+    }, { timeout: 8000 }).catch(() => {
+      console.log(`  WARN: no h1/content for ${tenderUrl}`);
+    });
 
-await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 500));
 
-
+    // Nuskaitome Mercell puslapio turinį
     const details = await page.evaluate(() => {
       const bodyText = (document.body.innerText || '').trim();
 
@@ -289,6 +543,10 @@ await new Promise(r => setTimeout(r, 500));
         /(?:reference(?:\s+number|\s+no\.?)?|ref\.?\s*no\.?|viitenumero|hankintailmoituksen\s*numero)[:\s]+([A-Z0-9\-\/_.]+)/i
       );
 
+      // ŠALTINIO URL iš "Go to source" mygtuko
+      const sourceBtn = document.querySelector('button[data-testid="join-tender-button"]');
+      const sourceUrl = sourceBtn?.getAttribute('data-linkurl') || null;
+
       return {
         title: document.querySelector('h1')?.innerText?.trim() || null,
         organisation: sectionText([
@@ -321,12 +579,47 @@ await new Promise(r => setTimeout(r, 500));
           'technical stack', 'technology', 'technical requirements',
           'tekniset vaatimukset'
         ]),
+        sourceUrl,
         fullTextSnippet: bodyText.slice(0, 3000),
       };
     });
 
     page.off('request', blockHandler);
     await page.setRequestInterception(false);
+
+    // --- ŠALTINIO PUSLAPIS -------------------------------------------
+    if (details.sourceUrl) {
+      console.log(`    → source: ${details.sourceUrl.slice(0, 80)}`);
+      const t0 = Date.now();
+      const src = await fetchSourcePageDetails(browser, details.sourceUrl);
+      const elapsed = Date.now() - t0;
+      console.log(`    source done in ${elapsed}ms (host: ${src?.sourceHost || 'n/a'}, err: ${src?.error || 'none'})`);
+
+      if (src && !src.error) {
+        // Šaltinio puslapiai kur kas patikimesni šioms sritims — jei rado,
+        // perrašom Mercell reikšmę (Mercell dažnai šitų laukų neturi).
+        for (const key of [
+          'maxBudget',
+          'duration',
+          'requirementsForSupplier',
+          'qualificationRequirements',
+          'offerWeighingCriteria',
+          'scopeOfAgreement',
+          'technicalStack',
+        ]) {
+          if (src[key]) details[key] = src[key];
+        }
+        if (!details.referenceNumber && src.referenceNumberSource) {
+          details.referenceNumber = src.referenceNumberSource;
+        }
+        details.sourceHost = src.sourceHost || null;
+      } else {
+        details.sourceFetchError = src?.error || 'unknown';
+      }
+    } else {
+      console.log('    (no "Go to source" button / data-linkurl)');
+    }
+
     return details;
 
   } catch (e) {
@@ -370,10 +663,10 @@ async function runScraper() {
   try {
     const page = await browser.newPage();
     page.on('response', (res) => {
-  if (res.url().includes('mercell.com') && res.request().resourceType() === 'xhr') {
-    console.log('XHR:', res.url());
-  }
-});
+      if (res.url().includes('mercell.com') && res.request().resourceType() === 'xhr') {
+        console.log('XHR:', res.url());
+      }
+    });
     page.setDefaultNavigationTimeout(120000);
     page.setDefaultTimeout(120000);
 
@@ -707,7 +1000,6 @@ async function runScraper() {
         }).filter(t => t.href);
       });
 
-      // DEBUG: parodyk pirmuosius href'us kad matytume ar keičiasi
       const foundHrefs = pageTenders.slice(0, 3).map(t => (t.href || '').slice(0, 60));
       console.log(`Page ${pageNum}: found ${pageTenders.length} cards, first hrefs: ${JSON.stringify(foundHrefs)}`);
 
@@ -733,7 +1025,6 @@ async function runScraper() {
         break;
       }
 
-      // Tolerantiškas sustojimas: leidžiam 2 tuščius puslapius iš eilės
       if (newOnThisPage === 0) {
         emptyPagesInRow++;
         console.log(`  (${emptyPagesInRow}/${MAX_EMPTY_PAGES_IN_ROW} empty pages in a row)`);
@@ -828,7 +1119,7 @@ async function runScraper() {
     for (let i = 0; i < toFetch.length; i++) {
       const cleanUrl = getCleanTenderUrl(toFetch[i].tenderId);
       const t0 = Date.now();
-      toFetch[i].details = await fetchTenderDetails(page, cleanUrl);
+      toFetch[i].details = await fetchTenderDetails(browser, page, cleanUrl);
       const elapsed = Date.now() - t0;
 
       const d = toFetch[i].details || {};
@@ -838,7 +1129,7 @@ async function runScraper() {
       if (/414 ERROR|CloudFront|Bad request/i.test(snippet)) {
         console.log(`  ⚠️ CloudFront, retry in 3s...`);
         await new Promise(r => setTimeout(r, 3000));
-        toFetch[i].details = await fetchTenderDetails(page, cleanUrl);
+        toFetch[i].details = await fetchTenderDetails(browser, page, cleanUrl);
       }
 
       await new Promise(r => setTimeout(r, 400));
@@ -848,10 +1139,13 @@ async function runScraper() {
     const nowIso = new Date().toISOString().slice(0, 10);
     const rows = toFetch.map(t => {
       const d = t.details || {};
+      // Source URL → pirmenybė šaltinio nuorodai, kaip paprašyta ("puslapis,
+      // kuriame tender'is buvo paskelbtas" == originalus šaltinis).
+      const publishedUrl = d.sourceUrl || t.url;
       return [
         nowIso,
         d.publicationDate || t.publicationDate || '',
-        t.url,
+        publishedUrl,
         d.title || t.title || '',
         d.organisation || t.organisation || '',
         d.deadline || t.deadlineRaw || '',
@@ -863,7 +1157,7 @@ async function runScraper() {
         d.offerWeighingCriteria || '',
         d.scopeOfAgreement || '',
         d.technicalStack || '',
-        t.url,
+        d.sourceUrl || '',
         d.referenceNumber || t.tenderId || '',
       ];
     });
