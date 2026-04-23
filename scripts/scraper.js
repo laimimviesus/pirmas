@@ -732,6 +732,22 @@ function pickField(obj, candidates) {
   return null;
 }
 
+// Mercell pateikia daug laukų kaip `[{languageCode:"en", text:"..."},...]`.
+// Ištraukiam angliškąjį tekstą (arba pirmąjį, jei anglų nėra).
+function pickTranslationText(v) {
+  if (!v) return null;
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v) && v.length) {
+    const en = v.find((x) => x && (x.languageCode === 'en' || x.lang === 'en' || x.language === 'en'));
+    const pick = en || v[0];
+    if (pick && typeof pick === 'object') {
+      return pick.text || pick.value || pick.content || null;
+    }
+  }
+  if (typeof v === 'object' && v.text) return v.text;
+  return null;
+}
+
 // Iš Mercell tender JSON'o išsitraukia mūsų domenui reikalingus laukus.
 function extractFieldsFromTenderJson(tenderJson) {
   if (!tenderJson || typeof tenderJson !== 'object') return {};
@@ -740,31 +756,63 @@ function extractFieldsFromTenderJson(tenderJson) {
   const root =
     tenderJson.tender || tenderJson.data || tenderJson.result || tenderJson;
 
-  const title = pickField(root, [
-    'title', 'name', 'subject', 'tenderTitle', 'officialTitle', 'heading',
+  // Title: `[{languageCode,text}]` formatas
+  const title = pickTranslationText(root.title) || pickField(root, [
+    'name', 'subject', 'tenderTitle', 'officialTitle', 'heading',
   ]);
-  const description = pickField(root, [
-    'description', 'shortDescription', 'longDescription', 'summary',
+  // Description: `[{languageCode,text}]`, dažnai ilgas
+  const description = pickTranslationText(root.description) || pickField(root, [
+    'shortDescription', 'longDescription', 'summary',
     'objectDescription', 'scopeDescription', 'contentDescription', 'content',
   ]);
   // Mercell JSON key name'ai (patvirtinti iš live response'ų):
-  //   authority    → contracting authority (buyer)
-  //   tenderLocation → country / region info (objektas)
-  //   bidDueDate / deadlineDate → submission deadline
-  //   moneyRange   → {min, max, currency} biudžetas
+  //   authority    → {name, nameAndCity, country} — perkančioji organizacija
+  //   buyer        → {name, organizationNumber, emails, contactPoint, contractingPartners}
+  //   tenderLocation[] → [{name, city, code}]
+  //   bidDueDate / deadlineDate → submission deadline (ISO timestamp)
+  //   moneyRange   → {currency, low, high} biudžetas
+  //   contractLength → {awardRange, optionRanges} — agreement duration
+  //   evaluationBasis → award criteria description
   //   noticeType   → dokumento tipas
   //   procedure    → procurement procedure
-  const buyer = pickField(root, [
-    'authority', 'buyer', 'buyerName', 'organisation', 'organization',
-    'contractingAuthority', 'contractingEntity', 'purchaser',
-    'awardingAuthority', 'publishedBy', 'issuer',
-    // nested objektų variantai
-    'authorityName', 'authorityTitle',
-  ]);
-  const country = pickField(root, [
-    'country', 'countryCode', 'countryName', 'nation',
-    'deliveryPlaceCode', 'location', 'tenderLocation',
-  ]);
+  const authorityObj = root.authority;
+  const buyerObj = root.buyer;
+  let buyer = null;
+  if (authorityObj && typeof authorityObj === 'object') {
+    buyer = authorityObj.name || authorityObj.nameAndCity || null;
+  }
+  if (!buyer && buyerObj && typeof buyerObj === 'object') {
+    buyer = buyerObj.name || null;
+  }
+  if (!buyer) {
+    buyer = pickField(root, [
+      'buyerName', 'organisation', 'organization', 'contractingAuthority',
+      'contractingEntity', 'purchaser', 'awardingAuthority',
+      'publishedBy', 'issuer', 'authorityName', 'authorityTitle',
+    ]);
+  }
+
+  // Country — tenderLocation yra `[{name, city, code}]` arba authority.country
+  let country = null;
+  const locArr = root.tenderLocation;
+  if (Array.isArray(locArr) && locArr.length) {
+    const first = locArr[0];
+    if (first && typeof first === 'object') {
+      country = first.name || first.code || null;
+    } else if (typeof first === 'string') {
+      country = first;
+    }
+  }
+  if (!country && authorityObj && typeof authorityObj === 'object') {
+    country = authorityObj.country || null;
+  }
+  if (!country) {
+    country = pickField(root, [
+      'country', 'countryCode', 'countryName', 'nation',
+      'deliveryPlaceCode', 'location',
+    ]);
+  }
+
   const deadline = pickField(root, [
     'bidDueDate', 'deadline', 'deadlineDate', 'submissionDeadline',
     'endDate', 'closingDate', 'offerDeadline', 'tenderDeadline',
@@ -778,8 +826,9 @@ function extractFieldsFromTenderJson(tenderJson) {
     'referenceNumber', 'reference', 'noticeNumber', 'ocid',
     'tenderReference', 'externalReferenceNumber', 'sourceNoticeId',
   ]);
-  // VERTĖ / BUDGET — Mercell grąžina `moneyRange: {min, max, currency}` arba
-  // kartais tiesiog skaičių. Pirmiausia patikrinam objektą.
+  // VERTĖ / BUDGET — Mercell pateikia `moneyRange: {currency, low, high}`.
+  // Taip pat galim sulaukti `estimatedValue` ir pan. objektuose su
+  // {amount, currency} ar {min, max}.
   const budgetCandidates = [
     'moneyRange', 'estimatedValue', 'estimatedTotalValue',
     'contractValue', 'totalValue', 'maxBudget', 'maximumBudget',
@@ -787,17 +836,16 @@ function extractFieldsFromTenderJson(tenderJson) {
     'estimatedBudget', 'contractAmount',
   ];
   let budget = null;
-  // 1) Pirma bandom objekto formą {amount|value|min|max, currency}
   for (const key of budgetCandidates) {
     const v = root[key];
     if (v && typeof v === 'object' && !Array.isArray(v)) {
       const cur = v.currency ?? v.currencyCode ?? v.code ?? '';
-      const min = v.min ?? v.minValue ?? v.minimum;
-      const max = v.max ?? v.maxValue ?? v.maximum;
-      const amt = v.amount ?? v.value ?? v.number ?? max ?? min;
+      const lo = v.low ?? v.min ?? v.minValue ?? v.minimum;
+      const hi = v.high ?? v.max ?? v.maxValue ?? v.maximum;
+      const amt = v.amount ?? v.value ?? v.number ?? hi ?? lo;
       if (amt !== undefined && amt !== null && amt !== '') {
-        if (min !== undefined && max !== undefined && min !== max) {
-          budget = `${min}–${max} ${cur}`.trim();
+        if (lo !== undefined && hi !== undefined && lo !== null && hi !== null && lo !== hi) {
+          budget = `${lo}–${hi} ${cur}`.trim();
         } else {
           budget = `${amt} ${cur}`.trim();
         }
@@ -805,15 +853,46 @@ function extractFieldsFromTenderJson(tenderJson) {
       }
     }
   }
-  // 2) Fallback: paprastas skalarinis laukas
   if (!budget) budget = pickField(root, budgetCandidates);
 
-  const duration = pickField(root, [
-    'duration', 'contractDuration', 'durationMonths', 'periodMonths',
-    'contractPeriod', 'contractLength', 'performancePeriod',
-    'timeFrame', 'validityPeriod', 'estimatedDuration',
-  ]);
+  // DURATION — Mercell pateikia `contractLength: {awardRange, optionRanges}`,
+  // kur awardRange yra pvz. `{low, high, unit}` arba panašiai.
+  let duration = null;
+  const cl = root.contractLength;
+  if (cl && typeof cl === 'object') {
+    const ar = cl.awardRange;
+    if (ar && typeof ar === 'object') {
+      const lo = ar.low ?? ar.min ?? ar.minimum;
+      const hi = ar.high ?? ar.max ?? ar.maximum;
+      const unit = ar.unit || ar.units || 'months';
+      if (lo !== undefined && hi !== undefined && lo !== null && hi !== null && lo !== hi) {
+        duration = `${lo}–${hi} ${unit}`.trim();
+      } else if (lo !== undefined && lo !== null) {
+        duration = `${lo} ${unit}`.trim();
+      } else if (hi !== undefined && hi !== null) {
+        duration = `${hi} ${unit}`.trim();
+      }
+    }
+    if (!duration && Array.isArray(cl.optionRanges) && cl.optionRanges.length) {
+      const or = cl.optionRanges[0];
+      if (or && typeof or === 'object') {
+        const lo = or.low, hi = or.high;
+        const unit = or.unit || 'months';
+        if (lo && hi) duration = `${lo}–${hi} ${unit} (option)`;
+      }
+    }
+  }
+  if (!duration) {
+    duration = pickField(root, [
+      'duration', 'contractDuration', 'durationMonths', 'periodMonths',
+      'contractPeriod', 'performancePeriod',
+      'timeFrame', 'validityPeriod', 'estimatedDuration',
+    ]);
+  }
+
+  // AWARD CRITERIA — Mercell: `evaluationBasis` (dažnai enum / string).
   const awardCriteria = pickField(root, [
+    'evaluationBasis',
     'awardCriteria', 'awardCriterion', 'evaluationCriteria',
     'weighingCriteria', 'criteria', 'contractAwardCriteria',
     'awardingCriteria', 'evaluationMethod', 'selectionMethod',
@@ -1726,7 +1805,7 @@ async function runScraper() {
         nowIso,
         fmtDate(d.publicationDate || t.publicationDate || ''),
         publishedUrl,
-        d.title || t.title || '',
+        cleanDescription(d.title || t.title || ''),
         cleanOrg(d.organisation || t.organisation || ''),
         fmtDate(d.deadline || t.deadlineRaw || ''),
         d.country || t.country || '',
