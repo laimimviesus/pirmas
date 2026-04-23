@@ -695,9 +695,142 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
 }
 
 // --- Mercell detalių puslapio nuskaitymas ------------------------------
+//
+// PAPILDOMA: Mercell React komponentai nerodo paprasto label→value HTML'o,
+// todėl `sectionText`-stiliaus DOM-scraping neveikia budget/duration/scope/
+// requirements laukams. Tačiau Mercell atlieka JSON užklausą į:
+//   https://search-service-api.discover.app.mercell.com/api/v1/search/tenders/{id}
+//   https://sd-match-service.discover.app.mercell.com/api/v1/bopp-matches/{id}
+// Perimam šias response'as, parse'inam JSON ir išgaunam struktūruotus laukus.
+
+// Bando paimti reikšmę iš įdėto objekto pagal kelis galimus field name'us.
+function pickField(obj, candidates) {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const cand of candidates) {
+    if (obj[cand] !== undefined && obj[cand] !== null) {
+      const v = obj[cand];
+      if (typeof v === 'string' && v.trim()) return v.trim();
+      if (typeof v === 'number') return String(v);
+      if (Array.isArray(v) && v.length) {
+        return v.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join('; ');
+      }
+      if (typeof v === 'object' && v.value !== undefined) return String(v.value);
+    }
+  }
+  // Rekursiškai patikrinam nested'us — bet tik vieną lygį, kad nesugaištumėm
+  for (const [k, v] of Object.entries(obj)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      for (const cand of candidates) {
+        if (v[cand] !== undefined && v[cand] !== null) {
+          const val = v[cand];
+          if (typeof val === 'string' && val.trim()) return val.trim();
+          if (typeof val === 'number') return String(val);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// Iš Mercell tender JSON'o išsitraukia mūsų domenui reikalingus laukus.
+function extractFieldsFromTenderJson(tenderJson) {
+  if (!tenderJson || typeof tenderJson !== 'object') return {};
+
+  // Kartais response'as yra { data: {...}, result: {...}, tender: {...} }
+  const root =
+    tenderJson.tender || tenderJson.data || tenderJson.result || tenderJson;
+
+  const title = pickField(root, [
+    'title', 'name', 'subject', 'tenderTitle', 'officialTitle', 'heading',
+  ]);
+  const description = pickField(root, [
+    'description', 'shortDescription', 'longDescription', 'summary',
+    'objectDescription', 'scopeDescription', 'contentDescription', 'content',
+  ]);
+  const buyer = pickField(root, [
+    'buyer', 'buyerName', 'organisation', 'organization',
+    'contractingAuthority', 'contractingEntity', 'purchaser',
+    'awardingAuthority', 'publishedBy', 'issuer',
+  ]);
+  const country = pickField(root, [
+    'country', 'countryCode', 'countryName', 'nation',
+    'deliveryPlaceCode', 'location',
+  ]);
+  const deadline = pickField(root, [
+    'deadline', 'deadlineDate', 'submissionDeadline',
+    'endDate', 'closingDate', 'offerDeadline', 'tenderDeadline',
+  ]);
+  const publicationDate = pickField(root, [
+    'publicationDate', 'publishedDate', 'published', 'publishDate',
+    'noticePublishedDate', 'created', 'createdDate', 'releaseDate',
+  ]);
+  const reference = pickField(root, [
+    'referenceNumber', 'reference', 'noticeNumber', 'ocid',
+    'tenderReference', 'externalReferenceNumber', 'sourceNoticeId',
+  ]);
+  // VERTĖ / BUDGET
+  const budgetCandidates = [
+    'estimatedValue', 'estimatedTotalValue', 'contractValue', 'totalValue',
+    'maxBudget', 'maximumBudget', 'value', 'budget', 'valueExcludingVat',
+    'valueAmount', 'amount',
+  ];
+  let budget = pickField(root, budgetCandidates);
+  // jei tai objektas su {amount, currency}
+  if (!budget) {
+    for (const key of budgetCandidates) {
+      const v = root[key];
+      if (v && typeof v === 'object') {
+        const amt = v.amount ?? v.value ?? v.number;
+        const cur = v.currency ?? v.currencyCode ?? '';
+        if (amt) { budget = `${amt} ${cur}`.trim(); break; }
+      }
+    }
+  }
+  const duration = pickField(root, [
+    'duration', 'contractDuration', 'durationMonths', 'periodMonths',
+    'contractPeriod', 'contractLength',
+  ]);
+  const awardCriteria = pickField(root, [
+    'awardCriteria', 'awardCriterion', 'evaluationCriteria',
+    'weighingCriteria', 'criteria', 'contractAwardCriteria',
+  ]);
+  const qualification = pickField(root, [
+    'qualificationRequirements', 'selectionCriteria', 'suitabilityCriteria',
+    'eligibilityCriteria', 'qualifications', 'participationCriteria',
+  ]);
+  const requirements = pickField(root, [
+    'requirementsForSupplier', 'supplierRequirements', 'requirements',
+    'bidderRequirements', 'conditionsForParticipation',
+  ]);
+  const sourceUrl = pickField(root, [
+    'sourceUrl', 'linkUrl', 'url', 'originalSourceUrl', 'externalUrl',
+    'documentUrl', 'permalink', 'link',
+  ]);
+  const cpvCodes = pickField(root, ['cpvCodes', 'cpvCode', 'cpv']);
+
+  return {
+    _raw: root,
+    title,
+    description,
+    buyer,
+    country,
+    deadline,
+    publicationDate,
+    reference,
+    budget,
+    duration,
+    awardCriteria,
+    qualification,
+    requirements,
+    sourceUrl,
+    cpvCodes,
+  };
+}
 
 async function fetchTenderDetails(browser, page, tenderUrl) {
   let blockHandler = null;
+  let responseHandler = null;
+  const capturedApis = []; // { url, json }
   try {
     await page.setRequestInterception(true);
     blockHandler = (req) => {
@@ -710,10 +843,31 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
     };
     page.on('request', blockHandler);
 
+    // JSON response capture — renkam visas Mercell detailinio tender'io
+    // užklausų atsakymas (tiek `search-service-api`, tiek `sd-match-service`).
+    responseHandler = async (res) => {
+      try {
+        const url = res.url();
+        if (!/\.discover\.app\.mercell\.com\//.test(url)) return;
+        if (!res.ok()) return;
+        const ctype = res.headers()['content-type'] || '';
+        if (!ctype.includes('application/json')) return;
+        // Mums reikia TIK tender-specific response'ų, ne facets/search list
+        if (!/\/search\/tenders\/|\/bopp-matches\//.test(url)) return;
+        const text = await res.text();
+        try {
+          const json = JSON.parse(text);
+          capturedApis.push({ url, json });
+        } catch (_) {}
+      } catch (_) {}
+    };
+    page.on('response', responseHandler);
+
+    // Net jei `apiPromise` nesulauks, `capturedApis` masyve jau bus viskas.
     const apiPromise = page
       .waitForResponse(
-        (res) => res.url().includes('/api/tender') && res.ok(),
-        { timeout: 10000 }
+        (res) => /\/api\/v1\/search\/tenders\//.test(res.url()) && res.ok(),
+        { timeout: 12000 }
       )
       .catch(() => null);
 
@@ -733,7 +887,13 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       console.log(`  WARN: no h1/content for ${tenderUrl}`);
     });
 
-    await new Promise(r => setTimeout(r, 500));
+    // Po domcontentloaded eksplicitiškai palaukiam API atsakymų —
+    // `responseHandler` visąlaik renka, bet turim duoti XHR'ams laiko pasileist.
+    await apiPromise;
+
+    // Papildomas settle time, kad spėtų ir `bopp-matches` užklausa (dažnai
+    // fetchinama šiek tiek vėliau nei tender'io core info).
+    await new Promise(r => setTimeout(r, 1500));
 
     // Nuskaitome Mercell puslapio turinį
     const details = await page.evaluate(() => {
@@ -818,6 +978,43 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
     page.off('request', blockHandler);
     await page.setRequestInterception(false);
 
+    // --- MERCELL JSON API ATSAKYMAI ------------------------------------
+    // Mercell tender'io puslapis fetchina `/api/v1/search/tenders/{id}`
+    // ir `/api/v1/bopp-matches/{id}` iš discover.app.mercell.com. Šiuose
+    // JSON'uose yra daug struktūrizuotų laukų, kurių neradome puslapio DOM'e.
+    try {
+      page.off('response', responseHandler);
+    } catch (_) {}
+
+    console.log(`    Captured ${capturedApis.length} Mercell API responses`);
+    for (const { url, json } of capturedApis) {
+      const topKeys = Object.keys(json || {}).slice(0, 12);
+      console.log(`    API: ${url.slice(0, 100)} keys=${JSON.stringify(topKeys)}`);
+      const fields = extractFieldsFromTenderJson(json);
+      // Nenustuminam jau turimų reikšmių — tik užpildom tuščius.
+      if (fields.title && !details.title) details.title = fields.title;
+      if (fields.buyer && !details.organisation) details.organisation = fields.buyer;
+      if (fields.country && !details.country) details.country = fields.country;
+      if (fields.deadline && !details.deadline) details.deadline = fields.deadline;
+      if (fields.publicationDate && !details.publicationDate) details.publicationDate = fields.publicationDate;
+      if (fields.reference && !details.referenceNumber) details.referenceNumber = fields.reference;
+      if (fields.budget && !details.maxBudget) details.maxBudget = fields.budget;
+      if (fields.duration && !details.duration) details.duration = fields.duration;
+      if (fields.awardCriteria && !details.offerWeighingCriteria) details.offerWeighingCriteria = fields.awardCriteria;
+      if (fields.qualification && !details.qualificationRequirements) details.qualificationRequirements = fields.qualification;
+      if (fields.requirements && !details.requirementsForSupplier) details.requirementsForSupplier = fields.requirements;
+      if (fields.description && !details.scopeOfAgreement) details.scopeOfAgreement = fields.description;
+      if (fields.sourceUrl && !details.sourceUrl) details.sourceUrl = fields.sourceUrl;
+      if (fields.cpvCodes && !details.cpvCodes) details.cpvCodes = fields.cpvCodes;
+
+      // Logginam ką radom iš JSON'o, kad paprasta debugint kokie laukai buvo užpildyti
+      const filled = Object.entries(fields)
+        .filter(([k, v]) => v && k !== '_raw')
+        .map(([k, v]) => `${k}(${String(v).length}ch)`)
+        .join(', ');
+      if (filled) console.log(`    → from JSON: ${filled}`);
+    }
+
     // --- ŠALTINIO PUSLAPIS -------------------------------------------
     if (details.sourceUrl) {
       console.log(`    → source: ${details.sourceUrl.slice(0, 80)}`);
@@ -877,6 +1074,9 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
     try {
       if (blockHandler) page.off('request', blockHandler);
       await page.setRequestInterception(false);
+    } catch (_) {}
+    try {
+      if (responseHandler) page.off('response', responseHandler);
     } catch (_) {}
     return { error: e.message || String(e) };
   }
