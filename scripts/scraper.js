@@ -448,6 +448,7 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         referenceNumberSource: refMatch ? refMatch[1].trim() : null,
         sourceTitle: document.querySelector('h1')?.innerText?.trim() || null,
         sourceHost: location.host,
+        bodyTextPreview: bodyText.slice(0, 600),
       };
     });
 
@@ -596,8 +597,8 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       console.log(`    source done in ${elapsed}ms (host: ${src?.sourceHost || 'n/a'}, err: ${src?.error || 'none'})`);
 
       if (src && !src.error) {
-        // Šaltinio puslapiai kur kas patikimesni šioms sritims — jei rado,
-        // perrašom Mercell reikšmę (Mercell dažnai šitų laukų neturi).
+        // Per-field logging — matome ką šaltinio puslapis grąžino
+        const srcFieldSummary = {};
         for (const key of [
           'maxBudget',
           'duration',
@@ -607,7 +608,13 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           'scopeOfAgreement',
           'technicalStack',
         ]) {
-          if (src[key]) details[key] = src[key];
+          const v = src[key];
+          srcFieldSummary[key] = v ? `${String(v).length}ch: ${String(v).slice(0, 60).replace(/\s+/g, ' ')}` : null;
+          if (v) details[key] = v;
+        }
+        console.log(`    source fields:`, JSON.stringify(srcFieldSummary));
+        if (src.bodyTextPreview) {
+          console.log(`    source body preview (first 300ch): ${src.bodyTextPreview.slice(0, 300).replace(/\s+/g, ' ')}`);
         }
         if (!details.referenceNumber && src.referenceNumberSource) {
           details.referenceNumber = src.referenceNumberSource;
@@ -899,6 +906,34 @@ async function runScraper() {
     await new Promise(r => setTimeout(r, 1000));
     console.log('  CPV 72000000 ✓');
 
+    // ---- PRE-APPLY: DIAGNOSTINIS DUMP ----
+    // Patikrinam ar Contract / Open for offers / No time limit checkbox'ai iš tikrųjų aria-checked=true.
+    const preApplyState = await page.evaluate(() => {
+      const out = { checkedByAccordion: {}, allChecked: [] };
+      const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+      for (const tab of tabs) {
+        const id = tab.id || 'unknown';
+        // Checkbox'ai: PrimeReact naudoja .p-checkbox su hidden input, ir .p-highlight class'ę ant .p-checkbox-box kai pažymėta
+        const checkedBoxes = Array.from(tab.querySelectorAll('.p-checkbox-box.p-highlight, .p-checkbox .p-highlight'));
+        const labels = checkedBoxes.map(b => {
+          const wrapper = b.closest('.p-checkbox-wrapper') || b.parentElement?.parentElement;
+          return (wrapper?.querySelector('.p-checkbox-label')?.textContent || '').trim();
+        }).filter(Boolean);
+        if (labels.length) {
+          out.checkedByAccordion[id] = labels;
+          out.allChecked.push(...labels.map(l => `${id}::${l}`));
+        }
+      }
+      // Arba tiesiog visi checked visam sidebar'e
+      const sidebar = document.querySelector('.p-sidebar-content, [role="dialog"], .p-sidebar');
+      if (sidebar) {
+        const allHi = Array.from(sidebar.querySelectorAll('.p-checkbox-box.p-highlight'));
+        out.totalCheckedInSidebar = allHi.length;
+      }
+      return out;
+    });
+    console.log('PRE-APPLY checked boxes:', JSON.stringify(preApplyState, null, 2));
+
     // ---- APPLY FILTERS ----
     const appliedFilters = await page.evaluate(() => {
       const sidebar = document.querySelector('.p-sidebar-content, [role="dialog"], .p-sidebar');
@@ -930,6 +965,23 @@ async function runScraper() {
       console.log('WARN: no result cards after 60s');
     });
     await new Promise(r => setTimeout(r, 2000));
+
+    // ---- POST-APPLY: DIAGNOSTINIS DUMP ----
+    const postApplyState = await page.evaluate(() => {
+      const firstCards = Array.from(document.querySelectorAll('[data-testid^="search-result-card:"]')).slice(0, 3);
+      return {
+        url: location.href.slice(0, 500),
+        urlHasStatusFilter: /filter=tender_status/i.test(location.href),
+        urlHasDocTypeFilter: /filter=doc_type_code/i.test(location.href),
+        totalCards: document.querySelectorAll('[data-testid^="search-result-card:"]').length,
+        firstCards: firstCards.map(c => ({
+          title: (c.querySelector('[data-testid="tender-name"]')?.innerText || '').trim().slice(0, 60),
+          status: (c.querySelector('[data-testid="tender-header__tender-status"]')?.innerText || '').trim(),
+          docType: (c.querySelector('[data-testid="tender-header__doc-type-code"]')?.innerText || '').trim(),
+        })),
+      };
+    });
+    console.log('POST-APPLY URL/results:', JSON.stringify(postApplyState, null, 2));
 
     // ---- COLLECT TENDERS FROM ALL PAGES ----
     console.log('--- COLLECTING TENDERS ---');
@@ -1043,7 +1095,31 @@ async function runScraper() {
       }
     }
 
-    console.log(`✓ Collected ${allTenders.length} tenders total`);
+    console.log(`✓ Collected ${allTenders.length} tenders total (before defensive filter)`);
+
+    // ---- DEFENSIVE POST-FILTER ----
+    // Jei URL/API filtrai neprilipo, bent jau išmeskim tuos, kurie tikrai neatitinka kriterijų.
+    const WANTED_STATUSES = ['Open for offers', 'No time limit'];
+    const beforeFilter = allTenders.length;
+    const filteredOut = [];
+    const kept = [];
+    for (const t of allTenders) {
+      const status = (t.status || '').trim();
+      const docType = (t.docType || '').trim();
+      const statusOk = WANTED_STATUSES.some(s => status.toLowerCase().startsWith(s.toLowerCase()));
+      const docOk = /contract/i.test(docType) && !/award\s*notice/i.test(docType);
+      if (!statusOk || !docOk) {
+        filteredOut.push({ id: t.tenderId, title: (t.title || '').slice(0, 40), status, docType });
+        continue;
+      }
+      kept.push(t);
+    }
+    allTenders.length = 0;
+    allTenders.push(...kept);
+    console.log(`Defensive filter: kept ${kept.length}/${beforeFilter} (dropped ${filteredOut.length})`);
+    if (filteredOut.length) {
+      console.log('Dropped samples:', JSON.stringify(filteredOut.slice(0, 5), null, 2));
+    }
     if (allTenders.length > 0) {
       console.log('Sample tender:', JSON.stringify(allTenders[0], null, 2));
     }
