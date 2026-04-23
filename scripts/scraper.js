@@ -385,6 +385,63 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
     const result = await srcPage.evaluate(() => {
       const bodyText = (document.body?.innerText || '').trim();
 
+      // --- LOGIN-WALL DETEKTORIUS -----------------------------------
+      //
+      // Daugelis UK / DE / DK procurement portal'ų (MyTenders, Jaggaer,
+      // Bravo, BravoSolution, DTVP, etc.) rodo tik login formą
+      // neautentifikuotiems lankytojams. Atpažįstam tokius puslapius
+      // kad nereikalautume bereikalingai regex'ų ir nenuperrašytume
+      // Mercell laukų tuščiais duomenimis.
+      //
+      // Heuristika: skaičiuojam kiek "login-ženklų" yra body tekste.
+      // Jei ≥2 ir yra aktyvi password forma ARBA tekstas < 2500 simb.,
+      // laikom login-walled.
+      const loginMarkers = [
+        /\bplease\s*(?:log|sign)\s*in\b/i,
+        /\blog\s*in\s*(?:to\s*(?:continue|access|the))/i,
+        /\bsign\s*in\s*(?:to\s*(?:continue|access|the))/i,
+        /\benter\s*your\s*(?:email|username|password|login)/i,
+        /\bforgot\s*(?:your\s*)?password/i,
+        /\bnot\s*registered\s*yet/i,
+        /\bregister\s*(?:here|now|an\s*account)/i,
+        /\bcreate\s*(?:an\s*)?account/i,
+        /\bthis\s*secure\s*(?:website|portal|site)/i,
+        /\bwelcome\s*to\s*the\s*[^\n]{1,50}\s*(?:eprocurement|e-procurement|esourcing|e-sourcing|supplier|tender)\s*portal/i,
+        // LT/LV/EE/PL/DE/FR/ES/IT/NL equivalents
+        /\bprisijunkite\b/i,           // LT
+        /\blogg\s*inn\b/i,             // NO
+        /\blogga\s*in\b/i,             // SV
+        /\blog\s*ind\b/i,              // DA
+        /\bkirjaudu\s*sisään\b/i,      // FI
+        /\banmelden\s*(?:sie)?\b/i,    // DE
+        /\bpassword\s*vergessen\b/i,   // DE
+        /\bse\s*connecter\b/i,         // FR
+        /\bmot\s*de\s*passe\s*oublié/i,// FR
+        /\binloggen\b/i,               // NL
+        /\binicia(?:r)?\s*sesión\b/i,  // ES
+        /\bcontraseña\s*olvidada\b/i,  // ES
+        /\baccedi\s*(?:al|all)\b/i,    // IT
+      ];
+      const matchedMarkers = loginMarkers.filter((re) => re.test(bodyText)).length;
+      const hasPasswordField = !!document.querySelector(
+        'input[type="password"]:not([disabled]):not([aria-hidden="true"])'
+      );
+      const shortBody = bodyText.length < 2500;
+      const loginGated =
+        (matchedMarkers >= 2 && (hasPasswordField || shortBody)) ||
+        (hasPasswordField && matchedMarkers >= 1 && bodyText.length < 4000);
+
+      if (loginGated) {
+        return {
+          loginGated: true,
+          sourceHost: location.host,
+          matchedMarkers,
+          hasPasswordField,
+          bodyLength: bodyText.length,
+          bodyTextPreview: bodyText.slice(0, 300),
+        };
+      }
+
       // --- helper: rasti reikšmę pagal etiketę ---
       // ieškom po headerio / kito elemento su etikete — paimam kaimyno /
       // <dd>/<td>/po-brolio tekstą.
@@ -773,6 +830,16 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         // Mercell-internis permalink'as — nefetchinam, tik paliekam žymę.
         details.sourceHost = src.sourceHost || null;
         details.sourceSkipped = src.skipped;
+      } else if (src?.loginGated) {
+        // Login-gated portal'as (UK MyTenders, Jaggaer, Bravo, DTVP, ...)
+        // — realaus turinio nepaseiksim be autentifikacijos. Paliekam
+        // Mercell laukus nepakitusius; tik pažymim kad šaltinis login-walled.
+        console.log(
+          `    source login-gated (host: ${src.sourceHost}, markers: ${src.matchedMarkers}, ` +
+          `bodyLen: ${src.bodyLength}, passwordField: ${src.hasPasswordField})`
+        );
+        details.sourceHost = src.sourceHost || null;
+        details.sourceSkipped = 'login-gated';
       } else if (src && !src.error) {
         // Per-field logging — matome ką šaltinio puslapis grąžino
         const srcFieldSummary = {};
