@@ -747,18 +747,28 @@ function extractFieldsFromTenderJson(tenderJson) {
     'description', 'shortDescription', 'longDescription', 'summary',
     'objectDescription', 'scopeDescription', 'contentDescription', 'content',
   ]);
+  // Mercell JSON key name'ai (patvirtinti iš live response'ų):
+  //   authority    → contracting authority (buyer)
+  //   tenderLocation → country / region info (objektas)
+  //   bidDueDate / deadlineDate → submission deadline
+  //   moneyRange   → {min, max, currency} biudžetas
+  //   noticeType   → dokumento tipas
+  //   procedure    → procurement procedure
   const buyer = pickField(root, [
-    'buyer', 'buyerName', 'organisation', 'organization',
+    'authority', 'buyer', 'buyerName', 'organisation', 'organization',
     'contractingAuthority', 'contractingEntity', 'purchaser',
     'awardingAuthority', 'publishedBy', 'issuer',
+    // nested objektų variantai
+    'authorityName', 'authorityTitle',
   ]);
   const country = pickField(root, [
     'country', 'countryCode', 'countryName', 'nation',
-    'deliveryPlaceCode', 'location',
+    'deliveryPlaceCode', 'location', 'tenderLocation',
   ]);
   const deadline = pickField(root, [
-    'deadline', 'deadlineDate', 'submissionDeadline',
+    'bidDueDate', 'deadline', 'deadlineDate', 'submissionDeadline',
     'endDate', 'closingDate', 'offerDeadline', 'tenderDeadline',
+    'tenderDueDate', 'bidOpeningDate',
   ]);
   const publicationDate = pickField(root, [
     'publicationDate', 'publishedDate', 'published', 'publishDate',
@@ -768,39 +778,55 @@ function extractFieldsFromTenderJson(tenderJson) {
     'referenceNumber', 'reference', 'noticeNumber', 'ocid',
     'tenderReference', 'externalReferenceNumber', 'sourceNoticeId',
   ]);
-  // VERTĖ / BUDGET
+  // VERTĖ / BUDGET — Mercell grąžina `moneyRange: {min, max, currency}` arba
+  // kartais tiesiog skaičių. Pirmiausia patikrinam objektą.
   const budgetCandidates = [
-    'estimatedValue', 'estimatedTotalValue', 'contractValue', 'totalValue',
-    'maxBudget', 'maximumBudget', 'value', 'budget', 'valueExcludingVat',
-    'valueAmount', 'amount',
+    'moneyRange', 'estimatedValue', 'estimatedTotalValue',
+    'contractValue', 'totalValue', 'maxBudget', 'maximumBudget',
+    'value', 'budget', 'valueExcludingVat', 'valueAmount', 'amount',
+    'estimatedBudget', 'contractAmount',
   ];
-  let budget = pickField(root, budgetCandidates);
-  // jei tai objektas su {amount, currency}
-  if (!budget) {
-    for (const key of budgetCandidates) {
-      const v = root[key];
-      if (v && typeof v === 'object') {
-        const amt = v.amount ?? v.value ?? v.number;
-        const cur = v.currency ?? v.currencyCode ?? '';
-        if (amt) { budget = `${amt} ${cur}`.trim(); break; }
+  let budget = null;
+  // 1) Pirma bandom objekto formą {amount|value|min|max, currency}
+  for (const key of budgetCandidates) {
+    const v = root[key];
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const cur = v.currency ?? v.currencyCode ?? v.code ?? '';
+      const min = v.min ?? v.minValue ?? v.minimum;
+      const max = v.max ?? v.maxValue ?? v.maximum;
+      const amt = v.amount ?? v.value ?? v.number ?? max ?? min;
+      if (amt !== undefined && amt !== null && amt !== '') {
+        if (min !== undefined && max !== undefined && min !== max) {
+          budget = `${min}–${max} ${cur}`.trim();
+        } else {
+          budget = `${amt} ${cur}`.trim();
+        }
+        break;
       }
     }
   }
+  // 2) Fallback: paprastas skalarinis laukas
+  if (!budget) budget = pickField(root, budgetCandidates);
+
   const duration = pickField(root, [
     'duration', 'contractDuration', 'durationMonths', 'periodMonths',
-    'contractPeriod', 'contractLength',
+    'contractPeriod', 'contractLength', 'performancePeriod',
+    'timeFrame', 'validityPeriod', 'estimatedDuration',
   ]);
   const awardCriteria = pickField(root, [
     'awardCriteria', 'awardCriterion', 'evaluationCriteria',
     'weighingCriteria', 'criteria', 'contractAwardCriteria',
+    'awardingCriteria', 'evaluationMethod', 'selectionMethod',
   ]);
   const qualification = pickField(root, [
     'qualificationRequirements', 'selectionCriteria', 'suitabilityCriteria',
     'eligibilityCriteria', 'qualifications', 'participationCriteria',
+    'qualificationCriteria', 'tendererQualifications',
   ]);
   const requirements = pickField(root, [
     'requirementsForSupplier', 'supplierRequirements', 'requirements',
     'bidderRequirements', 'conditionsForParticipation',
+    'technicalRequirements', 'mandatoryRequirements', 'minimumRequirements',
   ]);
   const sourceUrl = pickField(root, [
     'sourceUrl', 'linkUrl', 'url', 'originalSourceUrl', 'externalUrl',
@@ -927,8 +953,11 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       const deadlineMatch = bodyText.match(
         /(?:deadline|closing\s*date|submission\s*deadline|määräaika|tarjousaika)[^\n]{0,40}?[:\s]+([^\n]{1,80})/i
       );
+      // Publication date turi atrodyti kaip data (dd/mm/yyyy, yyyy-mm-dd,
+      // „26 May 2026" ir pan.). Be to reikalavimo heuristika kibsdavo už
+      // „26 May - Deadline" ir panašių pavadinimų.
       const pubMatch = bodyText.match(
-        /(?:published|publication\s*date|julkaistu|julkaisupäivä)[^\n]{0,40}?[:\s]+([^\n]{1,60})/i
+        /(?:published|publication\s*date|julkaistu|julkaisupäivä)[^\n]{0,40}?[:\s]+(\d{1,2}[\/.\- ]\w{1,10}[\/.\- ]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{2,4})/i
       );
       const refMatch = bodyText.match(
         /(?:reference(?:\s+number|\s+no\.?)?|ref\.?\s*no\.?|viitenumero|hankintailmoituksen\s*numero)[:\s]+([A-Z0-9\-\/_.]+)/i
@@ -987,24 +1016,62 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
     } catch (_) {}
 
     console.log(`    Captured ${capturedApis.length} Mercell API responses`);
+
+    // DEBUG: pirmo naujo tender'io JSON'ą išrašom į diską — tai leis mums
+    // pamatyti nested'us laukus (requirements, duration, criteria, ...),
+    // kurių nėra top-level'yje.
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const dumpDir = path.join(process.cwd(), 'debug-json');
+      if (!fs.existsSync(dumpDir)) fs.mkdirSync(dumpDir, { recursive: true });
+      for (let i = 0; i < capturedApis.length; i++) {
+        const { url, json } = capturedApis[i];
+        const slug = url.replace(/[^a-zA-Z0-9]+/g, '_').slice(-80);
+        const file = path.join(dumpDir, `${Date.now()}_${i}_${slug}.json`);
+        fs.writeFileSync(file, JSON.stringify(json, null, 2));
+      }
+    } catch (e) {
+      console.log(`    (debug dump failed: ${e.message})`);
+    }
+
     for (const { url, json } of capturedApis) {
-      const topKeys = Object.keys(json || {}).slice(0, 12);
+      const topKeys = Object.keys(json || {}).slice(0, 20);
       console.log(`    API: ${url.slice(0, 100)} keys=${JSON.stringify(topKeys)}`);
+
+      // Diagnostika: dar gilesni nested keys, kad atrastume kur slypi
+      // requirements/qualifications/criteria/duration.
+      const nestedSummary = {};
+      for (const [k, v] of Object.entries(json || {})) {
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+          nestedSummary[k] = Object.keys(v).slice(0, 8);
+        } else if (Array.isArray(v) && v.length && typeof v[0] === 'object') {
+          nestedSummary[k + '[]'] = Object.keys(v[0] || {}).slice(0, 8);
+        }
+      }
+      if (Object.keys(nestedSummary).length) {
+        console.log(`    nested: ${JSON.stringify(nestedSummary).slice(0, 500)}`);
+      }
+
       const fields = extractFieldsFromTenderJson(json);
-      // Nenustuminam jau turimų reikšmių — tik užpildom tuščius.
-      if (fields.title && !details.title) details.title = fields.title;
-      if (fields.buyer && !details.organisation) details.organisation = fields.buyer;
-      if (fields.country && !details.country) details.country = fields.country;
-      if (fields.deadline && !details.deadline) details.deadline = fields.deadline;
-      if (fields.publicationDate && !details.publicationDate) details.publicationDate = fields.publicationDate;
-      if (fields.reference && !details.referenceNumber) details.referenceNumber = fields.reference;
-      if (fields.budget && !details.maxBudget) details.maxBudget = fields.budget;
-      if (fields.duration && !details.duration) details.duration = fields.duration;
-      if (fields.awardCriteria && !details.offerWeighingCriteria) details.offerWeighingCriteria = fields.awardCriteria;
-      if (fields.qualification && !details.qualificationRequirements) details.qualificationRequirements = fields.qualification;
-      if (fields.requirements && !details.requirementsForSupplier) details.requirementsForSupplier = fields.requirements;
+
+      // JSON VIRŠ DOM'O — Mercell JSON'as struktūrizuotas ir patikimas,
+      // o DOM heuristika dažnai pateikia šiukšles (pvz., publicationDate
+      // anksčiau gaudavo „26 May - Deadline"). Todėl čia užrašom JSON reikšmes
+      // per viršų, nebent jos tuščios.
+      if (fields.title) details.title = fields.title;
+      if (fields.buyer) details.organisation = fields.buyer;
+      if (fields.country) details.country = fields.country;
+      if (fields.deadline) details.deadline = fields.deadline;
+      if (fields.publicationDate) details.publicationDate = fields.publicationDate;
+      if (fields.reference) details.referenceNumber = fields.reference;
+      if (fields.budget) details.maxBudget = fields.budget;
+      if (fields.duration) details.duration = fields.duration;
+      if (fields.awardCriteria) details.offerWeighingCriteria = fields.awardCriteria;
+      if (fields.qualification) details.qualificationRequirements = fields.qualification;
+      if (fields.requirements) details.requirementsForSupplier = fields.requirements;
       if (fields.description && !details.scopeOfAgreement) details.scopeOfAgreement = fields.description;
-      if (fields.sourceUrl && !details.sourceUrl) details.sourceUrl = fields.sourceUrl;
+      if (fields.sourceUrl) details.sourceUrl = fields.sourceUrl;
       if (fields.cpvCodes && !details.cpvCodes) details.cpvCodes = fields.cpvCodes;
 
       // Logginam ką radom iš JSON'o, kad paprasta debugint kokie laukai buvo užpildyti
@@ -1608,6 +1675,48 @@ async function runScraper() {
 
     // ---- FORMAT ROWS & APPEND ----
     const nowIso = new Date().toISOString().slice(0, 10);
+
+    // Helper: ISO datetime → skaitoma data.  Priimame ir tikras ISO formas
+    // (2026-05-26T14:00:00Z), ir pre-parsintus stringus — paliekam kaip yra.
+    const fmtDate = (s) => {
+      if (!s) return '';
+      const str = String(s).trim();
+      const m = str.match(/^(\d{4}-\d{2}-\d{2})T/);
+      if (m) return m[1];
+      return str;
+    };
+    // Helper: visi description'ai ateina kaip JSON stringified array
+    // [{languageCode: "en", text: "..."}, ...]. Ištraukiam žmoniškai.
+    const cleanDescription = (v) => {
+      if (!v) return '';
+      const s = String(v);
+      // atpažįstam [{"languageCode":...,"text":"..."}...] formą
+      if (s.includes('languageCode') && s.includes('text')) {
+        try {
+          const arr = JSON.parse(s.startsWith('[') ? s : `[${s}]`);
+          if (Array.isArray(arr)) {
+            const en = arr.find((x) => x && x.languageCode === 'en');
+            const pick = en || arr[0];
+            if (pick && pick.text) return String(pick.text).trim();
+          }
+        } catch (_) {
+          // bandom su regex'u — renkam visas "text": "..." reikšmes
+          const texts = [...s.matchAll(/"text"\s*:\s*"([^"]*(?:\\.[^"]*)*)"/g)]
+            .map((m) => m[1].replace(/\\"/g, '"').replace(/\\n/g, ' '));
+          if (texts.length) return texts[0].trim();
+        }
+      }
+      return s.trim();
+    };
+    // Helper: organisation dažnai ateina su „\nShow all buyer information"
+    // priedu iš DOM'o. Paliekam tik pirmą reikšmingą eilutę.
+    const cleanOrg = (v) => {
+      if (!v) return '';
+      const s = String(v).trim();
+      const first = s.split(/\n|\r/).map((x) => x.trim()).filter(Boolean)[0];
+      return first || s;
+    };
+
     const rows = toFetch.map(t => {
       const d = t.details || {};
       // Source URL → pirmenybė šaltinio nuorodai, kaip paprašyta ("puslapis,
@@ -1615,18 +1724,18 @@ async function runScraper() {
       const publishedUrl = d.sourceUrl || t.url;
       return [
         nowIso,
-        d.publicationDate || t.publicationDate || '',
+        fmtDate(d.publicationDate || t.publicationDate || ''),
         publishedUrl,
         d.title || t.title || '',
-        d.organisation || t.organisation || '',
-        d.deadline || t.deadlineRaw || '',
+        cleanOrg(d.organisation || t.organisation || ''),
+        fmtDate(d.deadline || t.deadlineRaw || ''),
         d.country || t.country || '',
         d.maxBudget || '',
         d.duration || '',
-        d.requirementsForSupplier || '',
-        d.qualificationRequirements || '',
-        d.offerWeighingCriteria || '',
-        d.scopeOfAgreement || '',
+        cleanDescription(d.requirementsForSupplier || ''),
+        cleanDescription(d.qualificationRequirements || ''),
+        cleanDescription(d.offerWeighingCriteria || ''),
+        cleanDescription(d.scopeOfAgreement || ''),
         d.technicalStack || '',
         d.sourceUrl || '',
         d.referenceNumber || t.tenderId || '',
