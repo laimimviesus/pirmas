@@ -306,6 +306,22 @@ async function goToNextPage(page) {
 // =====================================================================
 
 async function fetchSourcePageDetails(browser, sourceUrl) {
+  // Mercell-internų permalink'ų atpažinimas — jei "Go to source" veda į
+  // patį Mercell (permalink.mercell.com ar mercell.com/*), šaltinio
+  // skrapinti nėra prasmės, nes tai yra tiesiog redirect'as į patį
+  // Mercell tender'io puslapį arba į portal'o landing page'ą, iš kurio
+  // realaus tender'io turinio pasiekti neįmanoma be papildomo login'o.
+  try {
+    const u = new URL(sourceUrl);
+    if (/(^|\.)mercell\.com$/i.test(u.hostname)) {
+      console.log(`    skipping Mercell-internal source: ${u.host}`);
+      return {
+        skipped: 'mercell-internal',
+        sourceHost: u.host,
+      };
+    }
+  } catch (_) { /* invalid URL → tęsiame, fetchas pats pašalins klaidą */ }
+
   let srcPage = null;
   try {
     srcPage = await browser.newPage();
@@ -333,12 +349,29 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       console.log(`    source nav warn: ${e.message}`);
     }
 
-    // Trumpam palaukti kol renderis stabilizuosis
+    // Po navigacijos patikriname galutinį host'ą — kai kurie "Go to source"
+    // permalink'ai atliekami per redirect'us ir galutinė lokacija vis tiek
+    // nukreipia į Mercell. Tokiu atveju neturi prasmės laužti duomenų.
+    try {
+      const finalUrl = new URL(srcPage.url());
+      if (/(^|\.)mercell\.com$/i.test(finalUrl.hostname)) {
+        console.log(`    source redirected to Mercell (${finalUrl.host}) — skipping`);
+        srcPage.off('request', blockHandler);
+        try { await srcPage.setRequestInterception(false); } catch (_) {}
+        return {
+          skipped: 'mercell-redirect',
+          sourceHost: finalUrl.host,
+        };
+      }
+    } catch (_) {}
+
+    // Trumpam palaukti kol renderis stabilizuosis — SPA'oms (pvz., Finnish
+    // hankintailmoitukset.fi) reikia daugiau laiko nei paprastam HTML'ui.
     await srcPage.waitForFunction(() => {
       const t = (document.body?.innerText || '').trim();
-      return t.length > 300;
-    }, { timeout: 8000 }).catch(() => {});
-    await new Promise(r => setTimeout(r, 400));
+      return t.length > 800;
+    }, { timeout: 12000 }).catch(() => {});
+    await new Promise(r => setTimeout(r, 1200));
 
     // Bandome uždaryti cookie banner'us, kurie dažnai uždengia turinį
     await srcPage.evaluate(() => {
@@ -403,28 +436,69 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       };
 
       // MAX BUDGET
-      let maxBudget = null;
-      const budgetRegexes = [
-        // EN: estimated value / contract value / total value / budget
-        /(?:estimated\s*(?:total\s*)?value|contract\s*value|total\s*value|max(?:imum)?\s*(?:budget|value)|budget)[^\n]{0,40}?[:\s]+((?:€|EUR|kr|NOK|SEK|DKK|£|\$)?\s*[\d.,\s]+(?:\s*(?:EUR|SEK|NOK|DKK|USD|GBP))?)/i,
+      //
+      // Griežtesnis matching'as:
+      // - MINIMALIAI 4 skaitmenys grupėje (1000+), kad išvengtume klaidingų
+      //   "10" ar "100" paėmimų iš ad-hoc konteksto (puslapių numeriai,
+      //   buyer ID, version'ai ir t.t.).
+      // - PRIVALOMA valiutos etiketė (€, EUR, kr, NOK, SEK, DKK, £, $, USD, GBP)
+      //   arba prieš skaitmenis, arba po jų.
+      // - Po etiketės leidžiami atskyrikliai: tarpas, dvitaškis, tab, naujalinija.
+      //
+      // Grupinamoji sintaksė (valiuta + skaičius) × 2 variantai, kad pagautume
+      // "EUR 1 234 567,89" ir "1 234 567,89 EUR".
+      //
+      // Pastaba: `\b\d{1,3}(?:[\s.,]\d{3}){1,}\b` reikalauja bent vieno
+      // tūkstančių atskyriklio (t.y. ≥1000). Taip pat leidžiame paprastą
+      // ≥4 skaitmenų blokeliu be atskyriklių (pvz., "10000").
+      const numPat = '(?:\\d{1,3}(?:[\\s.,]\\d{3}){1,}(?:[.,]\\d+)?|\\d{4,}(?:[.,]\\d+)?)';
+      const curPre = '(?:€|EUR|kr|NOK|SEK|DKK|£|\\$|USD|GBP)';
+      const curPost = '(?:\\s*(?:€|EUR|kr|NOK|SEK|DKK|£|USD|GBP))';
+      const budgetLabels = [
+        // EN
+        'estimated\\s*(?:total\\s*)?value', 'contract\\s*value', 'total\\s*value',
+        'max(?:imum)?\\s*(?:budget|value)', 'value\\s*excluding\\s*vat',
+        'value\\s*excl\\.?\\s*vat', 'budget',
         // SV/NO/DA
-        /(?:uppskattat\s*värde|kontraktsvärde|totalt?\s*värde|maxbudget|avtalsvärde|estimert\s*verdi|kontraktsverdi|estimeret\s*værdi|kontraktværdi)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|SEK|NOK|DKK|kr))?)/i,
+        'uppskattat\\s*värde', 'kontraktsvärde', 'totalt?\\s*värde',
+        'maxbudget', 'avtalsvärde', 'estimert\\s*verdi', 'kontraktsverdi',
+        'estimeret\\s*værdi', 'kontraktværdi',
         // FI
-        /(?:arvioitu\s*arvo|hankinnan\s*arvo|sopimuksen\s*arvo|kokonaisarvo)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|€))?)/i,
+        'arvioitu\\s*(?:kokonais)?arvo', 'hankinnan\\s*(?:ennakoitu\\s*)?arvo',
+        'sopimuksen\\s*arvo', 'kokonaisarvo', 'ennakoitu\\s*arvo',
         // DE
-        /(?:geschätzter\s*(?:gesamt)?wert|auftragswert|vertragswert|maximalbudget)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|€))?)/i,
+        'geschätzter\\s*(?:gesamt)?wert', 'auftragswert', 'vertragswert',
+        'maximalbudget', 'gesamtwert',
         // FR
-        /(?:valeur\s*(?:totale\s*)?estimée|montant\s*estimé|valeur\s*du\s*marché|budget\s*maximum)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|€))?)/i,
+        'valeur\\s*(?:totale\\s*)?estimée', 'montant\\s*estimé',
+        'valeur\\s*du\\s*marché', 'budget\\s*maximum',
         // NL
-        /(?:geschatte\s*waarde|contractwaarde|totale\s*waarde|maximale\s*begroting)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|€))?)/i,
+        'geschatte\\s*waarde', 'contractwaarde', 'totale\\s*waarde',
+        'maximale\\s*begroting',
         // ES/PT
-        /(?:valor\s*(?:total\s*)?estimado|importe\s*estimado|valor\s*do\s*contrato|presupuesto\s*máximo|orçamento\s*máximo)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|€))?)/i,
+        'valor\\s*(?:total\\s*)?estimado', 'importe\\s*estimado',
+        'valor\\s*do\\s*contrato', 'presupuesto\\s*máximo', 'orçamento\\s*máximo',
         // IT
-        /(?:valore\s*(?:totale\s*)?stimato|importo\s*stimato|valore\s*del\s*contratto|budget\s*massimo)[^\n]{0,40}?[:\s]+([\d.,\s]+(?:\s*(?:EUR|€))?)/i,
+        'valore\\s*(?:totale\\s*)?stimato', 'importo\\s*stimato',
+        'valore\\s*del\\s*contratto', 'budget\\s*massimo',
+      ].join('|');
+
+      // Du variantai: (a) valiuta prieš skaičių, (b) skaičius prieš valiutą.
+      const budgetRegexes = [
+        new RegExp(`(?:${budgetLabels})[^\\n]{0,60}?[:\\s]+((?:${curPre})\\s*${numPat}${curPost}?)`, 'i'),
+        new RegExp(`(?:${budgetLabels})[^\\n]{0,60}?[:\\s]+(${numPat}\\s*${curPre})`, 'i'),
       ];
+
+      let maxBudget = null;
       for (const re of budgetRegexes) {
         const m = bodyText.match(re);
-        if (m) { maxBudget = m[1].trim(); break; }
+        if (!m) continue;
+        const raw = m[1].trim().replace(/\s+/g, ' ');
+        // Sanity check: turi būti ≥4 skaitmenys IŠ VISO reikšmėje
+        const digitCount = (raw.match(/\d/g) || []).length;
+        if (digitCount < 4) continue;
+        maxBudget = raw;
+        break;
       }
 
       // DURATION
@@ -693,9 +767,13 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       const t0 = Date.now();
       const src = await fetchSourcePageDetails(browser, details.sourceUrl);
       const elapsed = Date.now() - t0;
-      console.log(`    source done in ${elapsed}ms (host: ${src?.sourceHost || 'n/a'}, err: ${src?.error || 'none'})`);
+      console.log(`    source done in ${elapsed}ms (host: ${src?.sourceHost || 'n/a'}, err: ${src?.error || 'none'}${src?.skipped ? ', skipped: ' + src.skipped : ''})`);
 
-      if (src && !src.error) {
+      if (src?.skipped) {
+        // Mercell-internis permalink'as — nefetchinam, tik paliekam žymę.
+        details.sourceHost = src.sourceHost || null;
+        details.sourceSkipped = src.skipped;
+      } else if (src && !src.error) {
         // Per-field logging — matome ką šaltinio puslapis grąžino
         const srcFieldSummary = {};
         for (const key of [
