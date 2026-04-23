@@ -108,6 +108,105 @@ async function checkTreeNodeByName(page, name) {
   }, name);
 }
 
+// Patikrina/pažymi PrimeReact checkbox'ą po tam tikru .p-accordion-tab (pagal ID regex).
+// Naudoja TIKRĄ mouse click per page.click() — element.click() iš evaluate'o neveikia
+// PrimeReact'ui su šiais checkbox'ais (patikrinta diagnostika — click'as kviečiasi,
+// bet .p-highlight nepersijungia).
+async function checkCheckboxInAccordion(page, accordionRegex, labelText) {
+  // 1. Išplėsti accordion'ą
+  await page.evaluate((pat) => {
+    const regex = new RegExp(pat, 'i');
+    const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+    const target = tabs.find(t => regex.test(t.id || ''));
+    if (!target) return;
+    const link = target.querySelector('.p-accordion-header-link');
+    if (link && link.getAttribute('aria-expanded') !== 'true') {
+      link.scrollIntoView({ block: 'center' });
+      link.click();
+    }
+  }, accordionRegex);
+  await new Promise(r => setTimeout(r, 700));
+
+  const tryClick = async (mode) => {
+    // mode: 'label' | 'box' | 'input'
+    const tagged = await page.evaluate((pat, text, clickMode) => {
+      const regex = new RegExp(pat, 'i');
+      const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+      const target = tabs.find(t => regex.test(t.id || ''));
+      if (!target) return { ok: false, reason: 'no accordion' };
+
+      document.querySelectorAll('[data-mx-click]').forEach(el => el.removeAttribute('data-mx-click'));
+
+      const labels = Array.from(target.querySelectorAll('.p-checkbox-label'));
+      const label = labels.find(l => {
+        const t = (l.textContent || '').trim();
+        return t === text || t.startsWith(text + ' ') || t.startsWith(text + '(');
+      });
+      if (!label) return { ok: false, reason: 'no label', avail: labels.map(l => l.textContent?.trim()).slice(0, 12) };
+
+      const wrapper = label.closest('.p-checkbox-wrapper') || label.parentElement;
+      let tgt = null;
+      if (clickMode === 'label') tgt = label;
+      else if (clickMode === 'box') tgt = wrapper?.querySelector('.p-checkbox-box');
+      else if (clickMode === 'input') tgt = wrapper?.querySelector('input[type="checkbox"]');
+      if (!tgt) return { ok: false, reason: `no target for mode ${clickMode}` };
+
+      tgt.setAttribute('data-mx-click', '1');
+      try { tgt.scrollIntoView({ block: 'center' }); } catch (_) {}
+      return { ok: true };
+    }, accordionRegex, labelText, mode);
+
+    if (!tagged.ok) return { ok: false, reason: tagged.reason, avail: tagged.avail };
+
+    try {
+      await page.click('[data-mx-click="1"]', { delay: 20 });
+    } catch (e) {
+      return { ok: false, reason: 'click error: ' + e.message };
+    }
+    await new Promise(r => setTimeout(r, 400));
+
+    const state = await page.evaluate((pat, text) => {
+      const regex = new RegExp(pat, 'i');
+      const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+      const target = tabs.find(t => regex.test(t.id || ''));
+      if (!target) return null;
+      const labels = Array.from(target.querySelectorAll('.p-checkbox-label'));
+      const label = labels.find(l => {
+        const t = (l.textContent || '').trim();
+        return t === text || t.startsWith(text + ' ') || t.startsWith(text + '(');
+      });
+      if (!label) return null;
+      const wrapper = label.closest('.p-checkbox-wrapper');
+      const box = wrapper?.querySelector('.p-checkbox-box');
+      const input = wrapper?.querySelector('input[type="checkbox"]');
+      return {
+        boxHighlight: box?.classList.contains('p-highlight') === true,
+        inputChecked: input?.checked === true,
+        ariaChecked: box?.getAttribute('aria-checked') || null,
+      };
+    }, accordionRegex, labelText);
+
+    const verified = !!state && (state.boxHighlight || state.inputChecked || state.ariaChecked === 'true');
+    return { ok: verified, state };
+  };
+
+  // Bandom eilės tvarka: label → box → input
+  for (const mode of ['label', 'box', 'input']) {
+    const r = await tryClick(mode);
+    if (r.ok) {
+      console.log(`  ✓ ${labelText} (mode=${mode})`, JSON.stringify(r.state));
+      return true;
+    }
+    if (r.avail) {
+      console.log(`  ✗ ${labelText}: ${r.reason}. Available labels:`, r.avail);
+      return false; // label'io nėra — nėra ko bandyti
+    }
+    console.log(`  ... ${labelText} mode=${mode} not verified, trying next`, JSON.stringify(r.state || {}));
+  }
+  console.log(`  ✗ ${labelText}: all click modes failed`);
+  return false;
+}
+
 function extractTenderId(urlOrHref) {
   const m = (urlOrHref || '').match(/\/tender\/(-?\d+)/);
   return m ? m[1] : null;
@@ -790,63 +889,14 @@ async function runScraper() {
     }
 
     // Opportunity type: Contract
-    await page.evaluate(() => {
-      const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
-      const target = tabs.find(t => /doc_type_code/i.test(t.id || ''));
-      const link = target?.querySelector('.p-accordion-header-link');
-      if (link && link.getAttribute('aria-expanded') !== 'true') {
-        link.scrollIntoView({ block: 'center' });
-        link.click();
-      }
-    });
-    await new Promise(r => setTimeout(r, 500));
-
-    await page.evaluate(() => {
-      const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
-      const target = tabs.find(t => /doc_type_code/i.test(t.id || ''));
-      if (!target) return;
-      const labels = Array.from(target.querySelectorAll('.p-checkbox-label'));
-      const label = labels.find(l => (l.textContent || '').trim().startsWith('Contract'));
-      if (!label) return;
-      const wrapper = label.closest('.p-checkbox-wrapper') || label.parentElement;
-      const box = wrapper?.querySelector('.p-checkbox-box') || wrapper?.querySelector('.p-checkbox') || wrapper;
-      box?.scrollIntoView({ block: 'center' });
-      box?.click();
-    });
-    console.log('  Opportunity type: Contract ✓');
+    const contractOk = await checkCheckboxInAccordion(page, 'doc_type_code', 'Contract');
+    console.log('  Opportunity type: Contract', contractOk ? '✓' : '✗');
 
     // Tender status
-    await page.evaluate(() => {
-      const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
-      const target = tabs.find(t => /tender_status/i.test(t.id || ''));
-      const link = target?.querySelector('.p-accordion-header-link');
-      if (link && link.getAttribute('aria-expanded') !== 'true') {
-        link.scrollIntoView({ block: 'center' });
-        link.click();
-      }
-    });
-    await new Promise(r => setTimeout(r, 500));
-
-    for (const wanted of ['Open for offers', 'No time limit']) {
-      await page.evaluate((name) => {
-        const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
-        const target = tabs.find(t => /tender_status/i.test(t.id || ''));
-        if (!target) return;
-        const labels = Array.from(target.querySelectorAll('.p-checkbox-label'));
-        const label = labels.find(l => {
-          const t = (l.textContent || '').trim();
-          return t === name || t.startsWith(name + ' ') || t.startsWith(name + '(') ||
-                 (name === 'Open for offers' && t.startsWith('Open for offer'));
-        });
-        if (!label) return;
-        const wrapper = label.closest('.p-checkbox-wrapper') || label.parentElement;
-        const box = wrapper?.querySelector('.p-checkbox-box') || wrapper?.querySelector('.p-checkbox') || wrapper;
-        box?.scrollIntoView({ block: 'center' });
-        box?.click();
-      }, wanted);
-      console.log('  Status:', wanted, '✓');
-      await new Promise(r => setTimeout(r, 250));
-    }
+    const openOk = await checkCheckboxInAccordion(page, 'tender_status', 'Open for offers');
+    console.log('  Status: Open for offers', openOk ? '✓' : '✗');
+    const noTimeOk = await checkCheckboxInAccordion(page, 'tender_status', 'No time limit');
+    console.log('  Status: No time limit', noTimeOk ? '✓' : '✗');
 
     // CPV Categories
     await page.evaluate(() => {
