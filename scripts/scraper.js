@@ -33,7 +33,28 @@ const SOURCE_NAV_TIMEOUT = 25000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const AI_MODEL = process.env.AI_MODEL || 'claude-haiku-4-5-20251001';
 const AI_ENABLED = !!ANTHROPIC_API_KEY;
+// Rate-limit state (org cap: 5 req/min for Haiku). We keep a rolling log of
+// call timestamps and delay so no more than AI_MAX_PER_MIN fire in any 60s.
+const AI_MAX_PER_MIN = Number(process.env.AI_MAX_PER_MIN || 4); // headroom under 5/min
+const _claudeCallTimes = [];
+const _sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+async function _throttleClaude() {
+  while (true) {
+    const now = Date.now();
+    // drop timestamps older than 60s
+    while (_claudeCallTimes.length && now - _claudeCallTimes[0] > 60000) {
+      _claudeCallTimes.shift();
+    }
+    if (_claudeCallTimes.length < AI_MAX_PER_MIN) {
+      _claudeCallTimes.push(now);
+      return;
+    }
+    const waitMs = 60000 - (now - _claudeCallTimes[0]) + 250;
+    console.log(`    ⏳ Claude rate-limit wait ${(waitMs/1000).toFixed(1)}s (${_claudeCallTimes.length}/${AI_MAX_PER_MIN} in last 60s)`);
+    await _sleep(waitMs);
+  }
+}
 async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperature = 0 } = {}) {
   if (!AI_ENABLED) throw new Error('ANTHROPIC_API_KEY missing');
   const body = JSON.stringify({
@@ -44,49 +65,74 @@ async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperat
     messages: [{ role: 'user', content: userPrompt }],
   });
   const https = require('https');
-  return await new Promise((resolve, reject) => {
-    const req = https.request(
-      {
-        hostname: 'api.anthropic.com',
-        path: '/v1/messages',
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-api-key': ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-          'content-length': Buffer.byteLength(body),
-        },
-        timeout: 45000,
-      },
-      (res) => {
-        let chunks = '';
-        res.setEncoding('utf8');
-        res.on('data', (c) => { chunks += c; });
-        res.on('end', () => {
-          if (res.statusCode < 200 || res.statusCode >= 300) {
-            return reject(new Error(`Claude HTTP ${res.statusCode}: ${chunks.slice(0, 300)}`));
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    await _throttleClaude();
+    try {
+      return await new Promise((resolve, reject) => {
+        const req = https.request(
+          {
+            hostname: 'api.anthropic.com',
+            path: '/v1/messages',
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'x-api-key': ANTHROPIC_API_KEY,
+              'anthropic-version': '2023-06-01',
+              'content-length': Buffer.byteLength(body),
+            },
+            timeout: 45000,
+          },
+          (res) => {
+            let chunks = '';
+            res.setEncoding('utf8');
+            res.on('data', (c) => { chunks += c; });
+            res.on('end', () => {
+              if (res.statusCode === 429 || res.statusCode === 529) {
+                const ra = Number(res.headers['retry-after']);
+                const wait = (Number.isFinite(ra) && ra > 0 ? ra * 1000 : 15000);
+                const err = new Error(`Claude HTTP ${res.statusCode}: ${chunks.slice(0, 200)}`);
+                err._retryAfter = wait;
+                err._retryable = true;
+                return reject(err);
+              }
+              if (res.statusCode < 200 || res.statusCode >= 300) {
+                return reject(new Error(`Claude HTTP ${res.statusCode}: ${chunks.slice(0, 300)}`));
+              }
+              try {
+                const j = JSON.parse(chunks);
+                const text = (j.content || [])
+                  .filter((b) => b.type === 'text')
+                  .map((b) => b.text)
+                  .join('')
+                  .trim();
+                resolve(text);
+              } catch (e) {
+                reject(new Error(`Claude JSON parse: ${e.message}`));
+              }
+            });
           }
-          try {
-            const j = JSON.parse(chunks);
-            const text = (j.content || [])
-              .filter((b) => b.type === 'text')
-              .map((b) => b.text)
-              .join('')
-              .trim();
-            resolve(text);
-          } catch (e) {
-            reject(new Error(`Claude JSON parse: ${e.message}`));
-          }
-        });
+        );
+        req.on('timeout', () => { req.destroy(new Error('Claude request timeout')); });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+      });
+    } catch (e) {
+      if (e._retryable && attempt < MAX_ATTEMPTS) {
+        // Drop the timestamp we just reserved — the call didn't actually succeed,
+        // and we want the next attempt to wait the Retry-After window, not skip.
+        _claudeCallTimes.pop();
+        const wait = e._retryAfter || (5000 * attempt);
+        console.log(`    ⏳ Claude 429 (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${(wait/1000).toFixed(1)}s`);
+        await _sleep(wait);
+        continue;
       }
-    );
-    req.on('timeout', () => { req.destroy(new Error('Claude request timeout')); });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
+      throw e;
+    }
+  }
+  throw new Error('Claude: exhausted retries');
 }
-
 async function translateToEnglish(text, { hint = '', skipHeuristic = false } = {}) {
   if (!AI_ENABLED || !text) return '';
   const trimmed = String(text).slice(0, 6000);
