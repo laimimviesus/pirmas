@@ -51,6 +51,7 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           SHEET_TAB_NAME: ${{ secrets.SHEET_TAB_NAME || 'Sheet1' }}
           TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: node scripts/scraper.js
 
       - name: Upload logs on failure
