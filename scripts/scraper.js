@@ -22,6 +22,144 @@ const DETAILS_LIMIT = TEST_MODE ? 2 : Number(process.env.DETAILS_LIMIT || 500);
 const FLUSH_BATCH = TEST_MODE ? 1 : Number(process.env.FLUSH_BATCH || 5);
 const SOURCE_NAV_TIMEOUT = 25000;
 
+// --- Anthropic Claude API ---------------------------------------------
+// Naudojam Claude Haiku 4.5 (pigus, greitas) dviem užduotims:
+//   1. Pavadinimo ir scope tekstų vertimui į anglų kalbą
+//   2. Struktūrizuotų laukų ištraukimui iš Mercell description'o +
+//      šaltinio puslapio teksto (maxBudget, requirements, qualifications,
+//      offerWeighingCriteria)
+// Jei nėra ANTHROPIC_API_KEY — AI žingsniai praleidžiami, scraper'is
+// veikia kaip anksčiau.
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const AI_MODEL = process.env.AI_MODEL || 'claude-haiku-4-5-20251001';
+const AI_ENABLED = !!ANTHROPIC_API_KEY;
+
+async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperature = 0 } = {}) {
+  if (!AI_ENABLED) throw new Error('ANTHROPIC_API_KEY missing');
+  const body = JSON.stringify({
+    model: AI_MODEL,
+    max_tokens: maxTokens,
+    temperature,
+    system: systemPrompt,
+    messages: [{ role: 'user', content: userPrompt }],
+  });
+  const https = require('https');
+  return await new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: 'api.anthropic.com',
+        path: '/v1/messages',
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-length': Buffer.byteLength(body),
+        },
+        timeout: 45000,
+      },
+      (res) => {
+        let chunks = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { chunks += c; });
+        res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            return reject(new Error(`Claude HTTP ${res.statusCode}: ${chunks.slice(0, 300)}`));
+          }
+          try {
+            const j = JSON.parse(chunks);
+            const text = (j.content || [])
+              .filter((b) => b.type === 'text')
+              .map((b) => b.text)
+              .join('')
+              .trim();
+            resolve(text);
+          } catch (e) {
+            reject(new Error(`Claude JSON parse: ${e.message}`));
+          }
+        });
+      }
+    );
+    req.on('timeout', () => { req.destroy(new Error('Claude request timeout')); });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function translateToEnglish(text, { hint = '', skipHeuristic = false } = {}) {
+  if (!AI_ENABLED || !text) return '';
+  const trimmed = String(text).slice(0, 6000);
+  // Heuristika tik ilgiems tekstams (scope), kad netrinktume Haiku'o dėl
+  // aiškiai angliško turinio. Trumpiems pavadinimams heuristika klysta
+  // (pvz., vokiškas „Beschaffung eines Schulmanagementsystems" neturi
+  // umlautų), tad jiems perduodam skipHeuristic=true.
+  if (!skipHeuristic) {
+    const looksEnglish =
+      !/[äöüßñçéèêáíóúîôûàèìòùâêîôûãõÿøœæåÄÖÜÑÉÉÈÊÁÍÓÚÎÔÛ]/.test(trimmed) &&
+      !/\b(och|und|der|die|den|het|van|een|de|el|la|les|los|das|für|pour|sur|avec|med|till|fra|para|del|dei|delle|della|zur|zum|mit|auf|bei|nach|ist|sind|wir|sie|ihr|van|voor|naar|niet|wel|als|aan|bij|maar|ook|waar|dan|alleen|geen|meer|kan)\b/i.test(trimmed);
+    if (looksEnglish) return trimmed;
+  }
+  try {
+    const out = await callClaude(
+      'You are a precise translator. Translate the user text into clear, concise English. Preserve technical terms, tender reference numbers, organisation names, CPV codes verbatim. Return ONLY the translation, no preface, no explanations, no quotes.',
+      `${hint ? `Context: ${hint}\n\n` : ''}Text to translate:\n${trimmed}`,
+      { maxTokens: 800, temperature: 0 }
+    );
+    return out || trimmed;
+  } catch (e) {
+    console.log(`    ⚠️ translate failed: ${e.message}`);
+    return trimmed;
+  }
+}
+
+async function extractFieldsWithAI(text, meta = {}) {
+  if (!AI_ENABLED || !text) return {};
+  const trimmed = String(text).slice(0, 15000);
+  const system =
+    'You extract structured procurement tender fields from free-form notice text. ' +
+    'Return ONLY a JSON object (no prose, no markdown fences) with these keys: ' +
+    'maxBudget, duration, requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement. ' +
+    'Rules:\n' +
+    '- maxBudget: total ceiling / max contract value in EUR (or native currency with explicit code), without VAT if stated. Example: "1,200,000 EUR (ex VAT)". Empty string if not stated.\n' +
+    '- duration: contract length in months or years. Example: "36 months" or "2 years + 2 x 1 year option". Empty string if not stated.\n' +
+    '- requirementsForSupplier: bullet-style summary (≤400 chars) of mandatory supplier/bidder requirements (legal status, insurance, ISO certifications, technical staff, etc.). Empty string if not stated.\n' +
+    '- qualificationRequirements: bullet-style summary (≤400 chars) of selection / qualification criteria (references, turnover thresholds, past projects, team CVs). Empty string if not stated.\n' +
+    '- offerWeighingCriteria: award criteria with weights if present. Example: "Price 40%, Quality 35%, Delivery time 25%" or "MEAT — lowest price". Empty string if not stated.\n' +
+    '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English.\n' +
+    'Write all field values in English even if the source is in another language. Never invent data — if a field is not present, use an empty string.';
+  const metaLine = [
+    meta.title ? `Title: ${meta.title}` : '',
+    meta.buyer ? `Buyer: ${meta.buyer}` : '',
+    meta.country ? `Country: ${meta.country}` : '',
+    meta.referenceNumber ? `Ref: ${meta.referenceNumber}` : '',
+  ].filter(Boolean).join('\n');
+  try {
+    const out = await callClaude(
+      system,
+      `${metaLine ? metaLine + '\n\n' : ''}Notice text:\n${trimmed}`,
+      { maxTokens: 1200, temperature: 0 }
+    );
+    // Claude sometimes wraps JSON in fences; strip them defensively.
+    const cleaned = out
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/```\s*$/i, '')
+      .trim();
+    const parsed = JSON.parse(cleaned);
+    return {
+      maxBudget: (parsed.maxBudget || '').toString().trim(),
+      duration: (parsed.duration || '').toString().trim(),
+      requirementsForSupplier: (parsed.requirementsForSupplier || '').toString().trim(),
+      qualificationRequirements: (parsed.qualificationRequirements || '').toString().trim(),
+      offerWeighingCriteria: (parsed.offerWeighingCriteria || '').toString().trim(),
+      scopeOfAgreement: (parsed.scopeOfAgreement || '').toString().trim(),
+    };
+  } catch (e) {
+    console.log(`    ⚠️ AI extract failed: ${e.message.slice(0, 160)}`);
+    return {};
+  }
+}
+
 // --- Pagalbinės funkcijos ----------------------------------------------
 
 async function clickButtonContainsText(page, text) {
@@ -1245,6 +1383,8 @@ async function runScraper() {
     hasSheetId: !!process.env.GOOGLE_SHEET_ID,
     hasUsername: !!process.env.MERCELL_USERNAME,
     hasPassword: !!process.env.MERCELL_PASSWORD,
+    hasAnthropicKey: AI_ENABLED,
+    aiModel: AI_ENABLED ? AI_MODEL : '(disabled)',
   });
 
   if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
@@ -1781,11 +1921,16 @@ async function runScraper() {
     const buildRow = (t) => {
       const d = t.details || {};
       const publishedUrl = d.sourceUrl || t.url;
+      // Pavadinimui ir scope — jei turim AI išverstą versiją, rodom ją
+      // (lengviau sales komandai dirbti angliškai). Jei AI išjungtas, rodom
+      // originalą.
+      const titleOut = d.titleEn || cleanDescription(d.title || t.title || '');
+      const scopeOut = d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || '');
       return [
         nowIso,
         fmtDate(d.publicationDate || t.publicationDate || ''),
         publishedUrl,
-        cleanDescription(d.title || t.title || ''),
+        titleOut,
         cleanOrg(d.organisation || t.organisation || ''),
         fmtDate(d.deadline || t.deadlineRaw || ''),
         d.country || t.country || '',
@@ -1794,7 +1939,7 @@ async function runScraper() {
         cleanDescription(d.requirementsForSupplier || ''),
         cleanDescription(d.qualificationRequirements || ''),
         cleanDescription(d.offerWeighingCriteria || ''),
-        cleanDescription(d.scopeOfAgreement || ''),
+        scopeOut,
         d.technicalStack || '',
         d.sourceUrl || '',
         d.referenceNumber || t.tenderId || '',
@@ -1872,6 +2017,61 @@ async function runScraper() {
         } catch (e) {
           console.log(`  ✗ retry threw: ${e.message}`);
         }
+      }
+
+      // --- AI ENRICHMENT (translate + extract missing fields) -------
+      if (AI_ENABLED) {
+        const dd = toFetch[i].details || {};
+        const rawTitle = cleanDescription(dd.title || toFetch[i].title || '');
+        const rawScope = cleanDescription(dd.scopeOfAgreement || '');
+        const combinedText = [
+          rawTitle ? `TITLE: ${rawTitle}` : '',
+          rawScope ? `DESCRIPTION: ${rawScope}` : '',
+          dd.fullTextSnippet ? `MERCELL_PAGE: ${dd.fullTextSnippet}` : '',
+        ].filter(Boolean).join('\n\n');
+
+        // 1) Extract structured fields if any are missing
+        const needsExtract =
+          !dd.maxBudget || !dd.requirementsForSupplier ||
+          !dd.qualificationRequirements || !dd.offerWeighingCriteria ||
+          !dd.scopeOfAgreement;
+        if (needsExtract && combinedText) {
+          const ai = await extractFieldsWithAI(combinedText, {
+            title: rawTitle,
+            buyer: dd.organisation || '',
+            country: dd.country || '',
+            referenceNumber: dd.referenceNumber || '',
+          });
+          const filled = [];
+          if (!dd.maxBudget && ai.maxBudget) { dd.maxBudget = ai.maxBudget; filled.push('maxBudget'); }
+          if (!dd.duration && ai.duration) { dd.duration = ai.duration; filled.push('duration'); }
+          if (!dd.requirementsForSupplier && ai.requirementsForSupplier) { dd.requirementsForSupplier = ai.requirementsForSupplier; filled.push('requirements'); }
+          if (!dd.qualificationRequirements && ai.qualificationRequirements) { dd.qualificationRequirements = ai.qualificationRequirements; filled.push('qualifications'); }
+          if (!dd.offerWeighingCriteria && ai.offerWeighingCriteria) { dd.offerWeighingCriteria = ai.offerWeighingCriteria; filled.push('criteria'); }
+          // scopeOfAgreement: AI's English summary overrides native-language description
+          if (ai.scopeOfAgreement) { dd.scopeOfAgreement = ai.scopeOfAgreement; filled.push('scope'); }
+          if (filled.length) console.log(`    🤖 AI filled: ${filled.join(', ')}`);
+        }
+
+        // 2) Translate title (always — short, heuristika klysta trumpiems).
+        //    Jei tekstas jau anglų, Claude grąžins jį beveik identišką.
+        if (rawTitle) {
+          const titleEn = await translateToEnglish(rawTitle, {
+            hint: 'Public tender title',
+            skipHeuristic: true,
+          });
+          if (titleEn) dd.titleEn = titleEn;
+        }
+
+        // 3) Translate scopeOfAgreement if not already English
+        //    (if AI extract above produced English scope, skip; otherwise translate)
+        const scopeToTranslate = dd.scopeOfAgreement || rawScope;
+        if (scopeToTranslate) {
+          const scopeEn = await translateToEnglish(scopeToTranslate, { hint: 'Public tender scope of agreement' });
+          if (scopeEn) dd.scopeOfAgreementEn = scopeEn;
+        }
+
+        toFetch[i].details = dd;
       }
 
       // Build & buffer
