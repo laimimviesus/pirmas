@@ -1453,24 +1453,57 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       const collectedFiles = [];
       const seenIds = new Set();
 
+      // String coercer — kartais Mercell JSON'e lauke yra array (pvz., title[])
+      // arba objektas su {languageCode,text}. Paversciam į plain string.
+      const toStr = (v) => {
+        if (v == null) return '';
+        if (typeof v === 'string') return v;
+        if (Array.isArray(v)) {
+          for (const it of v) { const s = toStr(it); if (s) return s; }
+          return '';
+        }
+        if (typeof v === 'object') {
+          return toStr(v.text || v.name || v.value || v.fileName || '');
+        }
+        return String(v);
+      };
+
       const pickFromNode = (node) => {
         if (!node || typeof node !== 'object') return;
         if (Array.isArray(node)) { for (const it of node) pickFromNode(it); return; }
-        const looksLikeFile =
-          (node.id || node.fileId || node.documentId || node.guid) &&
-          (node.filename || node.fileName || node.name || node.title || node.displayName);
-        if (looksLikeFile) {
-          const id = node.id || node.fileId || node.documentId || node.guid;
-          const name = node.filename || node.fileName || node.name || node.title || node.displayName || '';
-          const url = node.url || node.downloadUrl || node.downloadLink || node.href || null;
-          const mime = node.mimeType || node.contentType || node.type || '';
-          const ext = (name.match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '';
-          const isPdfLike = /pdf/i.test(mime) || /^pdf$/i.test(ext);
-          if (id && isPdfLike && !seenIds.has(String(id))) {
-            seenIds.add(String(id));
-            collectedFiles.push({ id: String(id), name, url, mime, ext });
+        // Strict file detection: reikia arba `fileId` + `extension`, arba
+        // aiškaus `mimeType: application/pdf`, arba download URL. Taip nepagaunam
+        // root tender'io objekto (kuris turi `id` + `title`, bet tai ne failas).
+        const hasFileId = !!(node.fileId || node.documentId || node.guid);
+        const extRaw = toStr(node.extension || '');
+        const mimeRaw = toStr(node.mimeType || node.contentType || '');
+        const typeRaw = toStr(node.type || '');
+        const nameRaw = toStr(node.name || node.filename || node.fileName || node.displayName || '');
+        const urlRaw = toStr(node.url || node.downloadUrl || node.downloadLink || node.href || '');
+
+        const extFromName = (nameRaw.match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '';
+        const ext = (extRaw || extFromName || '').toLowerCase();
+        const isPdfByMime = /pdf/i.test(mimeRaw);
+        const isPdfByExt = /^pdf$/i.test(ext);
+        const isPdfByType = /pdf/i.test(typeRaw);
+
+        const looksLikeFile = hasFileId && (extRaw || nameRaw || mimeRaw || urlRaw);
+        const isPdf = looksLikeFile && (isPdfByMime || isPdfByExt || isPdfByType);
+
+        if (isPdf) {
+          const id = toStr(node.fileId || node.documentId || node.guid);
+          if (id && !seenIds.has(id)) {
+            seenIds.add(id);
+            collectedFiles.push({
+              id,
+              name: nameRaw || `file-${id}.pdf`,
+              url: urlRaw || null,
+              mime: mimeRaw,
+              ext,
+            });
           }
         }
+
         for (const v of Object.values(node)) {
           if (v && typeof v === 'object') pickFromNode(v);
         }
