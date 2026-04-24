@@ -115,7 +115,9 @@ async function translateToEnglish(text, { hint = '', skipHeuristic = false } = {
 
 async function extractFieldsWithAI(text, meta = {}) {
   if (!AI_ENABLED || !text) return {};
-  const trimmed = String(text).slice(0, 15000);
+  // Bumped to 40000 — kad PDF dokumentų turinys (reikalavimai, kvalifikacijos,
+  // vertinimo kriterijai) pilnai tilptų į Claude prompt'ą.
+  const trimmed = String(text).slice(0, 40000);
   const system =
     'You extract structured procurement tender fields from free-form notice text. ' +
     'Return ONLY a JSON object (no prose, no markdown fences) with these keys: ' +
@@ -1440,6 +1442,130 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       if (filled) console.log(`    → from JSON: ${filled}`);
     }
 
+    // --- PDF DOKUMENTŲ PARSINIMAS ------------------------------------
+    // Mercell tender'io JSON'uose gali būti `files[]` / `documents[]` /
+    // `attachments[]` — čia surandame PDF'us, parsiunčiame su authent'intais
+    // puslapio sausainiais (`credentials: 'include'` per `page.evaluate`) ir
+    // ištraukiame teksto turinį pdf-parse'u. Išgautą tekstą pridedame į
+    // `details.pdfText`, kad AI ištraukimas galėtų pasimatyti reikalavimus,
+    // kvalifikacijas ir vertinimo kriterijus iš tikrų dokumentų.
+    try {
+      const collectedFiles = [];
+      const seenIds = new Set();
+
+      const pickFromNode = (node) => {
+        if (!node || typeof node !== 'object') return;
+        if (Array.isArray(node)) { for (const it of node) pickFromNode(it); return; }
+        const looksLikeFile =
+          (node.id || node.fileId || node.documentId || node.guid) &&
+          (node.filename || node.fileName || node.name || node.title || node.displayName);
+        if (looksLikeFile) {
+          const id = node.id || node.fileId || node.documentId || node.guid;
+          const name = node.filename || node.fileName || node.name || node.title || node.displayName || '';
+          const url = node.url || node.downloadUrl || node.downloadLink || node.href || null;
+          const mime = node.mimeType || node.contentType || node.type || '';
+          const ext = (name.match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '';
+          const isPdfLike = /pdf/i.test(mime) || /^pdf$/i.test(ext);
+          if (id && isPdfLike && !seenIds.has(String(id))) {
+            seenIds.add(String(id));
+            collectedFiles.push({ id: String(id), name, url, mime, ext });
+          }
+        }
+        for (const v of Object.values(node)) {
+          if (v && typeof v === 'object') pickFromNode(v);
+        }
+      };
+
+      for (const { json } of capturedApis) pickFromNode(json);
+
+      if (collectedFiles.length) {
+        console.log(`    📄 found ${collectedFiles.length} PDF file(s) in JSON`);
+      }
+
+      // Kiek PDF'ų parsiunčiam per tender'į (kad neužtruktų per ilgai):
+      const MAX_PDFS_PER_TENDER = 2;
+      const MAX_PDF_TEXT_CHARS = 20000;
+      let pdfParse = null;
+      try {
+        pdfParse = require('pdf-parse'); // optional dep
+      } catch (_) {
+        if (collectedFiles.length) {
+          console.log('    ⚠️ pdf-parse not installed — skipping PDF content extraction');
+        }
+      }
+
+      if (pdfParse && collectedFiles.length) {
+        const pdfTexts = [];
+        const toFetchPdfs = collectedFiles.slice(0, MAX_PDFS_PER_TENDER);
+
+        for (const f of toFetchPdfs) {
+          // Bandomi URL šablonai (vienas iš jų suveiks). Pirmas — jei JSON'e
+          // jau buvo `url`/`downloadUrl` laukas.
+          const candidates = [];
+          if (f.url) candidates.push(f.url);
+          candidates.push(
+            `https://file-service.discover.app.mercell.com/api/v1/files/${f.id}/download`,
+            `https://file-service.discover.app.mercell.com/api/v1/files/${f.id}`,
+            `https://app.mercell.com/files/${f.id}/download`,
+            `https://app.mercell.com/api/v1/files/${f.id}`,
+          );
+
+          let bytes = null;
+          let okUrl = null;
+          for (const u of candidates) {
+            try {
+              const result = await page.evaluate(async (url) => {
+                try {
+                  const r = await fetch(url, { credentials: 'include' });
+                  if (!r.ok) return { ok: false, status: r.status };
+                  const ct = r.headers.get('content-type') || '';
+                  const buf = await r.arrayBuffer();
+                  const arr = Array.from(new Uint8Array(buf));
+                  return { ok: true, status: r.status, contentType: ct, data: arr, size: arr.length };
+                } catch (e) {
+                  return { ok: false, error: String(e) };
+                }
+              }, u);
+              if (result && result.ok && result.size > 100) {
+                bytes = Buffer.from(result.data);
+                okUrl = u;
+                break;
+              }
+            } catch (_) {
+              // try next
+            }
+          }
+
+          if (!bytes) {
+            console.log(`    ⚠️ could not fetch PDF "${f.name}" (id=${f.id})`);
+            continue;
+          }
+
+          try {
+            const parsed = await pdfParse(bytes);
+            const text = (parsed && parsed.text ? parsed.text : '').trim();
+            if (text) {
+              const clipped = text.slice(0, MAX_PDF_TEXT_CHARS);
+              pdfTexts.push(`--- ${f.name} ---\n${clipped}`);
+              console.log(`    📄 parsed "${f.name}" (${bytes.length}B → ${clipped.length}ch from ${okUrl.slice(0, 70)})`);
+            } else {
+              console.log(`    ⚠️ PDF "${f.name}" has no extractable text`);
+            }
+          } catch (e) {
+            console.log(`    ⚠️ pdf-parse failed for "${f.name}": ${e.message}`);
+          }
+        }
+
+        if (pdfTexts.length) {
+          const combined = pdfTexts.join('\n\n');
+          // Bendrai ribokime per tender'į (kad AI prompt'as neišeitų už ribų)
+          details.pdfText = combined.slice(0, MAX_PDF_TEXT_CHARS * MAX_PDFS_PER_TENDER);
+        }
+      }
+    } catch (e) {
+      console.log(`    ⚠️ PDF extraction error: ${e.message}`);
+    }
+
     // --- ŠALTINIO PUSLAPIS -------------------------------------------
     if (details.sourceUrl) {
       console.log(`    → source: ${details.sourceUrl.slice(0, 80)}`);
@@ -1996,13 +2122,14 @@ async function runScraper() {
       'TECHNICAL STACK',
       'Source URL',
       'Reference number',
+      'KEYWORDS',
     ];
 
     let existingIds = new Set();
     try {
       const existing = await sheets.spreadsheets.values.get({
         spreadsheetId: SHEET_ID,
-        range: `${TAB_NAME}!A1:P`,
+        range: `${TAB_NAME}!A1:Q`,
       });
       const rows = existing.data.values || [];
       const hasHeader = rows[0] && rows[0][0] === SHEET_HEADERS[0];
@@ -2108,6 +2235,113 @@ async function runScraper() {
       return first || s;
     };
 
+    // --- KEYWORD TAGGING ------------------------------------------------
+    // Sales komanda nori matyti, kurie iš jų bendrai sekamų raktinių
+    // žodžių atitinka tender'į. Surinktus žodžius grąžinam kaip
+    // comma-separated list'ą paskutiniame sheet'o stulpelyje ("KEYWORDS").
+    // Match'as vykdomas regex'u ant EN tikro teksto (title + scope +
+    // requirements + qualifications + criteria + keywords iš CPV aprašymo).
+    const KEYWORD_PATTERNS = [
+      { label: 'software development', re: /\b(software\s*development|custom\s*software|bespoke\s*software)\b/i },
+      { label: 'project management',   re: /\b(project\s*management|programme\s*management|programme\s*manager|PMP|prince2)\b/i },
+      { label: 'Agile',                re: /\b(agile|scrum|kanban|SAFe|sprint\s*planning)\b/i },
+      { label: 'AI',                   re: /\b(AI|artificial\s*intelligence|machine\s*learning|\bML\b|LLM|generative\s*ai|genai|deep\s*learning|neural\s*network)\b/i },
+      { label: 'IT',                   re: /\b(IT\s*services?|ICT|information\s*technology|IT\s*systems?)\b/i },
+      { label: 'system support',       re: /\b(system\s*support|application\s*support|maintenance\s*and\s*support|technical\s*support)\b/i },
+      { label: 'application development', re: /\b(application\s*development|app\s*development|web\s*application|mobile\s*application)\b/i },
+      { label: 'JAVA',                 re: /\b(java|spring\s*boot|\bJVM\b|jakarta\s*ee|javaee)\b/i },
+      { label: 'Python',               re: /\b(python|django|flask|fastapi)\b/i },
+      { label: 'React',                re: /\b(react(?!\s*native)|reactjs|next\.?js)\b/i },
+      { label: 'React Native',         re: /\b(react\s*native)\b/i },
+      { label: 'IT system modernization', re: /\b(system\s*modernization|legacy\s*modernization|legacy\s*migration|modernisation|replatforming)\b/i },
+      { label: 'cloud-native development', re: /\b(cloud[-\s]*native|AWS|azure|GCP|kubernetes|\bK8s\b|microservices|serverless)\b/i },
+      { label: 'quality assurance',    re: /\b(quality\s*assurance|\bQA\b|test\s*automation)\b/i },
+      { label: 'testing',              re: /\b(testing|test\s*management|test\s*strategy|test\s*cases?)\b/i },
+      { label: 'user interface',       re: /\b(user\s*interface|\bUI\s*design|\bUI\b(?!\w))\b/i },
+      { label: 'system implementation', re: /\b(system\s*implementation|rollout|deployment|go[-\s]*live)\b/i },
+      { label: 'UX/UI',                re: /\b(UX\/UI|UI\/UX|UX\s*design|user\s*experience|\bUX\b(?!\w))\b/i },
+    ];
+    const matchKeywords = (texts) => {
+      const blob = (Array.isArray(texts) ? texts : [texts]).filter(Boolean).join(' \n ');
+      if (!blob.trim()) return '';
+      const matched = new Set();
+      for (const { label, re } of KEYWORD_PATTERNS) {
+        if (re.test(blob)) matched.add(label);
+      }
+      return Array.from(matched).join(', ');
+    };
+
+    // --- BUDGET PARSER (into EUR) --------------------------------------
+    // Grąžina { amount: number|null, known: boolean }. Palaiko:
+    //   "1,200,000 EUR", "1 200 000,00 €", "€1.5 million", "200k NOK",
+    //   "2,5 mln EUR", "no limit", "€30" (suspect — grąžinam kaip 30).
+    // Valiutos: EUR/€, NOK, SEK, DKK, GBP/£, USD/$ — verčiam į EUR pagal
+    // grubų kursą (užtenka "virš/po 500K" filtrui).
+    const FX_TO_EUR = {
+      EUR: 1, '€': 1,
+      NOK: 0.087, SEK: 0.088, DKK: 0.134,
+      GBP: 1.17, '£': 1.17,
+      USD: 0.92, '$': 0.92,
+      PLN: 0.23, CZK: 0.040, HUF: 0.0026,
+    };
+    const parseEurBudget = (raw) => {
+      if (!raw) return { amount: null, known: false };
+      let s = String(raw).trim();
+      if (!s) return { amount: null, known: false };
+      // Anything saying "no limit", "unknown", "not specified" — treat as unknown.
+      if (/\b(no\s*limit|unknown|not\s*specified|n\/?a|none)\b/i.test(s)) {
+        return { amount: null, known: false };
+      }
+      // Pick currency
+      let fx = 1;
+      let currencyMatched = null;
+      for (const code of ['EUR', 'NOK', 'SEK', 'DKK', 'GBP', 'USD', 'PLN', 'CZK', 'HUF']) {
+        const re = new RegExp('\\b' + code + '\\b', 'i');
+        if (re.test(s)) { fx = FX_TO_EUR[code]; currencyMatched = code; break; }
+      }
+      if (!currencyMatched) {
+        if (/€/.test(s)) fx = FX_TO_EUR['€'];
+        else if (/£/.test(s)) fx = FX_TO_EUR['£'];
+        else if (/\$/.test(s)) fx = FX_TO_EUR['$'];
+      }
+      // Multiplier (million / billion / k)
+      let mult = 1;
+      if (/\b(bln|bil(?:lion)?|mlrd|miljard)\b/i.test(s)) mult = 1e9;
+      else if (/\b(mln|mio|million|milj|miljoon)\b/i.test(s)) mult = 1e6;
+      else if (/\b(k|thousand|tuhat|tys)\b/i.test(s) && !/\bEUR\s*k\b/i.test(s)) mult = 1e3;
+      // Strip currency markers, whitespace, letters; keep digits/./,/-
+      let numStr = s
+        .replace(/(EUR|NOK|SEK|DKK|GBP|USD|PLN|CZK|HUF|€|£|\$)/gi, ' ')
+        .replace(/\b(mln|mio|million|milj|miljoon|bln|bil|billion|mlrd|miljard|k|thousand|tuhat|tys)\b/gi, ' ')
+        .replace(/[^0-9.,\s-]/g, ' ')
+        .trim();
+      // If both '.' and ',' present, assume comma = thousands (EU style uses
+      // comma as decimal but also common to see space/thousands), heuristika:
+      //   "1,200,000.50" → 1200000.50  (US)
+      //   "1.200.000,50" → 1200000.50  (EU)
+      if (numStr.includes('.') && numStr.includes(',')) {
+        if (numStr.lastIndexOf(',') > numStr.lastIndexOf('.')) {
+          // EU: dot = thousands, comma = decimal
+          numStr = numStr.replace(/\./g, '').replace(',', '.');
+        } else {
+          // US: comma = thousands, dot = decimal
+          numStr = numStr.replace(/,/g, '');
+        }
+      } else if (numStr.includes(',')) {
+        // Only comma: decide by position. If comma followed by 1-2 digits at
+        // end, treat as decimal; otherwise as thousands separator.
+        if (/,\d{1,2}$/.test(numStr)) numStr = numStr.replace(',', '.');
+        else numStr = numStr.replace(/,/g, '');
+      }
+      numStr = numStr.replace(/\s+/g, '').replace(/^0+(?=\d)/, '');
+      const firstMatch = numStr.match(/-?\d+(?:\.\d+)?/);
+      if (!firstMatch) return { amount: null, known: false };
+      const n = parseFloat(firstMatch[0]);
+      if (!Number.isFinite(n) || n <= 0) return { amount: null, known: false };
+      const eur = n * mult * fx;
+      return { amount: eur, known: true };
+    };
+
     const buildRow = (t) => {
       const d = t.details || {};
       const publishedUrl = d.sourceUrl || t.url;
@@ -2116,6 +2350,11 @@ async function runScraper() {
       // originalą.
       const titleOut = d.titleEn || cleanDescription(d.title || t.title || '');
       const scopeOut = d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || '');
+      const reqOut = cleanDescription(d.requirementsForSupplier || '');
+      const qualOut = cleanDescription(d.qualificationRequirements || '');
+      const critOut = cleanDescription(d.offerWeighingCriteria || '');
+      // Keyword'ai match'inami ant visko, ką turim anglų kalba.
+      const keywords = matchKeywords([titleOut, scopeOut, reqOut, qualOut, critOut, d.technicalStack || '']);
       return [
         nowIso,
         fmtDate(d.publicationDate || t.publicationDate || ''),
@@ -2126,13 +2365,14 @@ async function runScraper() {
         d.country || t.country || '',
         d.maxBudget || '',
         d.duration || '',
-        cleanDescription(d.requirementsForSupplier || ''),
-        cleanDescription(d.qualificationRequirements || ''),
-        cleanDescription(d.offerWeighingCriteria || ''),
+        reqOut,
+        qualOut,
+        critOut,
         scopeOut,
         d.technicalStack || '',
         d.sourceUrl || '',
         d.referenceNumber || t.tenderId || '',
+        keywords,
       ];
     };
 
@@ -2149,7 +2389,7 @@ async function runScraper() {
       try {
         const res = await sheets.spreadsheets.values.append({
           spreadsheetId: SHEET_ID,
-          range: `${TAB_NAME}!A:P`,
+          range: `${TAB_NAME}!A:Q`,
           valueInputOption: 'RAW',
           insertDataOption: 'INSERT_ROWS',
           requestBody: { values: batch },
@@ -2183,6 +2423,10 @@ async function runScraper() {
     process.on('SIGINT', () => onShutdown('SIGINT'));
 
     let sampleLogged = false;
+    // 500K EUR threshold: drop tenders whose known budget is below this.
+    // Keep rows where budget is unknown (empty) or ≥ 500K EUR.
+    const BUDGET_MIN_EUR = 500000;
+    let budgetFilteredCount = 0;
 
     for (let i = 0; i < toFetch.length; i++) {
       const cleanUrl = getCleanTenderUrl(toFetch[i].tenderId);
@@ -2218,6 +2462,7 @@ async function runScraper() {
           rawTitle ? `TITLE: ${rawTitle}` : '',
           rawScope ? `DESCRIPTION: ${rawScope}` : '',
           dd.fullTextSnippet ? `MERCELL_PAGE: ${dd.fullTextSnippet}` : '',
+          dd.pdfText ? `DOCUMENTS: ${dd.pdfText}` : '',
         ].filter(Boolean).join('\n\n');
 
         // Jei Mercell JSON'e maxBudget yra suspect'iškai mažas (< 1000) —
@@ -2234,6 +2479,18 @@ async function runScraper() {
         if (dd.duration && /\d{1,4}[\/.\-]\d{1,2}[\/.\-]\d{1,4}\s*[-–—]\s*\d{1,4}[\/.\-]\d{1,2}[\/.\-]\d{1,4}/.test(dd.duration)) {
           console.log(`    ⚠️ discarding date-range duration: "${dd.duration}"`);
           dd.duration = '';
+        }
+
+        // --- PRE-AI BUDGET FILTER -----------------------------------
+        // Jei Mercell'as paraše aiškų biudžetą ir jis < 500K EUR —
+        // nėra ko kviesti AI nei rašyti į sheet'ą. Taupom Claude tokens.
+        const preBudget = parseEurBudget(dd.maxBudget);
+        if (preBudget.known && preBudget.amount < BUDGET_MIN_EUR) {
+          budgetFilteredCount++;
+          console.log(`    ⏭️  skipping: budget below 500K EUR ("${dd.maxBudget}" ≈ €${Math.round(preBudget.amount).toLocaleString()})`);
+          toFetch[i].details = dd;
+          await new Promise(r => setTimeout(r, 200));
+          continue;
         }
 
         // 1) Extract structured fields if any are missing
@@ -2259,6 +2516,18 @@ async function runScraper() {
           if (filled.length) console.log(`    🤖 AI filled: ${filled.join(', ')}`);
         }
 
+        // --- POST-AI BUDGET FILTER ---------------------------------
+        // AI galėjo įrašyti biudžetą kur Mercell'o nebuvo. Patikrinam dar
+        // kartą — jei žinomas ir < 500K, praleidžiam (eilutė nerašoma).
+        const postBudget = parseEurBudget(dd.maxBudget);
+        if (postBudget.known && postBudget.amount < BUDGET_MIN_EUR) {
+          budgetFilteredCount++;
+          console.log(`    ⏭️  skipping (post-AI): budget below 500K EUR ("${dd.maxBudget}" ≈ €${Math.round(postBudget.amount).toLocaleString()})`);
+          toFetch[i].details = dd;
+          await new Promise(r => setTimeout(r, 200));
+          continue;
+        }
+
         // 2) Translate title (always — short, heuristika klysta trumpiems).
         //    Jei tekstas jau anglų, Claude grąžins jį beveik identišką.
         if (rawTitle) {
@@ -2278,6 +2547,16 @@ async function runScraper() {
         }
 
         toFetch[i].details = dd;
+      } else {
+        // AI išjungtas — vis tiek taikom budget filtrą pagal Mercell'o lauką.
+        const dd = toFetch[i].details || {};
+        const preBudget = parseEurBudget(dd.maxBudget);
+        if (preBudget.known && preBudget.amount < BUDGET_MIN_EUR) {
+          budgetFilteredCount++;
+          console.log(`    ⏭️  skipping: budget below 500K EUR ("${dd.maxBudget}" ≈ €${Math.round(preBudget.amount).toLocaleString()})`);
+          await new Promise(r => setTimeout(r, 200));
+          continue;
+        }
       }
 
       // Build & buffer
@@ -2314,6 +2593,7 @@ async function runScraper() {
     console.log(`Total tenders found: ${allTenders.length}`);
     console.log(`New tenders: ${newTenders.length}`);
     console.log(`Rows appended: ${totalAppended}`);
+    console.log(`Budget-filtered (<500K EUR): ${budgetFilteredCount}`);
 
     return { ok: true, tendersFound: allTenders.length, rowsAppended: totalAppended };
 
