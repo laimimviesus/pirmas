@@ -2374,7 +2374,19 @@ async function runScraper() {
       const eur = n * mult * fx;
       return { amount: eur, known: true };
     };
-
+const formatEurBudget = (raw) => {
+      if (!raw) return '';
+      const { amount, known } = parseEurBudget(raw);
+      if (!known || !Number.isFinite(amount)) return String(raw);
+      const rounded = Math.round(amount);
+      const formatted = rounded.toLocaleString('en-US');
+      const rawStr = String(raw).trim();
+      const hadForeignCurrency = /\b(NOK|SEK|DKK|GBP|USD|PLN|CZK|HUF)\b|[£$]/i.test(rawStr);
+      if (hadForeignCurrency) {
+        return `EUR ${formatted} (${rawStr})`;
+      }
+      return `EUR ${formatted}`;
+    };
     const buildRow = (t) => {
       const d = t.details || {};
       const publishedUrl = d.sourceUrl || t.url;
