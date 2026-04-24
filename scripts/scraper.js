@@ -13,8 +13,13 @@ const { google } = require('googleapis');
 // --- Config ------------------------------------------------------------
 const TEST_MODE = process.env.TEST_MODE === 'true';
 const MAX_PAGES = TEST_MODE ? 1 : 200;
-const MAX_TENDERS = TEST_MODE ? 2 : 4000;
-const DETAILS_LIMIT = TEST_MODE ? 2 : 4000;
+// Prod limits sąmoningai konservatyvūs — GitHub Actions jobs are capped at
+// 6h, o pilnas detail-fetch ciklas per tender'į truko ~5–10s. 4000 tenderių
+// prasilenkdavo su timeout'u ir niekas nebuvo įrašoma. Paliekam override'ą
+// per aplinkos kintamąjį jeigu kada reikės platesnio pirmojo backfill'o.
+const MAX_TENDERS = TEST_MODE ? 2 : Number(process.env.MAX_TENDERS || 500);
+const DETAILS_LIMIT = TEST_MODE ? 2 : Number(process.env.DETAILS_LIMIT || 500);
+const FLUSH_BATCH = TEST_MODE ? 1 : Number(process.env.FLUSH_BATCH || 5);
 const SOURCE_NAV_TIMEOUT = 25000;
 
 // --- Pagalbinės funkcijos ----------------------------------------------
@@ -1729,34 +1734,17 @@ async function runScraper() {
     const newTenders = allTenders.filter(t => !existingIds.has(t.tenderId));
     console.log(`New tenders: ${newTenders.length} (${allTenders.length - newTenders.length} already in sheet)`);
 
-    // ---- FETCH DETAILS ----
+    // ---- FETCH DETAILS + INCREMENTAL APPEND ----
+    // SVARBU: GitHub Actions job'as turi 6h cap. Per praėjusį pilną run'ą
+    // job'as buvo nutrauktas 6h 5m ribose, o visas `sheets.append` iškvie-
+    // timas vyko tik loop'o gale → niekas nespėjo būti įrašyta. Dabar
+    // flushinam kas `FLUSH_BATCH` tenderių, plus SIGTERM/SIGINT handler'is
+    // išsaugo likusias eilutes, kai runner'is bando nužudyti procesą.
     const toFetch = newTenders.slice(0, DETAILS_LIMIT);
-    console.log(`--- FETCHING DETAILS (${toFetch.length}) ---`);
+    console.log(`--- FETCHING DETAILS (${toFetch.length}) with flush batch ${FLUSH_BATCH} ---`);
 
-    for (let i = 0; i < toFetch.length; i++) {
-      const cleanUrl = getCleanTenderUrl(toFetch[i].tenderId);
-      const t0 = Date.now();
-      toFetch[i].details = await fetchTenderDetails(browser, page, cleanUrl);
-      const elapsed = Date.now() - t0;
-
-      const d = toFetch[i].details || {};
-      console.log(`[${i + 1}/${toFetch.length}] ${elapsed}ms | ${(d.title || 'NONE').slice(0, 60)}`);
-
-      const snippet = (d.fullTextSnippet || '').slice(0, 200);
-      if (/414 ERROR|CloudFront|Bad request/i.test(snippet)) {
-        console.log(`  ⚠️ CloudFront, retry in 3s...`);
-        await new Promise(r => setTimeout(r, 3000));
-        toFetch[i].details = await fetchTenderDetails(browser, page, cleanUrl);
-      }
-
-      await new Promise(r => setTimeout(r, 400));
-    }
-
-    // ---- FORMAT ROWS & APPEND ----
     const nowIso = new Date().toISOString().slice(0, 10);
 
-    // Helper: ISO datetime → skaitoma data.  Priimame ir tikras ISO formas
-    // (2026-05-26T14:00:00Z), ir pre-parsintus stringus — paliekam kaip yra.
     const fmtDate = (s) => {
       if (!s) return '';
       const str = String(s).trim();
@@ -1764,12 +1752,9 @@ async function runScraper() {
       if (m) return m[1];
       return str;
     };
-    // Helper: visi description'ai ateina kaip JSON stringified array
-    // [{languageCode: "en", text: "..."}, ...]. Ištraukiam žmoniškai.
     const cleanDescription = (v) => {
       if (!v) return '';
       const s = String(v);
-      // atpažįstam [{"languageCode":...,"text":"..."}...] formą
       if (s.includes('languageCode') && s.includes('text')) {
         try {
           const arr = JSON.parse(s.startsWith('[') ? s : `[${s}]`);
@@ -1779,7 +1764,6 @@ async function runScraper() {
             if (pick && pick.text) return String(pick.text).trim();
           }
         } catch (_) {
-          // bandom su regex'u — renkam visas "text": "..." reikšmes
           const texts = [...s.matchAll(/"text"\s*:\s*"([^"]*(?:\\.[^"]*)*)"/g)]
             .map((m) => m[1].replace(/\\"/g, '"').replace(/\\n/g, ' '));
           if (texts.length) return texts[0].trim();
@@ -1787,8 +1771,6 @@ async function runScraper() {
       }
       return s.trim();
     };
-    // Helper: organisation dažnai ateina su „\nShow all buyer information"
-    // priedu iš DOM'o. Paliekam tik pirmą reikšmingą eilutę.
     const cleanOrg = (v) => {
       if (!v) return '';
       const s = String(v).trim();
@@ -1796,10 +1778,8 @@ async function runScraper() {
       return first || s;
     };
 
-    const rows = toFetch.map(t => {
+    const buildRow = (t) => {
       const d = t.details || {};
-      // Source URL → pirmenybė šaltinio nuorodai, kaip paprašyta ("puslapis,
-      // kuriame tender'is buvo paskelbtas" == originalus šaltinis).
       const publishedUrl = d.sourceUrl || t.url;
       return [
         nowIso,
@@ -1819,29 +1799,117 @@ async function runScraper() {
         d.sourceUrl || '',
         d.referenceNumber || t.tenderId || '',
       ];
-    });
+    };
 
-    if (rows.length > 0) {
-      console.log('Sample row:', JSON.stringify(rows[0]).slice(0, 500));
+    // Pending buffer + totals shared su signal handler'iu.
+    const pendingRows = [];
+    let totalAppended = 0;
+    let flushInFlight = false;
 
-      const appendRes = await sheets.spreadsheets.values.append({
-        spreadsheetId: SHEET_ID,
-        range: `${TAB_NAME}!A:P`,
-        valueInputOption: 'RAW',
-        insertDataOption: 'INSERT_ROWS',
-        requestBody: { values: rows },
-      });
-      console.log(`✓ Appended ${rows.length} rows: ${appendRes.data.updates?.updatedRange}`);
-    } else {
+    const flushPending = async (label) => {
+      if (pendingRows.length === 0) return;
+      if (flushInFlight) return; // viena flush operacija vienu metu
+      flushInFlight = true;
+      const batch = pendingRows.splice(0, pendingRows.length);
+      try {
+        const res = await sheets.spreadsheets.values.append({
+          spreadsheetId: SHEET_ID,
+          range: `${TAB_NAME}!A:P`,
+          valueInputOption: 'RAW',
+          insertDataOption: 'INSERT_ROWS',
+          requestBody: { values: batch },
+        });
+        totalAppended += batch.length;
+        console.log(
+          `✓ ${label || 'Flush'}: +${batch.length} rows (cumulative ${totalAppended}) range=${res.data.updates?.updatedRange}`
+        );
+      } catch (e) {
+        // Jei nepavyko — grąžinam eilutes atgal į buferį, kad neprarastume.
+        pendingRows.unshift(...batch);
+        console.log(`✗ Flush failed (${label}): ${e.message}; ${batch.length} rows kept in buffer`);
+        throw e;
+      } finally {
+        flushInFlight = false;
+      }
+    };
+
+    // SIGTERM/SIGINT — GitHub Actions cancel siunčia SIGTERM ir duoda ~10s
+    // grace period'o. Spėjam flushinti buferį prieš SIGKILL.
+    let shuttingDown = false;
+    const onShutdown = async (signal) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.log(`\n⚠️ ${signal} received — flushing ${pendingRows.length} pending rows before exit`);
+      try { await flushPending(`${signal}-flush`); } catch (e) { console.log('Shutdown flush error:', e.message); }
+      try { await browser.close(); } catch (_) {}
+      process.exit(0);
+    };
+    process.on('SIGTERM', () => onShutdown('SIGTERM'));
+    process.on('SIGINT', () => onShutdown('SIGINT'));
+
+    let sampleLogged = false;
+
+    for (let i = 0; i < toFetch.length; i++) {
+      const cleanUrl = getCleanTenderUrl(toFetch[i].tenderId);
+      const t0 = Date.now();
+      try {
+        toFetch[i].details = await fetchTenderDetails(browser, page, cleanUrl);
+      } catch (e) {
+        console.log(`  ✗ fetchTenderDetails threw: ${e.message}`);
+        toFetch[i].details = { sourceUrl: '', title: toFetch[i].title || '' };
+      }
+      const elapsed = Date.now() - t0;
+
+      const d = toFetch[i].details || {};
+      console.log(`[${i + 1}/${toFetch.length}] ${elapsed}ms | ${(d.title || 'NONE').slice(0, 60)}`);
+
+      const snippet = (d.fullTextSnippet || '').slice(0, 200);
+      if (/414 ERROR|CloudFront|Bad request/i.test(snippet)) {
+        console.log(`  ⚠️ CloudFront, retry in 3s...`);
+        await new Promise(r => setTimeout(r, 3000));
+        try {
+          toFetch[i].details = await fetchTenderDetails(browser, page, cleanUrl);
+        } catch (e) {
+          console.log(`  ✗ retry threw: ${e.message}`);
+        }
+      }
+
+      // Build & buffer
+      const row = buildRow(toFetch[i]);
+      pendingRows.push(row);
+
+      if (!sampleLogged) {
+        console.log('Sample row:', JSON.stringify(row).slice(0, 500));
+        sampleLogged = true;
+      }
+
+      // Flush batch
+      if (pendingRows.length >= FLUSH_BATCH) {
+        try {
+          await flushPending(`batch@${i + 1}`);
+        } catch (e) {
+          // jei flush'as numiršta — eilutės liko buferyje, bandysim dar kartą vėliau
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      }
+
+      await new Promise(r => setTimeout(r, 400));
+    }
+
+    // Galutinis flush
+    if (pendingRows.length > 0) {
+      try { await flushPending('final'); }
+      catch (e) { console.log('Final flush error:', e.message); }
+    } else if (totalAppended === 0) {
       console.log('Nothing to append');
     }
 
     console.log('=== SCRAPER FINISHED ===');
     console.log(`Total tenders found: ${allTenders.length}`);
     console.log(`New tenders: ${newTenders.length}`);
-    console.log(`Rows appended: ${rows.length}`);
+    console.log(`Rows appended: ${totalAppended}`);
 
-    return { ok: true, tendersFound: allTenders.length, rowsAppended: rows.length };
+    return { ok: true, tendersFound: allTenders.length, rowsAppended: totalAppended };
 
   } finally {
     try { await browser.close(); } catch (_) {}
