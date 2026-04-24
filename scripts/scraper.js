@@ -972,6 +972,18 @@ function extractFieldsFromTenderJson(tenderJson) {
   // VERTĖ / BUDGET — Mercell pateikia `moneyRange: {currency, low, high}`.
   // Taip pat galim sulaukti `estimatedValue` ir pan. objektuose su
   // {amount, currency} ar {min, max}.
+  // Anksčiau formatter'is pateikdavo "30 EUR" kai realioj JSON būdavo
+  // `{low: 30000, high: null}` arba `{low: 30000, high: 30000}` — dabar:
+  //   • numerius formatuojam su tūkstančių skirtukais ("30 000 EUR"),
+  //   • jei turim ir low ir high (ir skirtingi) — rodom range,
+  //   • jei amt yra per mažas (<1) — laikom nesančiu ir einam toliau.
+  const fmtMoney = (n) => {
+    if (n === undefined || n === null || n === '') return '';
+    const num = typeof n === 'number' ? n : parseFloat(String(n).replace(/[,\s]/g, '.').replace(/\.(?=\d{3}\b)/g, ''));
+    if (!Number.isFinite(num) || num <= 0) return '';
+    // Use narrow-NBSP as thousands separator (European convention).
+    return num.toLocaleString('en-US').replace(/,/g, ' ');
+  };
   const budgetCandidates = [
     'moneyRange', 'estimatedValue', 'estimatedTotalValue',
     'contractValue', 'totalValue', 'maxBudget', 'maximumBudget',
@@ -983,23 +995,70 @@ function extractFieldsFromTenderJson(tenderJson) {
     const v = root[key];
     if (v && typeof v === 'object' && !Array.isArray(v)) {
       const cur = v.currency ?? v.currencyCode ?? v.code ?? '';
-      const lo = v.low ?? v.min ?? v.minValue ?? v.minimum;
-      const hi = v.high ?? v.max ?? v.maxValue ?? v.maximum;
-      const amt = v.amount ?? v.value ?? v.number ?? hi ?? lo;
-      if (amt !== undefined && amt !== null && amt !== '') {
-        if (lo !== undefined && hi !== undefined && lo !== null && hi !== null && lo !== hi) {
-          budget = `${lo}–${hi} ${cur}`.trim();
-        } else {
-          budget = `${amt} ${cur}`.trim();
-        }
+      const loRaw = v.low ?? v.min ?? v.minValue ?? v.minimum;
+      const hiRaw = v.high ?? v.max ?? v.maxValue ?? v.maximum;
+      const amtRaw = v.amount ?? v.value ?? v.number;
+      const loNum = Number(loRaw);
+      const hiNum = Number(hiRaw);
+      const amtNum = Number(amtRaw);
+      const loOk = Number.isFinite(loNum) && loNum > 0;
+      const hiOk = Number.isFinite(hiNum) && hiNum > 0;
+      const amtOk = Number.isFinite(amtNum) && amtNum > 0;
+      if (loOk && hiOk && loNum !== hiNum) {
+        budget = `${fmtMoney(loNum)}–${fmtMoney(hiNum)} ${cur}`.trim();
         break;
       }
+      if (hiOk) { budget = `${fmtMoney(hiNum)} ${cur}`.trim(); break; }
+      if (loOk) { budget = `${fmtMoney(loNum)} ${cur}`.trim(); break; }
+      if (amtOk) { budget = `${fmtMoney(amtNum)} ${cur}`.trim(); break; }
     }
   }
-  if (!budget) budget = pickField(root, budgetCandidates);
+  if (!budget) {
+    const picked = pickField(root, budgetCandidates);
+    if (picked) {
+      // Validate scalar pick — if it's obviously trash (like just "0"),
+      // drop it. Otherwise pass through verbatim so AI can refine later.
+      const num = parseFloat(String(picked).replace(/[,\s]/g, '.'));
+      if (!Number.isFinite(num) || num > 0) budget = String(picked).trim();
+    }
+  }
 
   // DURATION — Mercell pateikia `contractLength: {awardRange, optionRanges}`,
   // kur awardRange yra pvz. `{low, high, unit}` arba panašiai.
+  //
+  // BUG fix: anksčiau pickField'as iš `performancePeriod`/`contractPeriod`
+  // paimdavo date-range string'ą tipo "01/07/2026 - 28/10/2030" ir jį
+  // įrašydavo kaip duration. Dabar:
+  //   • tikrinam ar awardRange.low/high yra skaičiai — tik tada render'inam,
+  //   • jei jie datos — paverčiam jas mėnesių skaičiumi,
+  //   • pickField'o fallback — nepriimam string'ų, kuriuose daug skaičių
+  //     su slash/dash (tikėtinai — datos), o esant datų pora — konvertuojam.
+  const monthsBetween = (a, b) => {
+    const da = new Date(a);
+    const db = new Date(b);
+    if (isNaN(da) || isNaN(db)) return null;
+    const diff = (db.getFullYear() - da.getFullYear()) * 12
+      + (db.getMonth() - da.getMonth());
+    return diff > 0 ? diff : null;
+  };
+  const parseDateRange = (s) => {
+    if (!s || typeof s !== 'string') return null;
+    // dd/mm/yyyy - dd/mm/yyyy   or   yyyy-mm-dd - yyyy-mm-dd
+    const m = s.match(
+      /(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}|\d{4}[\/.\-]\d{1,2}[\/.\-]\d{1,2})\s*[-–—]\s*(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}|\d{4}[\/.\-]\d{1,2}[\/.\-]\d{1,2})/
+    );
+    if (!m) return null;
+    const norm = (d) => {
+      const mm = d.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+      if (mm) {
+        const [_, dd, mo, yy] = mm;
+        const y = yy.length === 2 ? '20' + yy : yy;
+        return `${y}-${mo.padStart(2,'0')}-${dd.padStart(2,'0')}`;
+      }
+      return d;
+    };
+    return [norm(m[1]), norm(m[2])];
+  };
   let duration = null;
   const cl = root.contractLength;
   if (cl && typeof cl === 'object') {
@@ -1007,30 +1066,52 @@ function extractFieldsFromTenderJson(tenderJson) {
     if (ar && typeof ar === 'object') {
       const lo = ar.low ?? ar.min ?? ar.minimum;
       const hi = ar.high ?? ar.max ?? ar.maximum;
-      const unit = ar.unit || ar.units || 'months';
-      if (lo !== undefined && hi !== undefined && lo !== null && hi !== null && lo !== hi) {
-        duration = `${lo}–${hi} ${unit}`.trim();
-      } else if (lo !== undefined && lo !== null) {
-        duration = `${lo} ${unit}`.trim();
-      } else if (hi !== undefined && hi !== null) {
-        duration = `${hi} ${unit}`.trim();
+      const unit = (ar.unit || ar.units || 'months').toString().toLowerCase().replace(/^month$/, 'months');
+      const loNum = Number(lo);
+      const hiNum = Number(hi);
+      const loIsNum = Number.isFinite(loNum) && loNum > 0;
+      const hiIsNum = Number.isFinite(hiNum) && hiNum > 0;
+      if (loIsNum && hiIsNum && loNum !== hiNum) {
+        duration = `${loNum}–${hiNum} ${unit}`;
+      } else if (hiIsNum) {
+        duration = `${hiNum} ${unit}`;
+      } else if (loIsNum) {
+        duration = `${loNum} ${unit}`;
+      } else if (typeof lo === 'string' && typeof hi === 'string') {
+        // lo/hi look like dates → convert to months span
+        const months = monthsBetween(lo, hi);
+        if (months) duration = `${months} months`;
       }
     }
     if (!duration && Array.isArray(cl.optionRanges) && cl.optionRanges.length) {
       const or = cl.optionRanges[0];
       if (or && typeof or === 'object') {
-        const lo = or.low, hi = or.high;
+        const loNum = Number(or.low);
+        const hiNum = Number(or.high);
         const unit = or.unit || 'months';
-        if (lo && hi) duration = `${lo}–${hi} ${unit} (option)`;
+        if (Number.isFinite(loNum) && Number.isFinite(hiNum) && loNum > 0 && hiNum > 0) {
+          duration = `${loNum}–${hiNum} ${unit} (option)`;
+        }
       }
     }
   }
   if (!duration) {
-    duration = pickField(root, [
+    const pickedDur = pickField(root, [
       'duration', 'contractDuration', 'durationMonths', 'periodMonths',
       'contractPeriod', 'performancePeriod',
       'timeFrame', 'validityPeriod', 'estimatedDuration',
     ]);
+    if (pickedDur) {
+      // If pickField returned a date range, convert to month count.
+      const range = parseDateRange(String(pickedDur));
+      if (range) {
+        const months = monthsBetween(range[0], range[1]);
+        if (months) duration = `${months} months`;
+      } else if (/\d/.test(pickedDur) && !/\d{4}.*\d{4}/.test(pickedDur)) {
+        // Accept only if it looks duration-ish (not like two years).
+        duration = String(pickedDur).trim();
+      }
+    }
   }
 
   // AWARD CRITERIA — Mercell: `evaluationBasis` (dažnai enum / string).
@@ -1386,6 +1467,26 @@ async function runScraper() {
     hasAnthropicKey: AI_ENABLED,
     aiModel: AI_ENABLED ? AI_MODEL : '(disabled)',
   });
+
+  if (!AI_ENABLED) {
+    console.log('');
+    console.log('==========================================================');
+    console.log('⚠️  ANTHROPIC_API_KEY NOT SET — AI is DISABLED');
+    console.log('   → Tender titles & scope will NOT be translated to English');
+    console.log('   → maxBudget / requirements / qualifications / criteria');
+    console.log('     will NOT be filled from source text when Mercell JSON');
+    console.log('     does not carry them.');
+    console.log('   To enable:');
+    console.log('     1. Add ANTHROPIC_API_KEY to GitHub repo Settings →');
+    console.log('        Secrets and variables → Actions → New repository secret.');
+    console.log('     2. In .github/workflows/*.yml under the scraper step, add:');
+    console.log('          env:');
+    console.log('            ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}');
+    console.log('==========================================================');
+    console.log('');
+  } else {
+    console.log(`✓ AI enabled (model: ${AI_MODEL})`);
+  }
 
   if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
     throw new Error('GOOGLE_SERVICE_ACCOUNT_KEY env var is missing');
@@ -1892,24 +1993,58 @@ async function runScraper() {
       if (m) return m[1];
       return str;
     };
+    // HTML entity decoder — Mercell scope/requirements often contain
+    // `&#61;` (=), `&amp;`, `&#39;` ('), `&quot;`, `&lt;`, `&gt;`, `&nbsp;`
+    // and numeric entities like `&#8211;` (en-dash). Sheet rendered them
+    // raw, so we normalise here before handing the string to the sheet or AI.
+    const NAMED_ENTITIES = {
+      amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+      laquo: '«', raquo: '»', hellip: '…', mdash: '—', ndash: '–',
+      lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”', bull: '•',
+      copy: '©', reg: '®', trade: '™', deg: '°', middot: '·',
+    };
+    const decodeHtmlEntities = (s) => {
+      if (!s) return '';
+      return String(s)
+        .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+          const code = parseInt(hex, 16);
+          return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+        })
+        .replace(/&#(\d+);/g, (_, num) => {
+          const code = parseInt(num, 10);
+          return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+        })
+        .replace(/&([a-zA-Z]+);/g, (orig, name) =>
+          NAMED_ENTITIES[name.toLowerCase()] !== undefined
+            ? NAMED_ENTITIES[name.toLowerCase()]
+            : orig
+        );
+    };
+
     const cleanDescription = (v) => {
       if (!v) return '';
       const s = String(v);
+      let out = s;
       if (s.includes('languageCode') && s.includes('text')) {
         try {
           const arr = JSON.parse(s.startsWith('[') ? s : `[${s}]`);
           if (Array.isArray(arr)) {
             const en = arr.find((x) => x && x.languageCode === 'en');
             const pick = en || arr[0];
-            if (pick && pick.text) return String(pick.text).trim();
+            if (pick && pick.text) out = String(pick.text);
           }
         } catch (_) {
           const texts = [...s.matchAll(/"text"\s*:\s*"([^"]*(?:\\.[^"]*)*)"/g)]
             .map((m) => m[1].replace(/\\"/g, '"').replace(/\\n/g, ' '));
-          if (texts.length) return texts[0].trim();
+          if (texts.length) out = texts[0];
         }
       }
-      return s.trim();
+      // Decode HTML entities (handles &#61;, &amp;, &#39;, &quot;, numeric
+      // decimal/hex, and common named entities). Safe to run repeatedly.
+      out = decodeHtmlEntities(out);
+      // Collapse whitespace runs (incl. NBSP leftovers) and trim.
+      out = out.replace(/[\u00A0\s]+/g, ' ').trim();
+      return out;
     };
     const cleanOrg = (v) => {
       if (!v) return '';
