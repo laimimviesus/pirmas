@@ -935,25 +935,80 @@ function extractFieldsFromTenderJson(tenderJson) {
     ]);
   }
 
-  // Country — tenderLocation yra `[{name, city, code}]` arba authority.country
+  // Country — prioritetas:
+  //   1) authority.country  (perkančiosios org. šalis — teisingiausia)
+  //   2) tenderLocation[].code prefix (pvz. "FI1C2" → "FI")
+  //   3) tenderLocation[].name — DĖMESIO: tai dažnai yra regionas
+  //      (pvz. "Pirkanmaa", ne "Finland"). Naudojam tik kaip paskutinę viltį.
+  //   4) pickField(root, ...)
+  //
+  // Jei gaunam 2 raidžių kodą (FI, DE, ES...) — konvertuojam į pilną
+  // pavadinimą iš COUNTRY_CODES žodynėlio. Taip pat žiūrim ar gautas
+  // string'as nėra regionas (pvz. "Pirkanmaa") — jei taip, grąžinam null
+  // ir leidžiam einat toliau.
+  const COUNTRY_CODES = {
+    NO: 'Norway', DK: 'Denmark', SE: 'Sweden', FI: 'Finland',
+    NL: 'Netherlands', AT: 'Austria', BE: 'Belgium', EE: 'Estonia',
+    FR: 'France', DE: 'Germany', LI: 'Liechtenstein', LU: 'Luxembourg',
+    PT: 'Portugal', ES: 'Spain', CH: 'Switzerland', UK: 'United Kingdom',
+    GB: 'United Kingdom', IE: 'Ireland', IT: 'Italy', PL: 'Poland',
+    IS: 'Iceland', LT: 'Lithuania', LV: 'Latvia', CZ: 'Czech Republic',
+    SK: 'Slovakia', HU: 'Hungary', GR: 'Greece', RO: 'Romania',
+    BG: 'Bulgaria', HR: 'Croatia', SI: 'Slovenia', MT: 'Malta',
+    CY: 'Cyprus',
+  };
+  const normalizeCountry = (raw) => {
+    if (!raw) return null;
+    const s = String(raw).trim();
+    if (!s) return null;
+    // Kodas (2 raidės) → pavadinimas
+    if (/^[A-Z]{2}$/.test(s) && COUNTRY_CODES[s]) return COUNTRY_CODES[s];
+    // Kodas su regionu (FI1C2) → išsitraukiam pirmas 2 raides
+    const codeMatch = s.match(/^([A-Z]{2})[A-Z0-9]{1,3}$/);
+    if (codeMatch && COUNTRY_CODES[codeMatch[1]]) return COUNTRY_CODES[codeMatch[1]];
+    // Jei jau pilnas pavadinimas
+    const lower = s.toLowerCase();
+    for (const name of Object.values(COUNTRY_CODES)) {
+      if (lower === name.toLowerCase()) return name;
+    }
+    // Kitaip — gal regionas, ne šalis. Grąžinam null.
+    return null;
+  };
+
   let country = null;
-  const locArr = root.tenderLocation;
-  if (Array.isArray(locArr) && locArr.length) {
-    const first = locArr[0];
-    if (first && typeof first === 'object') {
-      country = first.name || first.code || null;
-    } else if (typeof first === 'string') {
-      country = first;
+  // 1) authority.country
+  if (authorityObj && typeof authorityObj === 'object') {
+    country = normalizeCountry(authorityObj.country);
+  }
+  // 2) tenderLocation[].code (regiono kodas su šalies prefiksu)
+  if (!country) {
+    const locArr = root.tenderLocation;
+    if (Array.isArray(locArr) && locArr.length) {
+      for (const loc of locArr) {
+        if (loc && typeof loc === 'object' && loc.code) {
+          const c = normalizeCountry(loc.code);
+          if (c) { country = c; break; }
+        }
+      }
     }
   }
-  if (!country && authorityObj && typeof authorityObj === 'object') {
-    country = authorityObj.country || null;
-  }
+  // 3) pickField — bendras bandymas
   if (!country) {
-    country = pickField(root, [
+    const picked = pickField(root, [
       'country', 'countryCode', 'countryName', 'nation',
-      'deliveryPlaceCode', 'location',
+      'deliveryPlaceCode',
     ]);
+    if (picked) country = normalizeCountry(picked) || picked;
+  }
+  // 4) Paskutinė viltis — tenderLocation[].name (dažnai regionas)
+  if (!country) {
+    const locArr = root.tenderLocation;
+    if (Array.isArray(locArr) && locArr.length) {
+      const first = locArr[0];
+      if (first && typeof first === 'object') {
+        country = first.name || null;
+      }
+    }
   }
 
   const deadline = pickField(root, [
@@ -2164,6 +2219,22 @@ async function runScraper() {
           rawScope ? `DESCRIPTION: ${rawScope}` : '',
           dd.fullTextSnippet ? `MERCELL_PAGE: ${dd.fullTextSnippet}` : '',
         ].filter(Boolean).join('\n\n');
+
+        // Jei Mercell JSON'e maxBudget yra suspect'iškai mažas (< 1000) —
+        // beveik neįmanomas IT kontraktui — nuvaloma ir leidžiame AI jį
+        // užpildyti iš realaus teksto. Taip pat — jei duration yra datų
+        // range tipo "01/07/2026 - 28/10/2030" — laikom tuščiu.
+        const budgetNum = parseFloat(
+          String(dd.maxBudget || '').replace(/[\s,€$£]/g, '').replace(/^0+/, '')
+        );
+        if (dd.maxBudget && Number.isFinite(budgetNum) && budgetNum > 0 && budgetNum < 1000) {
+          console.log(`    ⚠️ discarding suspicious maxBudget: "${dd.maxBudget}" (${budgetNum})`);
+          dd.maxBudget = '';
+        }
+        if (dd.duration && /\d{1,4}[\/.\-]\d{1,2}[\/.\-]\d{1,4}\s*[-–—]\s*\d{1,4}[\/.\-]\d{1,2}[\/.\-]\d{1,4}/.test(dd.duration)) {
+          console.log(`    ⚠️ discarding date-range duration: "${dd.duration}"`);
+          dd.duration = '';
+        }
 
         // 1) Extract structured fields if any are missing
         const needsExtract =
