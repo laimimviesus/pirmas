@@ -1595,9 +1595,13 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         const nameRaw = toStr(node.name || node.filename || node.fileName || node.displayName || '');
         const urlRaw = toStr(node.url || node.downloadUrl || node.downloadLink || node.href || '');
 
+        // Mercell laiko `extension` lauką nevienodai: kartais su tašku (".pdf",
+        // ".zip"), kartais be ("docx", "xlsx"). Norm: nuvalykim leading dot ir
+        // visą whitespace'ą, tada lower-case.
+        const extRawClean = String(extRaw).trim().replace(/^\./, '');
         const extFromName = (nameRaw.match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '';
         const extFromUrl  = (urlRaw.match(/\.([a-z0-9]{1,5})(?:[?#]|$)/i) || [])[1] || '';
-        const ext = (extRaw || extFromName || extFromUrl || '').toLowerCase();
+        const ext = (extRawClean || extFromName || extFromUrl || '').toLowerCase();
 
         const looksLikeFile = hasFileId && (extRaw || nameRaw || mimeRaw || urlRaw);
 
@@ -1730,8 +1734,8 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       };
       collectedFiles.sort((a, b) => scoreFile(b.name) - scoreFile(a.name));
       if (collectedFiles.length) {
-        const top = collectedFiles.slice(0, 6).map(f => `${f.name}(${scoreFile(f.name)})`).join(', ');
-        console.log(`    📄 PDF priority: ${top}`);
+        const top = collectedFiles.slice(0, 6).map(f => `${f.name}[${f.ext}](${scoreFile(f.name)})`).join(', ');
+        console.log(`    📄 doc priority: ${top}`);
       }
 
       // Kiek dokumentų parsinam per tender'į (kad neužtruktų per ilgai):
