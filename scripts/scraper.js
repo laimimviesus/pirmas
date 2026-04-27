@@ -1920,21 +1920,30 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           // kartais grąžina HTML login wall'ą ir mums reikia kito host.
           const candidates = [];
           if (f.url) candidates.push(f.url);
-          // GUID variantai pirmiausia — file-service download'ui beveik visada
-          // nori `fileReference` (GUID), o ne `fileId` (signed-int hash). Jei
-          // GUID nepasiekiamas (`f.ref` tuščias), tai praleidžiam šitą bloką.
+          // `fileReference` Mercell'yje yra... ne GUID, o pilnas presigned S3
+          // URL (`https://old-dc-import-notices-prod.s3.eu-...amazonaws.com/...
+          // ?X-Amz-Signature=...`). Naudojam tiesiogiai, jokio template'inimo.
+          // Jei kažkada Mercell'is pakeis ir pradės tiekti GUID'ą, fallback'as
+          // suklaps į template'ą.
           if (f.ref) {
-            candidates.push(
-              `https://file-service.discover.app.mercell.com/api/v1/files/${f.ref}/download`,
-              `https://file-service.discover.app.mercell.com/api/v1/files/${f.ref}`,
-              `https://file-service.discover.app.mercell.com/files/${f.ref}/download`,
-              `https://file-service.discover.app.mercell.com/files/${f.ref}`,
-              `https://search-service-api.discover.app.mercell.com/api/v1/files/${f.ref}/download`,
-              `https://search-service-api.discover.app.mercell.com/api/v1/files/${f.ref}`,
-              `https://app.mercell.com/files/${f.ref}/download`,
-              `https://app.mercell.com/api/v1/files/${f.ref}`,
-              `https://permalink.mercell.com/api/v1/files/${f.ref}/download`,
-            );
+            const refStr = String(f.ref).trim();
+            if (/^https?:\/\//i.test(refStr)) {
+              // Direct URL — paduodam kaip yra
+              candidates.push(refStr);
+            } else {
+              // GUID-style — template'inam į žinomus endpoint'us
+              candidates.push(
+                `https://file-service.discover.app.mercell.com/api/v1/files/${refStr}/download`,
+                `https://file-service.discover.app.mercell.com/api/v1/files/${refStr}`,
+                `https://file-service.discover.app.mercell.com/files/${refStr}/download`,
+                `https://file-service.discover.app.mercell.com/files/${refStr}`,
+                `https://search-service-api.discover.app.mercell.com/api/v1/files/${refStr}/download`,
+                `https://search-service-api.discover.app.mercell.com/api/v1/files/${refStr}`,
+                `https://app.mercell.com/files/${refStr}/download`,
+                `https://app.mercell.com/api/v1/files/${refStr}`,
+                `https://permalink.mercell.com/api/v1/files/${refStr}/download`,
+              );
+            }
           }
           // Integer ID variantai kaip fallback'as — kartais Mercell'is juos
           // priima legacy endpoint'uose.
