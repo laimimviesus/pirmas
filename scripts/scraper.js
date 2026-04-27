@@ -622,7 +622,90 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
     }).catch(() => {});
     await new Promise(r => setTimeout(r, 200));
 
-    const result = await srcPage.evaluate(() => {
+    // --- simap.ch INTERESSE-BEKUNDEN HANDLER --------------------------
+    //
+    // simap.ch (Swiss federal procurement) hides the documents list behind
+    // an "Interesse bekunden" / "Manifester l'intérêt" / "Manifestare
+    // l'interesse" button — until the visitor explicitly expresses interest,
+    // the tender attachments are not shown. We try to click that button so
+    // the document list materialises on the next render. We deliberately
+    // avoid the inverse "Interesse zurückziehen" / "Retirer l'intérêt"
+    // button (which would withdraw an already-registered interest).
+    //
+    // Some flows pop a confirmation dialog ("Bestätigen" / "Confirmer" /
+    // "Conferma") — we click that too if it appears. The whole step is
+    // best-effort; any failure leaves the page state unchanged so the
+    // standard extractor can still pull whatever public text is there.
+    let simapInterestClicked = false;
+    try {
+      const finalHostNow = (() => {
+        try { return new URL(srcPage.url()).hostname.toLowerCase(); }
+        catch (_) { return ''; }
+      })();
+      if (/(^|\.)simap\.ch$/i.test(finalHostNow)) {
+        const clickRes = await srcPage.evaluate(() => {
+          const POSITIVE = /interesse\s*bekunden|manifester\s*(?:l'|l\s*’\s*)?intér[eè]t|manifestare\s*(?:l'|l\s*’\s*)?interesse|express\s*interest|register\s*interest/i;
+          const NEGATIVE = /interesse\s*zur[üu]ckziehen|retirer\s*(?:l'|l\s*’\s*)?intér[eè]t|ritirare\s*(?:l'|l\s*’\s*)?interesse|withdraw\s*interest/i;
+          const all = Array.from(document.querySelectorAll(
+            'button, a, input[type="button"], input[type="submit"], [role="button"]'
+          ));
+          // Prefer enabled, visible candidates that match POSITIVE and not NEGATIVE.
+          const candidates = all.filter(el => {
+            const t = (el.textContent || el.value || '').trim();
+            if (!t) return false;
+            if (NEGATIVE.test(t)) return false;
+            if (!POSITIVE.test(t)) return false;
+            if (el.disabled) return false;
+            const rect = el.getBoundingClientRect?.();
+            if (rect && (rect.width === 0 || rect.height === 0)) return false;
+            return true;
+          });
+          if (!candidates.length) return { clicked: false, reason: 'no-button' };
+          const btn = candidates[0];
+          btn.scrollIntoView?.({ block: 'center' });
+          btn.click?.();
+          return { clicked: true, label: (btn.textContent || btn.value || '').trim().slice(0, 80) };
+        }).catch((e) => ({ clicked: false, reason: 'eval-error: ' + e.message }));
+
+        if (clickRes && clickRes.clicked) {
+          simapInterestClicked = true;
+          console.log(`    simap: clicked "${clickRes.label}" — waiting for documents to render`);
+          // Wait a bit, then attempt confirmation-dialog click if simap pops one.
+          await new Promise(r => setTimeout(r, 1500));
+          await srcPage.evaluate(() => {
+            const CONFIRM = /^(?:bestätigen|best[äa]tigen|ja|confirmer|confirmer\s+l['’\s]intér[eè]t|conferma|confermare|confirm|ok)$/i;
+            const NEG = /interesse\s*zur[üu]ckziehen|retirer|ritirare|abbrechen|annuler|cancella|cancel/i;
+            const all = Array.from(document.querySelectorAll(
+              'button, a, input[type="button"], input[type="submit"], [role="button"]'
+            ));
+            const btn = all.find(el => {
+              const t = (el.textContent || el.value || '').trim();
+              if (!t) return false;
+              if (NEG.test(t)) return false;
+              if (!CONFIRM.test(t)) return false;
+              if (el.disabled) return false;
+              const rect = el.getBoundingClientRect?.();
+              if (rect && (rect.width === 0 || rect.height === 0)) return false;
+              return true;
+            });
+            btn?.click?.();
+          }).catch(() => {});
+          // Give simap.ch a moment to re-render the documents list.
+          await new Promise(r => setTimeout(r, 2500));
+          // Wait for any download-looking link to appear (best-effort).
+          await srcPage.waitForFunction(() => {
+            const links = Array.from(document.querySelectorAll('a[href]'));
+            return links.some(a => /\.(pdf|docx?|xlsx?|zip|rtf|odt|ods)(?:[?#]|$)/i.test(a.getAttribute('href') || ''));
+          }, { timeout: 8000 }).catch(() => {});
+        } else {
+          console.log(`    simap: no "Interesse bekunden" button found (${clickRes?.reason || 'unknown'})`);
+        }
+      }
+    } catch (e) {
+      console.log(`    simap interest-button handler error: ${e.message}`);
+    }
+
+    const result = await srcPage.evaluate((simapInterestClicked) => {
       const bodyText = (document.body?.innerText || '').trim();
 
       // --- LOGIN-WALL DETEKTORIUS -----------------------------------
@@ -907,6 +990,50 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         /(?:reference(?:\s+number|\s+no\.?)?|ref\.?\s*no\.?|ärende(?:nummer)?|viitenumero|saknummer|sagsnr|aktenzeichen|numéro\s*de\s*référence|kenmerk|número\s*de\s*referencia|numero\s*di\s*riferimento)[:\s]+([A-Z0-9\-\/_.]+)/i
       );
 
+      // --- SOURCE-PAGE FILE-LINK INVENTORY ---------------------------
+      //
+      // Some portals (notably simap.ch after "Interesse bekunden" was
+      // clicked) render document download links as plain <a href>'s
+      // pointing at PDFs / DOCX / ZIPs / etc. We harvest those here so
+      // the outer fetch loop can pull and parse them just like the
+      // Mercell-internal collectedFiles.
+      //
+      // Heuristic: anchor href whose URL path or query ends in a known
+      // document extension. Resolve relative URLs against the current
+      // page. Deduplicate by absolute URL.
+      const sourceFiles = (() => {
+        const DOC_RE = /\.(pdf|docx?|xlsx?|zip|rtf|odt|ods|txt)(?:[?#]|$)/i;
+        const seen = new Set();
+        const out = [];
+        const anchors = Array.from(document.querySelectorAll('a[href]'));
+        for (const a of anchors) {
+          const hrefRaw = a.getAttribute('href') || '';
+          if (!hrefRaw || /^javascript:/i.test(hrefRaw)) continue;
+          let abs = hrefRaw;
+          try { abs = new URL(hrefRaw, location.href).toString(); } catch (_) { continue; }
+          // simap.ch sometimes routes downloads through a "downloadFile"
+          // handler that doesn't carry a doc extension in the URL but
+          // does carry one in the link text. Catch those too.
+          const linkText = (a.textContent || '').trim();
+          const extFromUrl  = (abs.match(DOC_RE) || [])[1];
+          const extFromName = (linkText.match(DOC_RE) || [])[1];
+          const looksLikeDownload = /download|herunterladen|télécharger|scarica|attach|anhang|dokument|document|datei|fichier|allegato/i.test(linkText) ||
+            /download|datei|file|attach|allegat/i.test(abs);
+          const ext = (extFromUrl || extFromName || '').toLowerCase();
+          if (!ext && !looksLikeDownload) continue;
+          if (!ext) continue; // skip if we can't even guess an extension
+          if (seen.has(abs)) continue;
+          seen.add(abs);
+          out.push({
+            url: abs,
+            name: linkText || abs.split('/').pop() || `source-file.${ext}`,
+            ext,
+          });
+          if (out.length >= 20) break;
+        }
+        return out;
+      })();
+
       return {
         maxBudget,
         duration,
@@ -919,8 +1046,161 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         sourceTitle: document.querySelector('h1')?.innerText?.trim() || null,
         sourceHost: location.host,
         bodyTextPreview: bodyText.slice(0, 600),
+        sourceFiles,
+        simapInterestClicked: !!simapInterestClicked,
       };
-    });
+    }, simapInterestClicked);
+
+    // --- PRE-FETCH + PARSE source-page document bytes -------------------
+    //
+    // sourceFiles point at absolute URLs that often live on the source
+    // portal's own domain (simap.ch, etc.) — meaning their authenticated
+    // session cookies are bound to *this* tab, not Mercell's. We fetch
+    // them now (while srcPage is still open) using the page's own fetch
+    // (carries simap.ch cookies + Interesse-bekunden state), then parse
+    // each buffer with the same multi-format toolset that the Mercell
+    // pipeline uses. The combined text is returned as
+    // `result.sourceFilesText` so the outer pipeline can append it to
+    // `details.pdfText` without needing to know about the source domain.
+    try {
+      if (Array.isArray(result?.sourceFiles) && result.sourceFiles.length) {
+        const MAX_SRC_FILES = 8;
+        const SRC_DOC_CHAR_CAP = 30000;       // per-file
+        const SRC_TOTAL_CHAR_CAP = 80000;     // across all source files
+        // Lazy-load optional deps; missing ones just degrade per-format.
+        let pdfParse2 = null, mammoth2 = null, XLSX2 = null, AdmZip2 = null;
+        try { pdfParse2 = require('pdf-parse'); } catch (_) {}
+        try { mammoth2  = require('mammoth');   } catch (_) {}
+        try { XLSX2     = require('xlsx');      } catch (_) {}
+        try { AdmZip2   = require('adm-zip');   } catch (_) {}
+
+        const detectFormat2 = (buf) => {
+          if (!buf || buf.length < 4) return 'unknown';
+          const b0 = buf[0], b1 = buf[1], b2 = buf[2], b3 = buf[3];
+          if (b0 === 0x25 && b1 === 0x50 && b2 === 0x44 && b3 === 0x46) return 'pdf';
+          if (b0 === 0x50 && b1 === 0x4B && (b2 === 0x03 || b2 === 0x05 || b2 === 0x07)) return 'zip';
+          if (b0 === 0xD0 && b1 === 0xCF && b2 === 0x11 && b3 === 0xE0) return 'cfb';
+          if (b0 === 0x7B && b1 === 0x5C && b2 === 0x72 && b3 === 0x74) return 'rtf';
+          const head = buf.slice(0, 64).toString('utf8').trim().toLowerCase();
+          if (head.startsWith('<!doctype') || head.startsWith('<html') || head.startsWith('<?xml') || head.startsWith('<')) return 'html';
+          if (head.startsWith('{') || head.startsWith('[')) return 'json';
+          return 'unknown';
+        };
+        const magicMatchesExt2 = (buf, ext) => {
+          const got = detectFormat2(buf);
+          const ex = String(ext || '').toLowerCase();
+          if (ex === 'pdf') return got === 'pdf';
+          if (['docx', 'xlsx', 'odt', 'ods', 'zip'].includes(ex)) return got === 'zip';
+          if (ex === 'doc' || ex === 'xls') return got === 'cfb';
+          if (ex === 'rtf') return got === 'rtf';
+          if (ex === 'txt') return got !== 'html';
+          return true;
+        };
+
+        const parseBuf = async (name, ext, bytes) => {
+          if (!bytes || !bytes.length) return '';
+          const ex = String(ext || '').toLowerCase();
+          if (!magicMatchesExt2(bytes, ex)) {
+            const got = detectFormat2(bytes);
+            console.log(`    ⚠️ src ${ex.toUpperCase()} "${name}" magic mismatch (got=${got}, ${bytes.length}B) — skipping`);
+            return '';
+          }
+          try {
+            if (ex === 'pdf') {
+              if (!pdfParse2) return '';
+              const parsed = await pdfParse2(bytes);
+              return (parsed && parsed.text ? parsed.text : '').trim();
+            }
+            if (ex === 'docx' || ex === 'odt') {
+              if (!mammoth2) return '';
+              const out = await mammoth2.extractRawText({ buffer: bytes });
+              return (out && out.value ? out.value : '').trim();
+            }
+            if (ex === 'xlsx' || ex === 'xls' || ex === 'ods') {
+              if (!XLSX2) return '';
+              const wb = XLSX2.read(bytes, { type: 'buffer' });
+              const parts = [];
+              for (const sn of wb.SheetNames) {
+                const csv = XLSX2.utils.sheet_to_csv(wb.Sheets[sn]);
+                if (csv && csv.trim()) parts.push(`# Sheet: ${sn}\n${csv}`);
+              }
+              return parts.join('\n\n').trim();
+            }
+            if (ex === 'rtf' || ex === 'txt') {
+              const raw = bytes.toString('utf8');
+              if (ex === 'txt') return raw.trim();
+              return raw.replace(/\\[a-z]+-?\d*\s?/gi, ' ').replace(/[{}]/g, ' ').replace(/\s+/g, ' ').trim();
+            }
+            if (ex === 'zip') {
+              if (!AdmZip2) return '';
+              const zip = new AdmZip2(bytes);
+              const entries = zip.getEntries().filter(e => !e.isDirectory).slice(0, 5);
+              const parts = [];
+              for (const z of entries) {
+                const innerBytes = z.getData();
+                const innerExt = (z.entryName.match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '';
+                const t = await parseBuf(z.entryName, innerExt, innerBytes);
+                if (t) parts.push(`--- (zip:${name}) ${z.entryName} ---\n${t.slice(0, SRC_DOC_CHAR_CAP)}`);
+              }
+              return parts.join('\n\n');
+            }
+          } catch (e) {
+            console.log(`    ⚠️ src ${ex.toUpperCase()} parse failed for "${name}": ${e.message}`);
+            return '';
+          }
+          return '';
+        };
+
+        const docTexts = [];
+        let okCount = 0;
+        let totalChars = 0;
+        for (const sf of result.sourceFiles.slice(0, MAX_SRC_FILES)) {
+          if (totalChars >= SRC_TOTAL_CHAR_CAP) break;
+          try {
+            const fetched = await srcPage.evaluate(async (url) => {
+              try {
+                const r = await fetch(url, { credentials: 'include' });
+                const ct = r.headers.get('content-type') || '';
+                if (!r.ok) return { ok: false, status: r.status, contentType: ct };
+                const buf = await r.arrayBuffer();
+                const arr = Array.from(new Uint8Array(buf));
+                return { ok: true, status: r.status, contentType: ct, data: arr, size: arr.length };
+              } catch (e) {
+                return { ok: false, error: String(e) };
+              }
+            }, sf.url);
+            if (!(fetched && fetched.ok && fetched.size > 100)) {
+              const tail = fetched ? `status=${fetched.status || '?'}, ct=${(fetched.contentType || '').slice(0, 40)}` : 'no-response';
+              console.log(`    ⚠️ src fetch failed "${sf.name}" (${tail})`);
+              continue;
+            }
+            const buf = Buffer.from(fetched.data);
+            const text = await parseBuf(sf.name, sf.ext, buf);
+            if (text) {
+              const clipped = text.slice(0, SRC_DOC_CHAR_CAP);
+              docTexts.push(`--- (source) ${sf.name} ---\n${clipped}`);
+              totalChars += clipped.length;
+              okCount += 1;
+              console.log(`    📄 parsed source ${String(sf.ext).toUpperCase()} "${sf.name}" (${buf.length}B → ${clipped.length}ch)`);
+            } else {
+              console.log(`    ⚠️ src ${String(sf.ext).toUpperCase()} "${sf.name}" had no extractable text`);
+            }
+          } catch (e) {
+            console.log(`    ⚠️ src file "${sf.name}" error: ${e.message}`);
+          }
+        }
+        if (docTexts.length) {
+          result.sourceFilesText = docTexts.join('\n\n').slice(0, SRC_TOTAL_CHAR_CAP);
+        }
+        console.log(`    source files prefetched/parsed: ${okCount}/${result.sourceFiles.length} (host: ${result.sourceHost})`);
+        // Trim raw bytes from result (we no longer need them to leave the helper)
+        result.sourceFiles = result.sourceFiles.map(sf => ({
+          name: sf.name, ext: sf.ext, url: sf.url,
+        }));
+      }
+    } catch (e) {
+      console.log(`    source-file prefetch error: ${e.message}`);
+    }
 
     srcPage.off('request', blockHandler);
     try { await srcPage.setRequestInterception(false); } catch (_) {}
@@ -2082,6 +2362,23 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           details.referenceNumber = src.referenceNumberSource;
         }
         details.sourceHost = src.sourceHost || null;
+
+        // Append parsed source-page document text (e.g. simap.ch
+        // attachments revealed via "Interesse bekunden") into the same
+        // pdfText pool the AI extractor reads. Cap total to 200K so we
+        // stay inside Claude Haiku 4.5's 200K context with margin for
+        // title/description/system prompt.
+        if (src.sourceFilesText && src.sourceFilesText.length) {
+          const HARD_CAP = 200000;
+          const existing = details.pdfText || '';
+          const sep = existing ? '\n\n' : '';
+          const combined = (existing + sep + src.sourceFilesText).slice(0, HARD_CAP);
+          details.pdfText = combined;
+          console.log(`    → merged ${src.sourceFilesText.length}ch of source-page docs into pdfText (total now ${combined.length}ch)`);
+        }
+        if (src.simapInterestClicked) {
+          details.simapInterestClicked = true;
+        }
       } else {
         details.sourceFetchError = src?.error || 'unknown';
       }
