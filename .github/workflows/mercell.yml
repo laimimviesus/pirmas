@@ -32,7 +32,7 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-     - name: Install dependencies
+      - name: Install dependencies
         run: npm install puppeteer pdf-parse googleapis mammoth xlsx adm-zip
 
       - name: Install Chromium dependencies
