@@ -161,21 +161,25 @@ async function translateToEnglish(text, { hint = '', skipHeuristic = false } = {
 
 async function extractFieldsWithAI(text, meta = {}) {
   if (!AI_ENABLED || !text) return {};
-  // Bumped to 40000 — kad PDF dokumentų turinys (reikalavimai, kvalifikacijos,
-  // vertinimo kriterijai) pilnai tilptų į Claude prompt'ą.
-  const trimmed = String(text).slice(0, 40000);
+  // Bumped to 150000 — Haiku 4.5 has 200K context, so we send up to 150K chars
+  // of combined notice text + PDF document content. This lets the model see
+  // the full Terms of Reference, mandatory requirements lists, qualification
+  // chapters, and award-criteria tables that the sparse fields rely on.
+  const trimmed = String(text).slice(0, 150000);
   const system =
-    'You extract structured procurement tender fields from free-form notice text. ' +
+    'You extract structured procurement tender fields from free-form notice text plus attached document text. ' +
+    'The user message has sections labeled TITLE / DESCRIPTION / MERCELL_PAGE / DOCUMENTS — the DOCUMENTS section, when present, contains the FULL TEXT of one or more attached PDF specifications and is usually where requirements, qualifications, and award criteria are spelled out. SCAN IT THOROUGHLY before deciding a field is empty. ' +
     'Return ONLY a JSON object (no prose, no markdown fences) with these keys: ' +
-    'maxBudget, duration, requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement. ' +
+    'maxBudget, estimatedBudgetEur, duration, requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement.\n' +
     'Rules:\n' +
-    '- maxBudget: total ceiling / max contract value in EUR (or native currency with explicit code), without VAT if stated. Example: "1,200,000 EUR (ex VAT)". Empty string if not stated.\n' +
+    '- maxBudget: total ceiling / max contract value AS STATED in the tender or attached docs (with currency code, ex-VAT if specified). Examples: "1,200,000 EUR (ex VAT)", "8 500 000 SEK". Empty string if not explicitly stated anywhere.\n' +
+    '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND the description/documents give enough basis (scope, deliverables, duration, country, complexity). Use realistic public-sector IT contract rates for that country. Output a plain integer like 850000 (no separators, no currency, no words). Empty string if you cannot estimate responsibly.\n' +
     '- duration: contract length in months or years. Example: "36 months" or "2 years + 2 x 1 year option". Empty string if not stated.\n' +
-    '- requirementsForSupplier: bullet-style summary (≤400 chars) of mandatory supplier/bidder requirements (legal status, insurance, ISO certifications, technical staff, etc.). Empty string if not stated.\n' +
-    '- qualificationRequirements: bullet-style summary (≤400 chars) of selection / qualification criteria (references, turnover thresholds, past projects, team CVs). Empty string if not stated.\n' +
-    '- offerWeighingCriteria: award criteria with weights if present. Example: "Price 40%, Quality 35%, Delivery time 25%" or "MEAT — lowest price". Empty string if not stated.\n' +
+    '- requirementsForSupplier: bullet-style summary (≤400 chars) of MANDATORY supplier/bidder requirements (legal status, insurance, ISO certifications, security clearance, technical staff, financial standing). Look in DOCUMENTS for sections titled "Requirements", "Mandatory requirements", "Reikalavimai tiekėjui", "Wymagania", "Anforderungen an den Bieter", "Krav til leverandør", "Eisen aan inschrijver", "Exigences", "Requisitos". Empty string if truly absent.\n' +
+    '- qualificationRequirements: bullet-style summary (≤400 chars) of SELECTION / qualification criteria (turnover thresholds, references, past similar projects, team CVs, certifications). Look for "Selection criteria", "Qualification", "Kvalifikaciniai reikalavimai", "Kwalifikacja", "Eignungskriterien", "Kvalifikasjonskrav". Empty string if truly absent.\n' +
+    '- offerWeighingCriteria: award criteria with weights if present. Example: "Price 40%, Quality 35%, Delivery time 25%" or "MEAT — lowest price". Look for "Award criteria", "Evaluation", "Vertinimo kriterijai", "Kryteria oceny", "Zuschlagskriterien", "Tildelingskriterier". Empty string if truly absent.\n' +
     '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English.\n' +
-    'Write all field values in English even if the source is in another language. Never invent data — if a field is not present, use an empty string.';
+    'Write all field values in English even if the source is in another language. Never invent specifics — but DO synthesize when documents clearly imply requirements (e.g., "ISO 27001 certificate" listed under "Mandatory documents" → include in requirementsForSupplier). If a field is genuinely not present, use an empty string.';
   const metaLine = [
     meta.title ? `Title: ${meta.title}` : '',
     meta.buyer ? `Buyer: ${meta.buyer}` : '',
@@ -196,6 +200,7 @@ async function extractFieldsWithAI(text, meta = {}) {
     const parsed = JSON.parse(cleaned);
     return {
       maxBudget: (parsed.maxBudget || '').toString().trim(),
+      estimatedBudgetEur: (parsed.estimatedBudgetEur || '').toString().trim(),
       duration: (parsed.duration || '').toString().trim(),
       requirementsForSupplier: (parsed.requirementsForSupplier || '').toString().trim(),
       qualificationRequirements: (parsed.qualificationRequirements || '').toString().trim(),
@@ -1561,9 +1566,68 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         console.log(`    📄 found ${collectedFiles.length} PDF file(s) in JSON`);
       }
 
+      // --- PDF RELEVANCE SORTING --------------------------------------
+      // Mercell tender'iai dažnai pridėti 5–15 failų: ToR, EBVPD, kainos forma,
+      // priedai, NDA šablonai. Reikalavimai / kvalifikacijos / vertinimo
+      // kriterijai paprastai būna ToR / Specifikacijos / Pirkimo sąlygos
+      // dokumentuose. Surūšiuojam taip, kad relevant'iškiausi keliautų pirmi —
+      // multilingual, nes scraper'is grobia 16 ES šalių.
+      const POSITIVE_KW = [
+        // English
+        'requirement', 'qualification', 'criteria', 'criterion', 'specification',
+        'spec', 'tor', 'terms of reference', 'task description', 'sow',
+        'scope of work', 'rfp', 'tender doc', 'evaluation', 'award', 'selection',
+        // Lithuanian
+        'reikalav', 'kvalifik', 'kriterij', 'specifik', 'sąlyg', 'pirkimo',
+        // Polish
+        'wymag', 'kwalifik', 'kryteri', 'specyfik', 'opis przedmiotu',
+        // German
+        'anforder', 'kriterien', 'lastenheft', 'leistungsbeschr',
+        // Norwegian / Swedish / Danish
+        'krav', 'kravspec', 'tildelings',
+        // Dutch
+        'eisen', 'bestek', 'criteri', 'gunning',
+        // French
+        'exigen', 'cahier', 'crit',
+        // Spanish / Portuguese
+        'requisi', 'pliego',
+        // Italian
+        'capitolat',
+        // Czech / Slovak
+        'požadav', 'kritéri',
+        // Finnish
+        'vaatimuk', 'kelpoisuu',
+        // Estonian
+        'nõue', 'kriteer',
+        // Latvian
+        'prasīb',
+      ];
+      const NEGATIVE_KW = [
+        'espd', 'gdpr', 'nda', 'cv', 'logo', 'cover-letter', 'price-form',
+        'kainos forma', 'formularz cenowy', 'preisblatt', 'oferta-cenow',
+      ];
+      const scoreFile = (name) => {
+        const n = String(name || '').toLowerCase();
+        let s = 0;
+        for (const kw of POSITIVE_KW) if (n.includes(kw)) s += 10;
+        for (const kw of NEGATIVE_KW) if (n.includes(kw)) s -= 8;
+        // Annex/appendix → slight de-prioritization (often supplementary)
+        if (/\b(annex|appendix|priedas|liite|załącznik|bilag|bilaga|anlage|allegato|anexo)\b/i.test(n)) s -= 2;
+        return s;
+      };
+      collectedFiles.sort((a, b) => scoreFile(b.name) - scoreFile(a.name));
+      if (collectedFiles.length) {
+        const top = collectedFiles.slice(0, 6).map(f => `${f.name}(${scoreFile(f.name)})`).join(', ');
+        console.log(`    📄 PDF priority: ${top}`);
+      }
+
       // Kiek PDF'ų parsiunčiam per tender'į (kad neužtruktų per ilgai):
-      const MAX_PDFS_PER_TENDER = 2;
-      const MAX_PDF_TEXT_CHARS = 20000;
+      // Bumped 2 → 6: tender'iai dažnai turi po kelis svarbius dokumentus
+      // (ToR + qualification + award criteria atskirai), o filename'ų
+      // prioritizavimas užtikrina, kad pirmi 6 yra reikšmingiausi.
+      const MAX_PDFS_PER_TENDER = 6;
+      // Bumped 20K → 30K: ToR dokumentai dažnai > 20K char.
+      const MAX_PDF_TEXT_CHARS = 30000;
       let pdfParse = null;
       try {
         pdfParse = require('pdf-parse'); // optional dep
@@ -1637,8 +1701,10 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
 
         if (pdfTexts.length) {
           const combined = pdfTexts.join('\n\n');
-          // Bendrai ribokime per tender'į (kad AI prompt'as neišeitų už ribų)
-          details.pdfText = combined.slice(0, MAX_PDF_TEXT_CHARS * MAX_PDFS_PER_TENDER);
+          // Bendrai ribokime per tender'į iki 120K chars — Claude Haiku 4.5 turi
+          // 200K context'ą, tad palieam vietos title'ui, description'ui ir
+          // sistemos prompt'ui. Nesutrumpinta — taip AI mato visą ToR turinį.
+          details.pdfText = combined.slice(0, 120000);
         }
       }
     } catch (e) {
@@ -2420,13 +2486,21 @@ async function runScraper() {
       const eur = n * mult * fx;
       return { amount: eur, known: true };
     };
-const formatEurBudget = (raw) => {
+    const formatEurBudget = (raw) => {
       if (!raw) return '';
-      const { amount, known } = parseEurBudget(raw);
-      if (!known || !Number.isFinite(amount)) return String(raw);
+      const rawStr = String(raw).trim();
+      // Preserve "EST" prefix produced by AI estimation fallback when no
+      // explicit budget exists. We re-format the inner number but keep the
+      // EST marker so the user can tell estimates from stated budgets.
+      const estMatch = rawStr.match(/^EST\s+(.+)$/i);
+      if (estMatch) {
+        const inner = formatEurBudget(estMatch[1]);
+        return inner ? `EST ${inner}` : rawStr;
+      }
+      const { amount, known } = parseEurBudget(rawStr);
+      if (!known || !Number.isFinite(amount)) return rawStr;
       const rounded = Math.round(amount);
       const formatted = rounded.toLocaleString('en-US');
-      const rawStr = String(raw).trim();
       const hadForeignCurrency = /\b(NOK|SEK|DKK|GBP|USD|PLN|CZK|HUF)\b|[£$]/i.test(rawStr);
       if (hadForeignCurrency) {
         return `EUR ${formatted} (${rawStr})`;
@@ -2454,7 +2528,7 @@ const formatEurBudget = (raw) => {
         cleanOrg(d.organisation || t.organisation || ''),
         fmtDate(d.deadline || t.deadlineRaw || ''),
         d.country || t.country || '',
-        d.maxBudget || '',
+        formatEurBudget(d.maxBudget),
         d.duration || '',
         reqOut,
         qualOut,
@@ -2598,6 +2672,19 @@ const formatEurBudget = (raw) => {
           });
           const filled = [];
           if (!dd.maxBudget && ai.maxBudget) { dd.maxBudget = ai.maxBudget; filled.push('maxBudget'); }
+          // AI estimate fallback — no explicit budget anywhere, but AI thinks
+          // it can ballpark from scope/duration/country market rates. Marked
+          // with "EST " prefix so the cell visibly differentiates an estimate
+          // from a stated budget. Filter logic below still applies (estimates
+          // < 500K EUR are dropped exactly like stated budgets).
+          if (!dd.maxBudget && ai.estimatedBudgetEur) {
+            const num = parseFloat(String(ai.estimatedBudgetEur).replace(/[^0-9.]/g, ''));
+            if (Number.isFinite(num) && num > 0) {
+              dd.maxBudget = `EST ${Math.round(num).toLocaleString('en-US')} EUR`;
+              dd.budgetIsEstimated = true;
+              filled.push('maxBudget(EST)');
+            }
+          }
           if (!dd.duration && ai.duration) { dd.duration = ai.duration; filled.push('duration'); }
           if (!dd.requirementsForSupplier && ai.requirementsForSupplier) { dd.requirementsForSupplier = ai.requirementsForSupplier; filled.push('requirements'); }
           if (!dd.qualificationRequirements && ai.qualificationRequirements) { dd.qualificationRequirements = ai.qualificationRequirements; filled.push('qualifications'); }
