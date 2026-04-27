@@ -2215,9 +2215,14 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
             path: u.pathname + u.search,
             port: u.port || (u.protocol === 'http:' ? 80 : 443),
             // No `Cookie:` header on purpose — presigned URL is self-authenticating.
+            // `Accept-Encoding: identity` so S3 doesn't return a gzip body that we'd
+            // need to manually inflate; `Connection: close` so we don't reuse a
+            // socket whose state could interfere across attempts.
             headers: {
               'User-Agent': 'Mozilla/5.0 (compatible; mercell-scraper/1.0)',
               'Accept': '*/*',
+              'Accept-Encoding': 'identity',
+              'Connection': 'close',
             },
             timeout: 30000,
           }, (res) => {
@@ -2309,10 +2314,17 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           let lastFormat = null;
           let lastStatus = null;
           let lastContentType = null;
+          let lastError = null;
+          // per-attempt trace, dumped if we can't fetch — invaluable for
+          // diagnosing why an entire batch comes back as ct=text/html.
+          const attemptTrace = [];
           for (const u of candidates) {
+            const path = isMercellHost(u) ? 'PAGE' : 'NODE';
+            let host = '?';
+            try { host = new URL(u).hostname; } catch (_) { /* ignore */ }
+            let result;
             try {
-              let result;
-              if (isMercellHost(u)) {
+              if (path === 'PAGE') {
                 // Mercell-internal — needs session cookies, fetch via the
                 // authenticated Puppeteer page context.
                 result = await page.evaluate(async (url) => {
@@ -2335,32 +2347,59 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
                 // directly so we don't send cookies and don't trigger CORS.
                 result = await fetchNode(u);
               }
-              if (result && result.ok && result.size > 100) {
-                const tmpBytes = result.bytes || Buffer.from(result.data || []);
-                lastStatus = result.status;
-                lastContentType = result.contentType;
-                lastFormat = detectFormat(tmpBytes);
-                if (magicMatchesExt(tmpBytes, f.ext)) {
-                  bytes = tmpBytes;
-                  okUrl = u;
-                  break;
-                }
-                // wrong magic — log only at debug level and try next candidate
-              } else if (result && !result.ok) {
-                lastStatus = result.status;
-                if (!lastContentType && result.contentType) lastContentType = result.contentType;
+            } catch (e) {
+              result = { ok: false, error: String(e && e.message || e) };
+            }
+            // build attempt summary BEFORE branching so we always have it
+            const attemptParts = [`${path} ${host}`];
+            if (result) {
+              if (result.status != null) attemptParts.push(`status=${result.status}`);
+              else attemptParts.push('status=?');
+              if (result.contentType) attemptParts.push(`ct=${String(result.contentType).slice(0, 30)}`);
+              if (typeof result.size === 'number') attemptParts.push(`size=${result.size}`);
+              const tmpBytes = result.bytes || (Array.isArray(result.data) ? Buffer.from(result.data) : null);
+              if (tmpBytes && tmpBytes.length) {
+                const sniff = tmpBytes.slice(0, 60).toString('utf8').replace(/\s+/g, ' ').slice(0, 60);
+                attemptParts.push(`sniff="${sniff}"`);
               }
-            } catch (_) {
-              // try next
+              if (result.error) attemptParts.push(`err=${String(result.error).slice(0, 60)}`);
+            } else {
+              attemptParts.push('NO_RESULT');
+            }
+            attemptTrace.push(attemptParts.join(' '));
+
+            if (result && result.ok && (result.size || 0) > 100) {
+              const tmpBytes = result.bytes || Buffer.from(result.data || []);
+              lastStatus = result.status;
+              lastContentType = result.contentType;
+              lastFormat = detectFormat(tmpBytes);
+              if (magicMatchesExt(tmpBytes, f.ext)) {
+                bytes = tmpBytes;
+                okUrl = u;
+                break;
+              }
+            } else if (result && !result.ok) {
+              if (result.status != null) lastStatus = result.status;
+              if (!lastContentType && result.contentType) lastContentType = result.contentType;
+              if (result.error) lastError = String(result.error).slice(0, 80);
             }
           }
 
           if (!bytes) {
             const ctTail = lastContentType ? `, ct=${lastContentType.slice(0, 40)}` : '';
             const fmtTail = lastFormat ? `, got=${lastFormat}` : '';
-            const statusTail = lastStatus ? `, last=${lastStatus}` : '';
-            const refTail = f.ref ? `, ref=${String(f.ref).slice(0, 40)}` : ', ref=NONE';
-            console.log(`    ⚠️ could not fetch ${f.ext.toUpperCase()} "${f.name}" (id=${f.id}${refTail}${statusTail}${ctTail}${fmtTail})`);
+            const statusTail = (lastStatus != null) ? `, last=${lastStatus}` : '';
+            const errTail = lastError ? `, err=${lastError}` : '';
+            const refLen = f.ref ? String(f.ref).length : 0;
+            const refTail = f.ref
+              ? `, ref=${String(f.ref).slice(0, 40)}…(len=${refLen})`
+              : ', ref=NONE';
+            console.log(`    ⚠️ could not fetch ${f.ext.toUpperCase()} "${f.name}" (id=${f.id}${refTail}${statusTail}${ctTail}${fmtTail}${errTail})`);
+            // Dump per-attempt trace so we can see WHICH URLs were tried
+            // and what each returned — critical when whole batches fail.
+            for (const t of attemptTrace.slice(0, 8)) {
+              console.log(`      · ${t}`);
+            }
             continue;
           }
 
