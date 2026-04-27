@@ -1592,10 +1592,33 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
   let blockHandler = null;
   let responseHandler = null;
   const capturedApis = []; // { url, json }
+  // Bearer token captured from the SPA's own outgoing API requests.
+  // Mercell's frontend stores its access token in localStorage and sends
+  // it as `Authorization: Bearer <token>` on every XHR to *.discover.app.
+  // mercell.com. Cookies alone aren't enough — the search-service-api
+  // returns 401 without this header. We capture it once from the first
+  // intercepted request and reuse it on direct file fetches via CDP.
+  let mercellBearer = null;
   try {
     await page.setRequestInterception(true);
     blockHandler = (req) => {
       const type = req.resourceType();
+      // Sniff the outgoing Authorization header for any Mercell-internal
+      // API call. Captured ONCE and reused thereafter; the token is
+      // session-scoped and stable for the lifetime of this page.
+      try {
+        if (!mercellBearer) {
+          const reqUrl = req.url();
+          if (/\.discover\.app\.mercell\.com\//.test(reqUrl)) {
+            const headers = req.headers() || {};
+            const auth = headers.authorization || headers.Authorization;
+            if (auth && /^bearer\s+/i.test(auth)) {
+              mercellBearer = auth;
+              console.log(`    🔑 captured Mercell Bearer (${auth.length}ch) from ${new URL(reqUrl).hostname}`);
+            }
+          }
+        }
+      } catch (_) { /* ignore */ }
       if (['image', 'media', 'font'].includes(type)) {
         req.abort();
       } else {
@@ -2280,10 +2303,17 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       // fetchTenderDetails and reuse it across every candidate URL.
       let cdpSession = null;
       let cdpFrameId = null;
+      // Track which extra-header set is currently installed on the CDP
+      // session so we don't redundantly call setExtraHTTPHeaders.
+      // 'bearer' = Authorization header present, 'none' = no extras.
+      let cdpExtraMode = null;
       const ensureCdp = async () => {
         if (cdpSession) return cdpSession;
         try {
           cdpSession = await page.target().createCDPSession();
+          // Network domain MUST be enabled for setExtraHTTPHeaders to
+          // take effect — silently no-ops without this.
+          await cdpSession.send('Network.enable').catch(() => {});
           const { frameTree } = await cdpSession.send('Page.getFrameTree');
           cdpFrameId = frameTree.frame.id;
           return cdpSession;
@@ -2292,10 +2322,46 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           return null;
         }
       };
+      // Drain a CDP IO.read stream into a Buffer. Returns Buffer.alloc(0)
+      // on any error so the caller can still report status/headers.
+      const drainCdpStream = async (sess, handle) => {
+        const chunks = [];
+        try {
+          let done = false;
+          for (let i = 0; i < 200 && !done; i++) {
+            const chunk = await sess.send('IO.read', { handle });
+            if (chunk && chunk.data) {
+              chunks.push(Buffer.from(chunk.data, chunk.base64Encoded ? 'base64' : 'utf8'));
+            }
+            done = !!(chunk && chunk.eof);
+          }
+        } catch (_) { /* ignore */ }
+        try { await sess.send('IO.close', { handle }); } catch (_) { /* ignore */ }
+        return Buffer.concat(chunks);
+      };
       const fetchViaCDP = async (url) => {
         try {
           const sess = await ensureCdp();
           if (!sess) return { ok: false, error: 'cdp-init-failed' };
+
+          // Inject Authorization: Bearer <token> ONLY for Mercell-internal
+          // hosts. S3 must NOT see an Authorization header — AWS treats
+          // it as an alternate signature and rejects the presigned URL.
+          // We toggle the extra headers via Network.setExtraHTTPHeaders
+          // before each loadNetworkResource call.
+          let isMercell = false;
+          try {
+            isMercell = /\.mercell\.com$/i.test(new URL(url).hostname);
+          } catch (_) { /* ignore */ }
+          const wantMode = (isMercell && mercellBearer) ? 'bearer' : 'none';
+          if (wantMode !== cdpExtraMode) {
+            try {
+              const headers = wantMode === 'bearer' ? { Authorization: mercellBearer } : {};
+              await sess.send('Network.setExtraHTTPHeaders', { headers });
+              cdpExtraMode = wantMode;
+            } catch (_) { /* best-effort */ }
+          }
+
           const r = await sess.send('Network.loadNetworkResource', {
             frameId: cdpFrameId,
             url,
@@ -2303,41 +2369,31 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           });
           const resource = r && r.resource;
           if (!resource) return { ok: false, error: 'no-resource' };
+          const status = resource.httpStatusCode || 0;
+          const respHeaders = resource.headers || {};
+          const ct = respHeaders['content-type']
+            || respHeaders['Content-Type']
+            || respHeaders['CONTENT-TYPE']
+            || '';
+          // Read body whether or not CDP marks success. CDP says
+          // success=false for any non-2xx status, but the stream IS
+          // populated and contains diagnostic XML/JSON — critical for
+          // distinguishing "Request has expired" from "AccessDenied"
+          // from "SignatureDoesNotMatch" on S3 presigned URLs.
+          let bytes = Buffer.alloc(0);
+          if (resource.stream) {
+            bytes = await drainCdpStream(sess, resource.stream);
+          }
           if (!resource.success) {
             return {
               ok: false,
-              status: resource.httpStatusCode || 0,
-              error: resource.netErrorName || 'load-failed',
-            };
-          }
-          const status = resource.httpStatusCode || 0;
-          const headers = resource.headers || {};
-          const ct = headers['content-type']
-            || headers['Content-Type']
-            || headers['CONTENT-TYPE']
-            || '';
-          if (!resource.stream) {
-            return {
-              ok: status >= 200 && status < 300,
               status,
               contentType: ct,
-              bytes: Buffer.alloc(0),
-              size: 0,
+              error: resource.netErrorName || 'load-failed',
+              bytes,
+              size: bytes.length,
             };
           }
-          const chunks = [];
-          let done = false;
-          // Read until eof — IO.read returns up to ~10MB chunks. Cap at
-          // 200 iterations so a malformed stream can't infinite-loop us.
-          for (let i = 0; i < 200 && !done; i++) {
-            const chunk = await sess.send('IO.read', { handle: resource.stream });
-            if (chunk && chunk.data) {
-              chunks.push(Buffer.from(chunk.data, chunk.base64Encoded ? 'base64' : 'utf8'));
-            }
-            done = !!(chunk && chunk.eof);
-          }
-          try { await sess.send('IO.close', { handle: resource.stream }); } catch (_) { /* ignore */ }
-          const bytes = Buffer.concat(chunks);
           return {
             ok: status >= 200 && status < 300,
             status,
@@ -2371,12 +2427,11 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
               // Direct URL — paduodam kaip yra
               candidates.push(refStr);
             } else {
-              // GUID-style — template'inam į žinomus endpoint'us
+              // GUID-style — template'inam į žinomus endpoint'us.
+              // file-service.discover.app.mercell.com PAŠALINTAS —
+              // DNS NXDOMAIN, host'as neegzistuoja. Prieš tai gaišom 4
+              // candidate'us per failą bandydami nepasiekiamą subdomeną.
               candidates.push(
-                `https://file-service.discover.app.mercell.com/api/v1/files/${refStr}/download`,
-                `https://file-service.discover.app.mercell.com/api/v1/files/${refStr}`,
-                `https://file-service.discover.app.mercell.com/files/${refStr}/download`,
-                `https://file-service.discover.app.mercell.com/files/${refStr}`,
                 `https://search-service-api.discover.app.mercell.com/api/v1/files/${refStr}/download`,
                 `https://search-service-api.discover.app.mercell.com/api/v1/files/${refStr}`,
                 `https://app.mercell.com/files/${refStr}/download`,
@@ -2386,14 +2441,11 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
             }
           }
           // Integer ID variantai kaip fallback'as — kartais Mercell'is juos
-          // priima legacy endpoint'uose.
+          // priima legacy endpoint'uose. (file-service.* irgi pašalintas
+          // čia — žr. komentarą aukščiau.)
           candidates.push(
-            // file-service.discover.app.mercell.com — pagrindinis
-            `https://file-service.discover.app.mercell.com/api/v1/files/${f.id}/download`,
-            `https://file-service.discover.app.mercell.com/api/v1/files/${f.id}`,
-            `https://file-service.discover.app.mercell.com/files/${f.id}/download`,
-            `https://file-service.discover.app.mercell.com/files/${f.id}`,
-            // search-service-api — kartais file-service deleguojamas
+            // search-service-api — pagrindinis API host'as. Su captured
+            // Bearer'iu turėtų grąžinti file content arba presigned URL.
             `https://search-service-api.discover.app.mercell.com/api/v1/files/${f.id}/download`,
             `https://search-service-api.discover.app.mercell.com/api/v1/files/${f.id}`,
             // app.mercell.com legacy
