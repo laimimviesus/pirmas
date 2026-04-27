@@ -2190,6 +2190,67 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         return '';
       }
 
+      // --- Node-side https GET (no cookies, follows redirects) -------------
+      //
+      // Mercell now serves many attachments as presigned S3 URLs
+      // (`old-dc-import-notices-prod.s3.eu-…amazonaws.com/...?X-Amz-Signature=...`).
+      // These URLs are self-authenticating, but fetching them through
+      // `page.evaluate(fetch, {credentials:'include'})` confuses S3 — the
+      // browser sends Mercell session cookies + triggers a CORS preflight,
+      // and S3 responds with an HTML/XML error page. So for any non-Mercell
+      // URL we fetch from Node directly with no cookies; the presigned
+      // signature is all S3 needs. Returns { ok, status, contentType, bytes:Buffer|null, error }.
+      const isMercellHost = (url) => {
+        try {
+          const h = new URL(url).hostname.toLowerCase();
+          return /(^|\.)mercell\.com$/.test(h);
+        } catch (_) { return false; }
+      };
+      const fetchNode = (url, redirects = 5) => new Promise((resolve) => {
+        try {
+          const u = new URL(url);
+          const lib = u.protocol === 'http:' ? require('http') : require('https');
+          const req = lib.get({
+            hostname: u.hostname,
+            path: u.pathname + u.search,
+            port: u.port || (u.protocol === 'http:' ? 80 : 443),
+            // No `Cookie:` header on purpose — presigned URL is self-authenticating.
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (compatible; mercell-scraper/1.0)',
+              'Accept': '*/*',
+            },
+            timeout: 30000,
+          }, (res) => {
+            // Follow redirects manually so we can keep the no-cookies posture
+            // through the chain (S3 sometimes 302's to a different signed URL).
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
+              const next = new URL(res.headers.location, url).toString();
+              res.resume();
+              fetchNode(next, redirects - 1).then(resolve);
+              return;
+            }
+            const ct = res.headers['content-type'] || '';
+            const chunks = [];
+            res.on('data', (d) => chunks.push(d));
+            res.on('end', () => {
+              const bytes = Buffer.concat(chunks);
+              resolve({
+                ok: res.statusCode >= 200 && res.statusCode < 300,
+                status: res.statusCode,
+                contentType: ct,
+                bytes,
+                size: bytes.length,
+              });
+            });
+            res.on('error', (e) => resolve({ ok: false, error: e.message }));
+          });
+          req.on('error', (e) => resolve({ ok: false, error: e.message }));
+          req.on('timeout', () => { req.destroy(new Error('timeout')); });
+        } catch (e) {
+          resolve({ ok: false, error: e.message });
+        }
+      });
+
       if (collectedFiles.length) {
         const docTexts = [];
         const toFetch = collectedFiles.slice(0, MAX_DOCS_PER_TENDER);
@@ -2250,20 +2311,32 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           let lastContentType = null;
           for (const u of candidates) {
             try {
-              const result = await page.evaluate(async (url) => {
-                try {
-                  const r = await fetch(url, { credentials: 'include' });
-                  const ct = r.headers.get('content-type') || '';
-                  if (!r.ok) return { ok: false, status: r.status, contentType: ct };
-                  const buf = await r.arrayBuffer();
-                  const arr = Array.from(new Uint8Array(buf));
-                  return { ok: true, status: r.status, contentType: ct, data: arr, size: arr.length };
-                } catch (e) {
-                  return { ok: false, error: String(e) };
+              let result;
+              if (isMercellHost(u)) {
+                // Mercell-internal — needs session cookies, fetch via the
+                // authenticated Puppeteer page context.
+                result = await page.evaluate(async (url) => {
+                  try {
+                    const r = await fetch(url, { credentials: 'include' });
+                    const ct = r.headers.get('content-type') || '';
+                    if (!r.ok) return { ok: false, status: r.status, contentType: ct };
+                    const buf = await r.arrayBuffer();
+                    const arr = Array.from(new Uint8Array(buf));
+                    return { ok: true, status: r.status, contentType: ct, data: arr, size: arr.length };
+                  } catch (e) {
+                    return { ok: false, error: String(e) };
+                  }
+                }, u);
+                if (result && result.ok && Array.isArray(result.data)) {
+                  result = { ...result, bytes: Buffer.from(result.data) };
                 }
-              }, u);
+              } else {
+                // Non-Mercell (typically S3 presigned) — fetch from Node
+                // directly so we don't send cookies and don't trigger CORS.
+                result = await fetchNode(u);
+              }
               if (result && result.ok && result.size > 100) {
-                const tmpBytes = Buffer.from(result.data);
+                const tmpBytes = result.bytes || Buffer.from(result.data || []);
                 lastStatus = result.status;
                 lastContentType = result.contentType;
                 lastFormat = detectFormat(tmpBytes);
@@ -2275,6 +2348,7 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
                 // wrong magic — log only at debug level and try next candidate
               } else if (result && !result.ok) {
                 lastStatus = result.status;
+                if (!lastContentType && result.contentType) lastContentType = result.contentType;
               }
             } catch (_) {
               // try next
