@@ -1770,10 +1770,53 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         }
       }
 
+      // --- magic-byte sniffer ----------------------------------------------
+      // Mercell file-service kartais grąžina HTML login/redirect puslapį su
+      // 200 OK statusu — tas baitas pratenka mūsų `size > 100` filtrą, bet
+      // pdf-parse'ui jie nepriklauso PDF struktūrai ir log'as užsipildo
+      // šimtais "Ignoring invalid character" eilučių. Patikrinkim magic bytes
+      // PRIEŠ apkraunant parser'į.
+      const detectFormat = (buf) => {
+        if (!buf || buf.length < 4) return 'unknown';
+        const b0 = buf[0], b1 = buf[1], b2 = buf[2], b3 = buf[3];
+        // %PDF-
+        if (b0 === 0x25 && b1 === 0x50 && b2 === 0x44 && b3 === 0x46) return 'pdf';
+        // PK (ZIP family — also DOCX, XLSX, ODT, ODS)
+        if (b0 === 0x50 && b1 === 0x4B && (b2 === 0x03 || b2 === 0x05 || b2 === 0x07)) return 'zip';
+        // CFB (legacy doc/xls)
+        if (b0 === 0xD0 && b1 === 0xCF && b2 === 0x11 && b3 === 0xE0) return 'cfb';
+        // {\rtf
+        if (b0 === 0x7B && b1 === 0x5C && b2 === 0x72 && b3 === 0x74) return 'rtf';
+        // HTML / XML wrapper — first non-whitespace is '<'
+        const head = buf.slice(0, 64).toString('utf8').trim().toLowerCase();
+        if (head.startsWith('<!doctype') || head.startsWith('<html') || head.startsWith('<?xml') || head.startsWith('<')) return 'html';
+        // JSON error envelope
+        if (head.startsWith('{') || head.startsWith('[')) return 'json';
+        return 'unknown';
+      };
+      const magicMatchesExt = (buf, ext) => {
+        const got = detectFormat(buf);
+        const ex = String(ext || '').toLowerCase();
+        if (ex === 'pdf') return got === 'pdf';
+        if (ex === 'docx' || ex === 'xlsx' || ex === 'odt' || ex === 'ods' || ex === 'zip') return got === 'zip';
+        if (ex === 'doc' || ex === 'xls') return got === 'cfb';
+        if (ex === 'rtf') return got === 'rtf';
+        if (ex === 'txt') return got !== 'html'; // accept anything plausible
+        return true; // unknown ext — be permissive
+      };
+
       // --- multi-format text extractor (used for both top-level docs and ZIP entries)
       async function extractTextFromBuffer({ name, ext, bytes }, depth = 0) {
         if (!bytes || !bytes.length) return '';
         const ex = String(ext || '').toLowerCase();
+        // Pre-sniff: jei magic baitai nebus tinkami, ekstraktoriaus visiškai
+        // nešaukiam — taip išvengiam šimtų pdf-parse warning'ų ir nesusigadinam
+        // log'o, jei mums grąžino HTML/JSON vietoj failo.
+        if (!magicMatchesExt(bytes, ex)) {
+          const got = detectFormat(bytes);
+          console.log(`    ⚠️ ${ex.toUpperCase()} "${name}" magic mismatch (got=${got}, ${bytes.length}B) — skipping parse`);
+          return '';
+        }
         try {
           if (ex === 'pdf') {
             if (!pdfParse) return '';
@@ -1868,25 +1911,38 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
 
         for (const f of toFetch) {
           // Bandomi URL šablonai (vienas iš jų suveiks). Pirmas — jei JSON'e
-          // jau buvo `url`/`downloadUrl` laukas.
+          // jau buvo `url`/`downloadUrl` laukas. Plėtėm sąrašą — file-service
+          // kartais grąžina HTML login wall'ą ir mums reikia kito host.
           const candidates = [];
           if (f.url) candidates.push(f.url);
           candidates.push(
+            // file-service.discover.app.mercell.com — pagrindinis
             `https://file-service.discover.app.mercell.com/api/v1/files/${f.id}/download`,
             `https://file-service.discover.app.mercell.com/api/v1/files/${f.id}`,
+            `https://file-service.discover.app.mercell.com/files/${f.id}/download`,
+            `https://file-service.discover.app.mercell.com/files/${f.id}`,
+            // search-service-api — kartais file-service deleguojamas
+            `https://search-service-api.discover.app.mercell.com/api/v1/files/${f.id}/download`,
+            `https://search-service-api.discover.app.mercell.com/api/v1/files/${f.id}`,
+            // app.mercell.com legacy
             `https://app.mercell.com/files/${f.id}/download`,
             `https://app.mercell.com/api/v1/files/${f.id}`,
+            // permalink.mercell.com (kartais procurement docs ten kabo)
+            `https://permalink.mercell.com/api/v1/files/${f.id}/download`,
           );
 
           let bytes = null;
           let okUrl = null;
+          let lastFormat = null;
+          let lastStatus = null;
+          let lastContentType = null;
           for (const u of candidates) {
             try {
               const result = await page.evaluate(async (url) => {
                 try {
                   const r = await fetch(url, { credentials: 'include' });
-                  if (!r.ok) return { ok: false, status: r.status };
                   const ct = r.headers.get('content-type') || '';
+                  if (!r.ok) return { ok: false, status: r.status, contentType: ct };
                   const buf = await r.arrayBuffer();
                   const arr = Array.from(new Uint8Array(buf));
                   return { ok: true, status: r.status, contentType: ct, data: arr, size: arr.length };
@@ -1895,9 +1951,18 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
                 }
               }, u);
               if (result && result.ok && result.size > 100) {
-                bytes = Buffer.from(result.data);
-                okUrl = u;
-                break;
+                const tmpBytes = Buffer.from(result.data);
+                lastStatus = result.status;
+                lastContentType = result.contentType;
+                lastFormat = detectFormat(tmpBytes);
+                if (magicMatchesExt(tmpBytes, f.ext)) {
+                  bytes = tmpBytes;
+                  okUrl = u;
+                  break;
+                }
+                // wrong magic — log only at debug level and try next candidate
+              } else if (result && !result.ok) {
+                lastStatus = result.status;
               }
             } catch (_) {
               // try next
@@ -1905,7 +1970,10 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           }
 
           if (!bytes) {
-            console.log(`    ⚠️ could not fetch ${f.ext.toUpperCase()} "${f.name}" (id=${f.id})`);
+            const ctTail = lastContentType ? `, ct=${lastContentType.slice(0, 40)}` : '';
+            const fmtTail = lastFormat ? `, got=${lastFormat}` : '';
+            const statusTail = lastStatus ? `, last=${lastStatus}` : '';
+            console.log(`    ⚠️ could not fetch ${f.ext.toUpperCase()} "${f.name}" (id=${f.id}${statusTail}${ctTail}${fmtTail})`);
             continue;
           }
 
