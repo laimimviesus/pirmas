@@ -1635,10 +1635,15 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
 
         if (isDocFile) {
           const id = toStr(node.fileId || node.documentId || node.guid);
+          // `fileReference` Mercell'yje yra GUID (skiriasi nuo `fileId` int'o).
+          // file-service'as download'ui beveik visada nori būtent GUID'o, ne
+          // signed-int'o hash'o, todėl saugom ATSKIRAI ir abu naudosim fetch'e.
+          const ref = toStr(node.fileReference || node.reference || '');
           if (id && !seenIds.has(id)) {
             seenIds.add(id);
             collectedFiles.push({
               id,
+              ref,
               name: nameRaw || `file-${id}.${docExt}`,
               url: urlRaw || null,
               mime: mimeRaw,
@@ -1915,6 +1920,24 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           // kartais grąžina HTML login wall'ą ir mums reikia kito host.
           const candidates = [];
           if (f.url) candidates.push(f.url);
+          // GUID variantai pirmiausia — file-service download'ui beveik visada
+          // nori `fileReference` (GUID), o ne `fileId` (signed-int hash). Jei
+          // GUID nepasiekiamas (`f.ref` tuščias), tai praleidžiam šitą bloką.
+          if (f.ref) {
+            candidates.push(
+              `https://file-service.discover.app.mercell.com/api/v1/files/${f.ref}/download`,
+              `https://file-service.discover.app.mercell.com/api/v1/files/${f.ref}`,
+              `https://file-service.discover.app.mercell.com/files/${f.ref}/download`,
+              `https://file-service.discover.app.mercell.com/files/${f.ref}`,
+              `https://search-service-api.discover.app.mercell.com/api/v1/files/${f.ref}/download`,
+              `https://search-service-api.discover.app.mercell.com/api/v1/files/${f.ref}`,
+              `https://app.mercell.com/files/${f.ref}/download`,
+              `https://app.mercell.com/api/v1/files/${f.ref}`,
+              `https://permalink.mercell.com/api/v1/files/${f.ref}/download`,
+            );
+          }
+          // Integer ID variantai kaip fallback'as — kartais Mercell'is juos
+          // priima legacy endpoint'uose.
           candidates.push(
             // file-service.discover.app.mercell.com — pagrindinis
             `https://file-service.discover.app.mercell.com/api/v1/files/${f.id}/download`,
@@ -1973,7 +1996,8 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
             const ctTail = lastContentType ? `, ct=${lastContentType.slice(0, 40)}` : '';
             const fmtTail = lastFormat ? `, got=${lastFormat}` : '';
             const statusTail = lastStatus ? `, last=${lastStatus}` : '';
-            console.log(`    ⚠️ could not fetch ${f.ext.toUpperCase()} "${f.name}" (id=${f.id}${statusTail}${ctTail}${fmtTail})`);
+            const refTail = f.ref ? `, ref=${String(f.ref).slice(0, 40)}` : ', ref=NONE';
+            console.log(`    ⚠️ could not fetch ${f.ext.toUpperCase()} "${f.name}" (id=${f.id}${refTail}${statusTail}${ctTail}${fmtTail})`);
             continue;
           }
 
