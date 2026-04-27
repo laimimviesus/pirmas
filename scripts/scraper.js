@@ -2256,6 +2256,100 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         }
       });
 
+      // --- CDP-based fetch (browser network layer, bypasses CORS) -----------
+      //
+      // Diagnostic logs revealed that BOTH existing strategies fail for
+      // Mercell attachments:
+      //
+      //  - NODE fetch of S3 presigned URL:
+      //      `status=403 ct=application/xml sniff="<Error><Code>AccessDe…"`
+      //    The presign in `fileReference` is signed for Mercell's own
+      //    backend, not for end-user GET. AWS rejects with AccessDenied.
+      //
+      //  - PAGE fetch (page.evaluate) of file-service.discover.app.mercell.com:
+      //      `status=? err=TypeError: Failed to fetch`
+      //    file-service has no Access-Control-Allow-Origin header, so
+      //    the browser blocks the cross-origin fetch BEFORE it reaches
+      //    the network. (CORS is a JS-sandbox restriction.)
+      //
+      // Chrome DevTools Protocol's `Network.loadNetworkResource` runs at
+      // the browser's *network* layer — it picks up the existing Mercell
+      // session cookies (so file-service auth works), follows redirects
+      // (so file-service → fresh presigned S3 URL works), and is NOT
+      // subject to CORS. We open ONE CDP session per call to
+      // fetchTenderDetails and reuse it across every candidate URL.
+      let cdpSession = null;
+      let cdpFrameId = null;
+      const ensureCdp = async () => {
+        if (cdpSession) return cdpSession;
+        try {
+          cdpSession = await page.target().createCDPSession();
+          const { frameTree } = await cdpSession.send('Page.getFrameTree');
+          cdpFrameId = frameTree.frame.id;
+          return cdpSession;
+        } catch (e) {
+          cdpSession = null;
+          return null;
+        }
+      };
+      const fetchViaCDP = async (url) => {
+        try {
+          const sess = await ensureCdp();
+          if (!sess) return { ok: false, error: 'cdp-init-failed' };
+          const r = await sess.send('Network.loadNetworkResource', {
+            frameId: cdpFrameId,
+            url,
+            options: { disableCache: false, includeCredentials: true },
+          });
+          const resource = r && r.resource;
+          if (!resource) return { ok: false, error: 'no-resource' };
+          if (!resource.success) {
+            return {
+              ok: false,
+              status: resource.httpStatusCode || 0,
+              error: resource.netErrorName || 'load-failed',
+            };
+          }
+          const status = resource.httpStatusCode || 0;
+          const headers = resource.headers || {};
+          const ct = headers['content-type']
+            || headers['Content-Type']
+            || headers['CONTENT-TYPE']
+            || '';
+          if (!resource.stream) {
+            return {
+              ok: status >= 200 && status < 300,
+              status,
+              contentType: ct,
+              bytes: Buffer.alloc(0),
+              size: 0,
+            };
+          }
+          const chunks = [];
+          let done = false;
+          // Read until eof — IO.read returns up to ~10MB chunks. Cap at
+          // 200 iterations so a malformed stream can't infinite-loop us.
+          for (let i = 0; i < 200 && !done; i++) {
+            const chunk = await sess.send('IO.read', { handle: resource.stream });
+            if (chunk && chunk.data) {
+              chunks.push(Buffer.from(chunk.data, chunk.base64Encoded ? 'base64' : 'utf8'));
+            }
+            done = !!(chunk && chunk.eof);
+          }
+          try { await sess.send('IO.close', { handle: resource.stream }); } catch (_) { /* ignore */ }
+          const bytes = Buffer.concat(chunks);
+          return {
+            ok: status >= 200 && status < 300,
+            status,
+            contentType: ct,
+            bytes,
+            size: bytes.length,
+          };
+        } catch (e) {
+          return { ok: false, error: String(e && e.message || e) };
+        }
+      };
+
       if (collectedFiles.length) {
         const docTexts = [];
         const toFetch = collectedFiles.slice(0, MAX_DOCS_PER_TENDER);
@@ -2318,55 +2412,91 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           // per-attempt trace, dumped if we can't fetch — invaluable for
           // diagnosing why an entire batch comes back as ct=text/html.
           const attemptTrace = [];
+          // Helper: build "PATH host status=… ct=… size=… sniff="…" err=…"
+          // line and push onto attemptTrace. Centralizing this keeps the
+          // CDP/NODE/PAGE branches identical in their tracing.
+          const pushTrace = (label, host, result) => {
+            const parts = [`${label} ${host}`];
+            if (result) {
+              if (result.status != null) parts.push(`status=${result.status}`);
+              else parts.push('status=?');
+              if (result.contentType) parts.push(`ct=${String(result.contentType).slice(0, 30)}`);
+              if (typeof result.size === 'number') parts.push(`size=${result.size}`);
+              const tmpBytes = result.bytes || (Array.isArray(result.data) ? Buffer.from(result.data) : null);
+              if (tmpBytes && tmpBytes.length) {
+                // 180ch (was 60) so full S3 <Error><Message>…</Message>
+                // bodies are visible — needed to distinguish "Request has
+                // expired" from "SignatureDoesNotMatch" from "AccessDenied".
+                const sniff = tmpBytes.slice(0, 180).toString('utf8').replace(/\s+/g, ' ').slice(0, 180);
+                parts.push(`sniff="${sniff}"`);
+              }
+              if (result.error) parts.push(`err=${String(result.error).slice(0, 80)}`);
+            } else {
+              parts.push('NO_RESULT');
+            }
+            attemptTrace.push(parts.join(' '));
+          };
+          // Per-URL fetch with CDP-first, NODE/PAGE fallback. CDP wins for
+          // virtually everything because it runs at the browser network
+          // layer (cookies + no CORS + follows redirects). We only fall
+          // back when CDP itself errors at the transport level (cdp-init,
+          // net::ERR_*, etc.) — if CDP returns a real HTTP response (even
+          // 403/404), that's the truth and we use it.
           for (const u of candidates) {
-            const path = isMercellHost(u) ? 'PAGE' : 'NODE';
             let host = '?';
             try { host = new URL(u).hostname; } catch (_) { /* ignore */ }
+            const fallbackLabel = isMercellHost(u) ? 'PAGE' : 'NODE';
+            const fallbackFetch = async () => {
+              if (isMercellHost(u)) {
+                // Mercell-internal fallback — page.evaluate keeps cookies
+                // but is CORS-blocked for cross-subdomain calls. Kept as
+                // a last resort in case CDP is unavailable.
+                let r;
+                try {
+                  r = await page.evaluate(async (url) => {
+                    try {
+                      const rr = await fetch(url, { credentials: 'include' });
+                      const ct = rr.headers.get('content-type') || '';
+                      if (!rr.ok) return { ok: false, status: rr.status, contentType: ct };
+                      const buf = await rr.arrayBuffer();
+                      const arr = Array.from(new Uint8Array(buf));
+                      return { ok: true, status: rr.status, contentType: ct, data: arr, size: arr.length };
+                    } catch (e) {
+                      return { ok: false, error: String(e) };
+                    }
+                  }, u);
+                } catch (e) {
+                  return { ok: false, error: String(e && e.message || e) };
+                }
+                if (r && r.ok && Array.isArray(r.data)) {
+                  r = { ...r, bytes: Buffer.from(r.data) };
+                }
+                return r;
+              }
+              // Non-Mercell fallback — Node fetch (no cookies, no CORS).
+              return fetchNode(u);
+            };
+
+            // Attempt 1: CDP
             let result;
             try {
-              if (path === 'PAGE') {
-                // Mercell-internal — needs session cookies, fetch via the
-                // authenticated Puppeteer page context.
-                result = await page.evaluate(async (url) => {
-                  try {
-                    const r = await fetch(url, { credentials: 'include' });
-                    const ct = r.headers.get('content-type') || '';
-                    if (!r.ok) return { ok: false, status: r.status, contentType: ct };
-                    const buf = await r.arrayBuffer();
-                    const arr = Array.from(new Uint8Array(buf));
-                    return { ok: true, status: r.status, contentType: ct, data: arr, size: arr.length };
-                  } catch (e) {
-                    return { ok: false, error: String(e) };
-                  }
-                }, u);
-                if (result && result.ok && Array.isArray(result.data)) {
-                  result = { ...result, bytes: Buffer.from(result.data) };
-                }
-              } else {
-                // Non-Mercell (typically S3 presigned) — fetch from Node
-                // directly so we don't send cookies and don't trigger CORS.
-                result = await fetchNode(u);
-              }
+              result = await fetchViaCDP(u);
             } catch (e) {
               result = { ok: false, error: String(e && e.message || e) };
             }
-            // build attempt summary BEFORE branching so we always have it
-            const attemptParts = [`${path} ${host}`];
-            if (result) {
-              if (result.status != null) attemptParts.push(`status=${result.status}`);
-              else attemptParts.push('status=?');
-              if (result.contentType) attemptParts.push(`ct=${String(result.contentType).slice(0, 30)}`);
-              if (typeof result.size === 'number') attemptParts.push(`size=${result.size}`);
-              const tmpBytes = result.bytes || (Array.isArray(result.data) ? Buffer.from(result.data) : null);
-              if (tmpBytes && tmpBytes.length) {
-                const sniff = tmpBytes.slice(0, 60).toString('utf8').replace(/\s+/g, ' ').slice(0, 60);
-                attemptParts.push(`sniff="${sniff}"`);
+            pushTrace('CDP', host, result);
+
+            // Did CDP return a real HTTP response? If yes, trust it. If
+            // no (transport-level failure with no status), fall back.
+            const cdpReachedServer = result && (result.ok || (result.status != null && result.status > 0));
+            if (!cdpReachedServer) {
+              try {
+                result = await fallbackFetch();
+              } catch (e) {
+                result = { ok: false, error: String(e && e.message || e) };
               }
-              if (result.error) attemptParts.push(`err=${String(result.error).slice(0, 60)}`);
-            } else {
-              attemptParts.push('NO_RESULT');
+              pushTrace(fallbackLabel, host, result);
             }
-            attemptTrace.push(attemptParts.join(' '));
 
             if (result && result.ok && (result.size || 0) > 100) {
               const tmpBytes = result.bytes || Buffer.from(result.data || []);
@@ -2397,7 +2527,10 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
             console.log(`    ⚠️ could not fetch ${f.ext.toUpperCase()} "${f.name}" (id=${f.id}${refTail}${statusTail}${ctTail}${fmtTail}${errTail})`);
             // Dump per-attempt trace so we can see WHICH URLs were tried
             // and what each returned — critical when whole batches fail.
-            for (const t of attemptTrace.slice(0, 8)) {
+            // Bumped from 8 to 14 because each URL now contributes up to
+            // 2 entries (CDP + fallback), and we want full coverage of
+            // the typical 8-candidate search.
+            for (const t of attemptTrace.slice(0, 14)) {
               console.log(`      · ${t}`);
             }
             continue;
