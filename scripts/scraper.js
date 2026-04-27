@@ -55,6 +55,50 @@ async function _throttleClaude() {
     await _sleep(waitMs);
   }
 }
+
+// --- Portal credentials --------------------------------------------------
+// Mercell „Go to source" nuoroda dažnai veda į kitos platformos (Hansel,
+// tarjouspalvelu.fi, eu-supply, e-tendering, mercell.com pati, etc.) login
+// puslapį. Norėdami atsisiųsti tender'io priedus iš tų portalų, laikom
+// vartotojo / slaptažodžio porą JSON'e su hostname raktais. Paslaptis nustatoma
+// GitHub Actions secret'u `PORTAL_CREDS_JSON`. Pavyzdys:
+// {
+//   "tarjouspalvelu.fi":      { "username": "u@e.com", "password": "..." },
+//   "eu.eu-supply.com":       { "username": "u@e.com", "password": "..." },
+//   "permalink.mercell.com":  { "username": "u@e.com", "password": "..." }
+// }
+// Niekada nelaikom tų reikšmių kode. `getPortalCreds()` priima visą URL arba
+// hostname'ą, normalizuoja iki host, daro exact-match, tada suffix-match
+// (`sub.example.com` → `example.com`).
+let _portalCreds = {};
+try {
+  if (process.env.PORTAL_CREDS_JSON) {
+    const parsed = JSON.parse(process.env.PORTAL_CREDS_JSON);
+    if (parsed && typeof parsed === 'object') {
+      _portalCreds = parsed;
+      console.log(`✓ PORTAL_CREDS_JSON parsed: ${Object.keys(_portalCreds).length} portal(s) configured`);
+    }
+  }
+} catch (e) {
+  console.log(`⚠️ PORTAL_CREDS_JSON parse failed: ${e.message}`);
+}
+function getPortalCreds(hostOrUrl) {
+  if (!hostOrUrl || !_portalCreds || !Object.keys(_portalCreds).length) return null;
+  let host = String(hostOrUrl).trim().toLowerCase();
+  // pull host out of full URL
+  try {
+    if (/^https?:\/\//i.test(host)) host = new URL(host).hostname.toLowerCase();
+  } catch (_) { /* ignore */ }
+  host = host.replace(/^www\./, '');
+  // exact match
+  if (_portalCreds[host]) return _portalCreds[host];
+  // suffix match — credential key is a domain suffix of host
+  for (const key of Object.keys(_portalCreds)) {
+    const k = String(key).toLowerCase().replace(/^www\./, '');
+    if (host === k || host.endsWith('.' + k)) return _portalCreds[key];
+  }
+  return null;
+}
 async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperature = 0 } = {}) {
   if (!AI_ENABLED) throw new Error('ANTHROPIC_API_KEY missing');
   const body = JSON.stringify({
@@ -1519,12 +1563,31 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         return String(v);
       };
 
+      // Diagnostic: surenka VISUS file-like nodes (be filtravimo pagal extension).
+      // Naudojam tik debug log'ui, kad matytume ką API'us iš tikro grąžina —
+      // jei `collectedFiles` būna tuščias, šitas inventory rodys ar files[]
+      // nepalaikomos struktūros, ar tikrai išvis nieko nėra.
+      const fileLikeInventory = [];
+      const seenInvIds = new Set();
+
+      // Extensions, kurias laikom „dokumentu" pagrindiniu sąraše:
+      //   pdf  — pdf-parse
+      //   docx — mammoth
+      //   doc  — (legacy; mammoth nepalaiko, bandysim plain-text fallback)
+      //   xlsx, xls — SheetJS
+      //   zip — adm-zip recurse
+      //   rtf, txt — plain text
+      //   odt, ods — atvirkštinis OOXML; bandysim ZIP recurse
+      const DOC_EXTENSIONS = new Set([
+        'pdf', 'docx', 'doc', 'xlsx', 'xls', 'zip', 'rtf', 'txt', 'odt', 'ods',
+      ]);
+
       const pickFromNode = (node) => {
         if (!node || typeof node !== 'object') return;
         if (Array.isArray(node)) { for (const it of node) pickFromNode(it); return; }
-        // Strict file detection: reikia arba `fileId` + `extension`, arba
-        // aiškaus `mimeType: application/pdf`, arba download URL. Taip nepagaunam
-        // root tender'io objekto (kuris turi `id` + `title`, bet tai ne failas).
+        // Strict file detection: reikia `fileId`/`documentId`/`guid` (kad
+        // nepagautume root tender'io objekto) PLIUS bent vienos požymio,
+        // kad tai dokumentas (extension/mime/type/url su žinoma extension'a).
         const hasFileId = !!(node.fileId || node.documentId || node.guid);
         const extRaw = toStr(node.extension || '');
         const mimeRaw = toStr(node.mimeType || node.contentType || '');
@@ -1533,24 +1596,49 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         const urlRaw = toStr(node.url || node.downloadUrl || node.downloadLink || node.href || '');
 
         const extFromName = (nameRaw.match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '';
-        const ext = (extRaw || extFromName || '').toLowerCase();
-        const isPdfByMime = /pdf/i.test(mimeRaw);
-        const isPdfByExt = /^pdf$/i.test(ext);
-        const isPdfByType = /pdf/i.test(typeRaw);
+        const extFromUrl  = (urlRaw.match(/\.([a-z0-9]{1,5})(?:[?#]|$)/i) || [])[1] || '';
+        const ext = (extRaw || extFromName || extFromUrl || '').toLowerCase();
 
         const looksLikeFile = hasFileId && (extRaw || nameRaw || mimeRaw || urlRaw);
-        const isPdf = looksLikeFile && (isPdfByMime || isPdfByExt || isPdfByType);
 
-        if (isPdf) {
+        // --- diagnostic inventory: KIEKVIENĄ file-like node'ą įrašom, kad ir
+        // be žinomos extension'os (pvz., generic mimeType arba neaiškus type).
+        if (looksLikeFile) {
+          const id = toStr(node.fileId || node.documentId || node.guid);
+          if (id && !seenInvIds.has(id)) {
+            seenInvIds.add(id);
+            fileLikeInventory.push({
+              id,
+              name: nameRaw || '(no-name)',
+              ext,
+              mime: mimeRaw,
+              type: typeRaw,
+              hasUrl: !!urlRaw,
+            });
+          }
+        }
+
+        // --- žinomos dokumentų extension'os → įtraukiam į collectedFiles
+        // (parsing'ui). Jei nėra extension'os bet mime aiškiai PDF → tikslinam.
+        let docExt = ext;
+        if (!docExt && /pdf/i.test(mimeRaw)) docExt = 'pdf';
+        if (!docExt && /pdf/i.test(typeRaw)) docExt = 'pdf';
+        if (!docExt && /word|document/i.test(mimeRaw)) docExt = 'docx';
+        if (!docExt && /sheet|excel/i.test(mimeRaw)) docExt = 'xlsx';
+        if (!docExt && /zip/i.test(mimeRaw)) docExt = 'zip';
+
+        const isDocFile = looksLikeFile && DOC_EXTENSIONS.has(docExt);
+
+        if (isDocFile) {
           const id = toStr(node.fileId || node.documentId || node.guid);
           if (id && !seenIds.has(id)) {
             seenIds.add(id);
             collectedFiles.push({
               id,
-              name: nameRaw || `file-${id}.pdf`,
+              name: nameRaw || `file-${id}.${docExt}`,
               url: urlRaw || null,
               mime: mimeRaw,
-              ext,
+              ext: docExt,
             });
           }
         }
@@ -1562,8 +1650,33 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
 
       for (const { json } of capturedApis) pickFromNode(json);
 
+      // --- diagnostic 📎 inventory log -------------------------------------
+      // Jei collectedFiles tuščias, bet API kažką grąžino — čia matysim ką
+      // tiksliai. Ekonomijai logginam tik pirmus 12 ir bendrą skaičių.
+      if (fileLikeInventory.length) {
+        const summary = fileLikeInventory
+          .slice(0, 12)
+          .map(f => {
+            const parts = [];
+            if (f.ext) parts.push(`ext=${f.ext}`);
+            if (f.mime) parts.push(`mime=${f.mime.slice(0, 40)}`);
+            if (f.type) parts.push(`type=${f.type.slice(0, 24)}`);
+            return `${f.name.slice(0, 50)} [${parts.join(',') || '?'}]`;
+          })
+          .join('; ');
+        const tail = fileLikeInventory.length > 12 ? ` … (+${fileLikeInventory.length - 12} more)` : '';
+        console.log(`    📎 file-like nodes: ${fileLikeInventory.length} — ${summary}${tail}`);
+      } else {
+        console.log(`    📎 file-like nodes: 0 (capturedApis count=${capturedApis.length})`);
+      }
+
       if (collectedFiles.length) {
-        console.log(`    📄 found ${collectedFiles.length} PDF file(s) in JSON`);
+        const byExt = collectedFiles.reduce((m, f) => {
+          m[f.ext || '?'] = (m[f.ext || '?'] || 0) + 1;
+          return m;
+        }, {});
+        const extSummary = Object.entries(byExt).map(([k, v]) => `${k}=${v}`).join(', ');
+        console.log(`    📄 found ${collectedFiles.length} document file(s) in JSON (${extSummary})`);
       }
 
       // --- PDF RELEVANCE SORTING --------------------------------------
@@ -1621,27 +1734,135 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         console.log(`    📄 PDF priority: ${top}`);
       }
 
-      // Kiek PDF'ų parsiunčiam per tender'į (kad neužtruktų per ilgai):
-      // Bumped 2 → 6: tender'iai dažnai turi po kelis svarbius dokumentus
-      // (ToR + qualification + award criteria atskirai), o filename'ų
-      // prioritizavimas užtikrina, kad pirmi 6 yra reikšmingiausi.
-      const MAX_PDFS_PER_TENDER = 6;
-      // Bumped 20K → 30K: ToR dokumentai dažnai > 20K char.
-      const MAX_PDF_TEXT_CHARS = 30000;
-      let pdfParse = null;
-      try {
-        pdfParse = require('pdf-parse'); // optional dep
-      } catch (_) {
-        if (collectedFiles.length) {
-          console.log('    ⚠️ pdf-parse not installed — skipping PDF content extraction');
+      // Kiek dokumentų parsinam per tender'į (kad neužtruktų per ilgai):
+      // tender'iai dažnai turi po kelis svarbius dokumentus (ToR +
+      // qualification + award criteria atskirai), o filename'ų prioritizavimas
+      // užtikrina, kad pirmi yra reikšmingiausi.
+      const MAX_DOCS_PER_TENDER = 6;
+      const MAX_DOC_TEXT_CHARS = 30000;       // per single document
+      const MAX_TOTAL_DOC_CHARS = 120000;     // total for AI prompt
+      const MAX_INNER_BYTES = 10 * 1024 * 1024; // ZIP inner-file size cap
+      const MAX_ZIP_DEPTH = 2;
+
+      // Optional deps — visi try-load: jei nėra įdiegti, atitinkamą formatą
+      // praleidžiam su perspėjimu (bet visi kiti formatai ir toliau veikia).
+      let pdfParse = null, mammoth = null, XLSX = null, AdmZip = null;
+      try { pdfParse = require('pdf-parse'); } catch (_) { /* opt */ }
+      try { mammoth  = require('mammoth');   } catch (_) { /* opt */ }
+      try { XLSX     = require('xlsx');      } catch (_) { /* opt */ }
+      try { AdmZip   = require('adm-zip');   } catch (_) { /* opt */ }
+
+      // Loginam ko trūksta — tik kartą per tender'į ir tik jei iš tiesų yra
+      // failų, kuriuos reikės tame formate parsinti.
+      const haveExt = new Set(collectedFiles.map(f => f.ext));
+      if (collectedFiles.length) {
+        const missing = [];
+        if (haveExt.has('pdf')  && !pdfParse) missing.push('pdf-parse');
+        if ((haveExt.has('docx') || haveExt.has('odt')) && !mammoth) missing.push('mammoth');
+        if ((haveExt.has('xlsx') || haveExt.has('xls') || haveExt.has('ods')) && !XLSX) missing.push('xlsx');
+        if (haveExt.has('zip')  && !AdmZip) missing.push('adm-zip');
+        if (missing.length) {
+          console.log(`    ⚠️ optional deps missing: ${missing.join(', ')} — affected files will be skipped`);
         }
       }
 
-      if (pdfParse && collectedFiles.length) {
-        const pdfTexts = [];
-        const toFetchPdfs = collectedFiles.slice(0, MAX_PDFS_PER_TENDER);
+      // --- multi-format text extractor (used for both top-level docs and ZIP entries)
+      async function extractTextFromBuffer({ name, ext, bytes }, depth = 0) {
+        if (!bytes || !bytes.length) return '';
+        const ex = String(ext || '').toLowerCase();
+        try {
+          if (ex === 'pdf') {
+            if (!pdfParse) return '';
+            const parsed = await pdfParse(bytes);
+            return (parsed && parsed.text ? parsed.text : '').trim();
+          }
+          if (ex === 'docx' || ex === 'odt') {
+            if (!mammoth) return '';
+            const out = await mammoth.extractRawText({ buffer: bytes });
+            return (out && out.value ? out.value : '').trim();
+          }
+          if (ex === 'xlsx' || ex === 'xls' || ex === 'ods') {
+            if (!XLSX) return '';
+            const wb = XLSX.read(bytes, { type: 'buffer' });
+            const parts = [];
+            for (const sheetName of wb.SheetNames) {
+              const csv = XLSX.utils.sheet_to_csv(wb.Sheets[sheetName]);
+              if (csv && csv.trim()) parts.push(`# Sheet: ${sheetName}\n${csv}`);
+            }
+            return parts.join('\n\n').trim();
+          }
+          if (ex === 'rtf' || ex === 'txt') {
+            // RTF — naivus stripping (curly braces + control words). Pakanka
+            // raktažodžių paieškai. Pilna RTF parser'iai retai sutinkami EU
+            // tenderiuose, tad nesivelti į priklausomybes.
+            const raw = bytes.toString('utf8');
+            if (ex === 'txt') return raw.trim();
+            return raw
+              .replace(/\\[a-z]+-?\d*\s?/gi, ' ')
+              .replace(/[{}]/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+          }
+          if (ex === 'zip') {
+            if (!AdmZip) return '';
+            if (depth >= MAX_ZIP_DEPTH) {
+              console.log(`    ⚠️ ZIP depth limit reached for "${name}"`);
+              return '';
+            }
+            const zip = new AdmZip(bytes);
+            const entries = zip.getEntries().filter(e => !e.isDirectory);
+            // Score & sort entries — naudojam tą pačią scoreFile heuristiką
+            const scored = entries.map(e => {
+              const entryName = e.entryName || '';
+              const entryExt = (entryName.match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '';
+              return {
+                e,
+                name: entryName,
+                ext: entryExt.toLowerCase(),
+                score: scoreFile(entryName),
+              };
+            });
+            // Tik žinomi dokumentai (žinomos extension'os)
+            const docEntries = scored
+              .filter(s => DOC_EXTENSIONS.has(s.ext))
+              .sort((a, b) => b.score - a.score)
+              .slice(0, MAX_DOCS_PER_TENDER);
+            const zipParts = [];
+            for (const z of docEntries) {
+              try {
+                const innerBytes = z.e.getData();
+                if (!innerBytes || innerBytes.length === 0) continue;
+                if (innerBytes.length > MAX_INNER_BYTES) {
+                  console.log(`    ⚠️ ZIP entry "${z.name}" too large (${innerBytes.length}B), skipping`);
+                  continue;
+                }
+                const innerText = await extractTextFromBuffer(
+                  { name: z.name, ext: z.ext, bytes: innerBytes },
+                  depth + 1,
+                );
+                if (innerText) {
+                  const clipped = innerText.slice(0, MAX_DOC_TEXT_CHARS);
+                  zipParts.push(`--- (zip:${name}) ${z.name} ---\n${clipped}`);
+                  console.log(`    📦 zip entry "${z.name}" (${z.ext}, ${innerBytes.length}B → ${clipped.length}ch)`);
+                }
+              } catch (e) {
+                console.log(`    ⚠️ ZIP entry "${z.name}" failed: ${e.message}`);
+              }
+            }
+            return zipParts.join('\n\n');
+          }
+        } catch (e) {
+          console.log(`    ⚠️ ${ex.toUpperCase()} parse failed for "${name}": ${e.message}`);
+          return '';
+        }
+        return '';
+      }
 
-        for (const f of toFetchPdfs) {
+      if (collectedFiles.length) {
+        const docTexts = [];
+        const toFetch = collectedFiles.slice(0, MAX_DOCS_PER_TENDER);
+
+        for (const f of toFetch) {
           // Bandomi URL šablonai (vienas iš jų suveiks). Pirmas — jei JSON'e
           // jau buvo `url`/`downloadUrl` laukas.
           const candidates = [];
@@ -1680,35 +1901,34 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           }
 
           if (!bytes) {
-            console.log(`    ⚠️ could not fetch PDF "${f.name}" (id=${f.id})`);
+            console.log(`    ⚠️ could not fetch ${f.ext.toUpperCase()} "${f.name}" (id=${f.id})`);
             continue;
           }
 
           try {
-            const parsed = await pdfParse(bytes);
-            const text = (parsed && parsed.text ? parsed.text : '').trim();
+            const text = await extractTextFromBuffer({ name: f.name, ext: f.ext, bytes }, 0);
             if (text) {
-              const clipped = text.slice(0, MAX_PDF_TEXT_CHARS);
-              pdfTexts.push(`--- ${f.name} ---\n${clipped}`);
-              console.log(`    📄 parsed "${f.name}" (${bytes.length}B → ${clipped.length}ch from ${okUrl.slice(0, 70)})`);
+              const clipped = text.slice(0, MAX_DOC_TEXT_CHARS);
+              docTexts.push(`--- ${f.name} ---\n${clipped}`);
+              console.log(`    📄 parsed ${f.ext.toUpperCase()} "${f.name}" (${bytes.length}B → ${clipped.length}ch from ${okUrl.slice(0, 70)})`);
             } else {
-              console.log(`    ⚠️ PDF "${f.name}" has no extractable text`);
+              console.log(`    ⚠️ ${f.ext.toUpperCase()} "${f.name}" has no extractable text`);
             }
           } catch (e) {
-            console.log(`    ⚠️ pdf-parse failed for "${f.name}": ${e.message}`);
+            console.log(`    ⚠️ extractor failed for "${f.name}": ${e.message}`);
           }
         }
 
-        if (pdfTexts.length) {
-          const combined = pdfTexts.join('\n\n');
+        if (docTexts.length) {
+          const combined = docTexts.join('\n\n');
           // Bendrai ribokime per tender'į iki 120K chars — Claude Haiku 4.5 turi
           // 200K context'ą, tad palieam vietos title'ui, description'ui ir
           // sistemos prompt'ui. Nesutrumpinta — taip AI mato visą ToR turinį.
-          details.pdfText = combined.slice(0, 120000);
+          details.pdfText = combined.slice(0, MAX_TOTAL_DOC_CHARS);
         }
       }
     } catch (e) {
-      console.log(`    ⚠️ PDF extraction error: ${e.message}`);
+      console.log(`    ⚠️ document extraction error: ${e.message}`);
     }
 
     // --- ŠALTINIO PUSLAPIS -------------------------------------------
