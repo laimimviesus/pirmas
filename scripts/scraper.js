@@ -1765,18 +1765,22 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
     page.off('request', blockHandler);
     await page.setRequestInterception(false);
 
-    // --- DOCUMENTS-TAB CLICK PROBE -------------------------------------
-    // Visi keturi failų-fetch'avimo keliai (S3 presign, /files/ search-api,
-    // app/permalink, viešieji TED/FTS pranešimai) yra dead-end'ai. Bet kai
-    // user spaudžia "Documents" tab'ą savo naršyklėje — failai parsisiunčia.
-    // Reiškia, Mercell turi veikiantį endpoint'ą, kurio mes dar nesugavome.
-    // Šis blokas paspaudžia "Documents" tab'ą SPA'oje ir užfiksuoja, kokius
-    // URL'us iškviečia frontend'as — kad kitam iteracijoj galėtume juos atkartoti.
+    // --- FILE-ROW DOM PROBE + CLICK ------------------------------------
+    // Praeitam runn'e atradom, kad documents tab'as yra automatiškai
+    // atidarytas (SPA'oje matėm „document name upload date file size ..."
+    // antraštės eilutę DIV'e). Reiškia, failai jau renderinami DOM'e — tik
+    // mes nemokam jų parsisiųsti. Šis blokas:
+    //   1) Suskenuoja DOM ir randa elementus, kurių text'as panašus į
+    //      failo vardą (turi .pdf/.docx/.xlsx/... plėtinį).
+    //   2) Išspausdina jų href / data-* atributus — jei href yra, gausim
+    //      URL be jokio click'o.
+    //   3) Paspaudžia pirmą tokį elementą, kad pamatytume, kokį XHR'ą
+    //      Mercell SPA iššaukia (visus host'us, ne tik mercell.com).
     const docsClickUrls = [];
     const docsClickResponseHandler = (res) => {
       try {
         const url = res.url();
-        if (!/mercell\.com/i.test(url)) return;
+        // NOISE_HOST_RE filter applied at log time, capture everything here
         const headers = res.headers() || {};
         const ctype = headers['content-type'] || '';
         const size = headers['content-length'] || '';
@@ -1788,68 +1792,208 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         });
       } catch (_) { /* ignore */ }
     };
+    const docsClickRequestHandler = (req) => {
+      try {
+        // Catch redirects / navigations / downloads that may not produce
+        // a `response` event in this context.
+        const url = req.url();
+        const rt = req.resourceType();
+        if (rt === 'document' || rt === 'xhr' || rt === 'fetch' || rt === 'other') {
+          docsClickUrls.push({
+            url,
+            status: 'REQ',
+            ctype: rt,
+            size: '',
+          });
+        }
+      } catch (_) { /* ignore */ }
+    };
     page.on('response', docsClickResponseHandler);
+    page.on('request', docsClickRequestHandler);
 
+    // 1) Pasiklausom navigation events — kad nepraleistum top-level
+    //    navigation'o, kuris gali būti file download trigger.
+    let navUrls = [];
+    const frameNavHandler = (frame) => {
+      try {
+        if (frame === page.mainFrame()) {
+          navUrls.push(frame.url());
+        }
+      } catch (_) {}
+    };
+    page.on('framenavigated', frameNavHandler);
+
+    // 2) DOM probe — search for filename-like text + capture surrounding
+    //    anchor's href / data attributes. This often reveals the download
+    //    URL without needing to click anything.
+    let domProbe = [];
+    let clickProbe = { clicked: false };
     try {
-      const clickResult = await page.evaluate(() => {
-        const labels = [
-          'documents', 'document', 'files', 'attachments', 'attachment',
-          'dokumenter', 'dokumente', 'dokumenten', 'dokumentai', 'dokumenty',
-          'dokument', 'dokumentet', 'dokumentit', 'dokumendid',
-          'asiakirjat', 'liitteet',
-          'documenten', 'documentos', 'documenti', 'documentation',
-          'pieces', 'pièces', 'pieces jointes', 'pièces jointes',
-          'załączniki', 'zalaczniki', 'załącznik',
-          'přílohy', 'prilohy', 'príloha', 'přiloha',
-          'pielikumi', 'priedai',
-          'anexos', 'anexo', 'allegati', 'allegato',
-          'unterlagen', 'anlagen',
-        ];
-        const norm = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
-        const candidates = Array.from(
-          document.querySelectorAll(
-            'a, button, [role="tab"], [role="button"], .nav-link, .tab, .mat-tab-label, [class*="tab" i]'
-          )
-        );
-        for (const el of candidates) {
-          const txt = norm(el.innerText || el.textContent || '');
-          if (!txt) continue;
-          for (const lbl of labels) {
-            if (txt === lbl || txt.startsWith(lbl + ' ') || txt.endsWith(' ' + lbl) || txt.includes(' ' + lbl + ' ')) {
-              try {
-                el.scrollIntoView({ block: 'center' });
-                el.click();
-                return { clicked: true, label: txt.slice(0, 60), tag: el.tagName };
-              } catch (_) { /* keep trying */ }
+      domProbe = await page.evaluate(() => {
+        const EXT_RE = /\.(pdf|docx?|xlsx?|zip|rtf|txt|odt|ods|xml|json|csv|tsv|pptx?)\b/i;
+        const out = [];
+        const seen = new Set();
+        const all = Array.from(document.querySelectorAll('a, button, [role="link"], [role="button"], [class*="file" i], [class*="document" i], [class*="attach" i], [class*="download" i]'));
+        for (const el of all) {
+          const txt = ((el.innerText || el.textContent || '') + '').trim();
+          if (!txt || txt.length > 250) continue;
+          if (!EXT_RE.test(txt)) continue;
+          // Walk up to find any anchor with an href
+          let hrefEl = el.tagName === 'A' ? el : el.closest('a');
+          const href = (hrefEl && hrefEl.getAttribute('href')) || '';
+          const target = (hrefEl && hrefEl.getAttribute('target')) || '';
+          const downloadAttr = (hrefEl && hrefEl.getAttribute('download')) || '';
+          const dataAttrs = {};
+          const probeEl = hrefEl || el;
+          for (const attr of probeEl.attributes || []) {
+            const n = attr.name.toLowerCase();
+            if (/^(data-|ng-|on)/.test(n) || /url|src|file|doc|download/i.test(n)) {
+              dataAttrs[attr.name] = (attr.value || '').slice(0, 240);
             }
           }
+          // Also check parent row/li/tr for data attrs that often hold IDs
+          const row = el.closest('tr,li,[class*="row" i]');
+          const rowAttrs = {};
+          if (row) {
+            for (const attr of row.attributes || []) {
+              const n = attr.name.toLowerCase();
+              if (n.startsWith('data-') || /id$/i.test(n)) {
+                rowAttrs[attr.name] = (attr.value || '').slice(0, 240);
+              }
+            }
+          }
+          const k = (probeEl.tagName || '') + '|' + txt.slice(0, 80);
+          if (seen.has(k)) continue;
+          seen.add(k);
+          out.push({
+            tag: probeEl.tagName,
+            txt: txt.slice(0, 110),
+            href: href.slice(0, 240),
+            target,
+            download: downloadAttr,
+            data: dataAttrs,
+            row: rowAttrs,
+            outer: (probeEl.outerHTML || '').slice(0, 320),
+          });
+          if (out.length >= 12) break;
         }
-        return { clicked: false };
+        return out;
       });
-      if (clickResult && clickResult.clicked) {
-        console.log(`    📑 docs tab clicked (label="${clickResult.label}", tag=${clickResult.tag})`);
-        await new Promise((r) => setTimeout(r, 2500));
-      } else {
-        console.log(`    📑 docs tab not found in SPA`);
-      }
     } catch (e) {
-      console.log(`    📑 docs-tab click failed: ${e.message}`);
+      console.log(`    📎 file-row DOM probe failed: ${e.message}`);
+    }
+
+    if (domProbe.length) {
+      console.log(`    📎 file-row DOM probe: ${domProbe.length} candidate(s)`);
+      for (const m of domProbe.slice(0, 6)) {
+        const dataKeys = Object.keys(m.data || {}).filter((k) => m.data[k]);
+        const rowKeys = Object.keys(m.row || {}).filter((k) => m.row[k]);
+        console.log(`        <${m.tag}> "${m.txt}" href="${m.href || ''}" target="${m.target || ''}" dl="${m.download || ''}"`);
+        if (dataKeys.length) {
+          for (const k of dataKeys.slice(0, 5)) {
+            console.log(`            [${k}] = ${m.data[k]}`);
+          }
+        }
+        if (rowKeys.length) {
+          for (const k of rowKeys.slice(0, 5)) {
+            console.log(`            row[${k}] = ${m.row[k]}`);
+          }
+        }
+      }
+      // Dump first candidate's outerHTML for shape inspection
+      console.log(`    📎 first candidate outerHTML preview: ${domProbe[0].outer}`);
+    } else {
+      console.log(`    📎 file-row DOM probe: 0 candidates (no filename-like text in DOM)`);
+    }
+
+    // 3) Click probe — only if no usable href found in DOM probe.
+    //    We click ONCE on the first filename-like element and watch network.
+    const hasUsableHref = domProbe.some((m) => m.href && /^https?:\/\//i.test(m.href));
+    if (!hasUsableHref && domProbe.length > 0) {
+      try {
+        // Override window.open and location.assign so the page stays alive
+        await page.evaluate(() => {
+          try {
+            window.__capturedOpens__ = [];
+            const realOpen = window.open;
+            window.open = function (...args) {
+              try { window.__capturedOpens__.push(['open', String(args[0] || '')]); } catch (_) {}
+              return null;
+            };
+            const realAssign = window.location.assign.bind(window.location);
+            try {
+              Object.defineProperty(window.location, 'assign', {
+                configurable: true,
+                value: function (u) { window.__capturedOpens__.push(['assign', String(u || '')]); }
+              });
+            } catch (_) {}
+            try {
+              Object.defineProperty(window.location, 'replace', {
+                configurable: true,
+                value: function (u) { window.__capturedOpens__.push(['replace', String(u || '')]); }
+              });
+            } catch (_) {}
+          } catch (_) {}
+        });
+
+        clickProbe = await page.evaluate(() => {
+          const EXT_RE = /\.(pdf|docx?|xlsx?|zip|rtf|txt|odt|ods|xml|json|csv|tsv|pptx?)\b/i;
+          const all = Array.from(document.querySelectorAll('a, button, [role="link"], [role="button"]'));
+          for (const el of all) {
+            const txt = ((el.innerText || el.textContent || '') + '').trim();
+            if (!txt || txt.length > 250) continue;
+            if (!EXT_RE.test(txt)) continue;
+            try {
+              el.scrollIntoView({ block: 'center' });
+              el.click();
+              return { clicked: true, tag: el.tagName, txt: txt.slice(0, 100) };
+            } catch (_) {}
+          }
+          return { clicked: false };
+        });
+
+        if (clickProbe.clicked) {
+          console.log(`    📎 file-row clicked (<${clickProbe.tag}> "${clickProbe.txt}")`);
+          await new Promise((r) => setTimeout(r, 3500));
+
+          // Read back any window.open / location.assign captures
+          try {
+            const opens = await page.evaluate(() => window.__capturedOpens__ || []);
+            if (Array.isArray(opens) && opens.length) {
+              console.log(`    📎 captured navigation hooks (${opens.length}):`);
+              for (const [kind, u] of opens.slice(0, 10)) {
+                console.log(`        [${kind}] ${String(u).slice(0, 200)}`);
+              }
+            }
+          } catch (_) {}
+        }
+      } catch (e) {
+        console.log(`    📎 file-row click failed: ${e.message}`);
+      }
+    } else if (hasUsableHref) {
+      console.log(`    📎 skipping click — DOM probe already revealed href(s)`);
     }
 
     try {
       page.off('response', docsClickResponseHandler);
+      page.off('request', docsClickRequestHandler);
+      page.off('framenavigated', frameNavHandler);
     } catch (_) {}
 
     // Filtruojam triukšmą — nereikia matyti notification/user-service/comments XHR'ų
-    const NOISE_HOST_RE = /(notification|user-management|user-service|comments-service|telemetry|analytics|sentry|tracking)/i;
-    const docsClickFiltered = docsClickUrls.filter((u) => !NOISE_HOST_RE.test(u.url));
+    const NOISE_HOST_RE = /(notification-api|user-management-api|user-service\.|comments-service|telemetry|analytics|sentry|google-analytics|googletagmanager|hotjar|cookiebot|fonts\.googleapis|gstatic|cloudflareinsights)/i;
+    const STATIC_RE = /\.(js|css|woff2?|ttf|eot|svg|png|jpg|jpeg|gif|ico|map)(\?|$)/i;
+    const docsClickFiltered = docsClickUrls.filter((u) => !NOISE_HOST_RE.test(u.url) && !STATIC_RE.test(u.url));
     if (docsClickFiltered.length) {
-      console.log(`    📑 docs-tab XHRs (${docsClickFiltered.length}):`);
-      for (const u of docsClickFiltered.slice(0, 25)) {
-        console.log(`        [${u.status}] ${u.ctype} ${u.size}b ${u.url.slice(0, 180)}`);
+      console.log(`    📎 docs-phase requests/responses (${docsClickFiltered.length}):`);
+      for (const u of docsClickFiltered.slice(0, 30)) {
+        console.log(`        [${u.status}] ${u.ctype} ${u.size}b ${u.url.slice(0, 200)}`);
       }
     } else if (docsClickUrls.length) {
-      console.log(`    📑 docs-tab XHRs: ${docsClickUrls.length} captured but all filtered as noise`);
+      console.log(`    📎 docs-phase: ${docsClickUrls.length} captured but all filtered as noise/static`);
+    }
+    if (navUrls.length) {
+      console.log(`    📎 frame navigations during probe: ${navUrls.map((u) => u.slice(0, 180)).join(' → ')}`);
     }
 
     // --- MERCELL JSON API ATSAKYMAI ------------------------------------
