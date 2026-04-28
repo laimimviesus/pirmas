@@ -1812,16 +1812,19 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       }
 
       // --- diagnostic: actual VALUES of fields the public-notice harvester
-      // wants to read. We've confirmed `originalNotices` and `fileReference
-      // Number` exist as top-level keys, but the harvest produced 0 URLs —
-      // we need to see the real shape (URL strings? objects? bare IDs?
-      // hostnames?) to build the correct extraction rules. Truncate hard
-      // so log noise stays bounded.
+      // looks at. Confirmed empirically that `originalNotices` is a
+      // literal "TODO" stub in the current Mercell schema (schema field
+      // exists but is unimplemented), and `fileReferenceNumber` holds the
+      // BUYER'S INTERNAL ref (e.g. "GNU 2026/67", "ET183") — NOT a TED
+      // publication number. Skip logging known stubs so we still get a
+      // signal if Mercell ever populates a real value on a future tender.
+      const STUB_VALUES = new Set(['"TODO"', '"todo"', '"N/A"', '"n/a"', '""', 'null']);
       const dumpField = (label, value) => {
         if (value == null) return;
         try {
           const s = JSON.stringify(value);
           if (!s || s === 'null' || s === '""' || s === '{}' || s === '[]') return;
+          if (STUB_VALUES.has(s)) return;
           console.log(`    🔎 ${label}: ${s.slice(0, 300)}${s.length > 300 ? '…' : ''}`);
         } catch (_) { /* ignore */ }
       };
