@@ -1889,6 +1889,13 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         // contract value verbatim. Strip-tag extraction gives us the same
         // content that would otherwise sit in a ToR PDF.
         'xml',
+        // JSON — UK Find-a-Tender (FTS) notices are attached as JSON
+        // (type=OriginalNotice, ext=json). The schema mirrors TED eForms
+        // semantically — qualification, award criteria, lots, value — but
+        // is encoded as a flat JSON tree instead of XML. Pretty-printing
+        // it with JSON.stringify gives the AI extraction prompt the same
+        // verbatim text content it gets from XML notices.
+        'json',
       ]);
 
       const pickFromNode = (node) => {
@@ -2121,6 +2128,11 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         // payload). We don't distinguish XML from HTML at the magic-byte
         // level; the parser strips both safely.
         if (ex === 'xml') return got === 'html';
+        // JSON — matches the 'json' detector, but ALSO be permissive when
+        // the bytes are plain text starting with `{` or `[`. Some servers
+        // serve JSON with surrogate framing or BOMs that detectFormat
+        // doesn't classify as 'json'.
+        if (ex === 'json') return got === 'json';
         return true; // unknown ext — be permissive
       };
 
@@ -2206,6 +2218,21 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
               .replace(/\s+/g, ' ')
               .trim();
             return stripped;
+          }
+          if (ex === 'json') {
+            // JSON — UK FTS / Mercell-wrapped notice payloads. Try to
+            // pretty-print so the AI extraction prompt sees a flat,
+            // line-broken text representation of every key/value pair
+            // (qualification, award criteria, lots, value). If parse
+            // fails (rare; some servers wrap JSON in HTML), fall back
+            // to raw UTF-8 text.
+            const raw = bytes.toString('utf8').replace(/^\uFEFF/, '');
+            try {
+              const parsed = JSON.parse(raw);
+              return JSON.stringify(parsed, null, 2).trim();
+            } catch (_) {
+              return raw.replace(/\s+/g, ' ').trim();
+            }
           }
           if (ex === 'zip') {
             if (!AdmZip) return '';
@@ -2445,6 +2472,116 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         }
       };
 
+      // --- PUBLIC NOTICE FETCH (TED / Find-a-Tender / Doffin / etc.) -----
+      //
+      // Mercell's own file storage is locked behind two unbreakable walls:
+      //   - S3 presigned URLs in `fileReference` are signed for the
+      //     backend, not for end-user GET → AccessDenied (403).
+      //   - search-service-api `/files/` endpoints want a Bearer with
+      //     `/files/` audience, but our captured token has `/search/`.
+      //
+      // Mercell's tender JSON, however, contains references to the
+      // ORIGINAL public notice (TED, UK Find-a-Tender, Doffin, etc.) —
+      // either as a direct URL field or as a publication number that maps
+      // to a canonical public URL. Those public pages serve the same
+      // qualification / award criteria / lot scope / contract value
+      // content as the Mercell-internal copy, but require NO auth and
+      // NO CORS. We harvest them here and fetch via plain Node HTTP,
+      // bypassing the entire Mercell auth wall.
+      const publicNoticeUrls = [];
+      {
+        const seenPubUrls = new Set();
+        const PUBLIC_HOSTS = /(?:^|\.)(ted\.europa\.eu|find-tender\.service\.gov\.uk|contractsfinder\.service\.gov\.uk|doffin\.no|hilma\.fi)$/i;
+        const TED_REF_RE = /^\d{6,8}-\d{4}$/;
+        const pushPublic = (rawUrl, label) => {
+          if (!rawUrl) return;
+          let u;
+          try { u = new URL(String(rawUrl).trim()); } catch (_) { return; }
+          if (!PUBLIC_HOSTS.test(u.hostname)) return;
+          const key = u.toString();
+          if (seenPubUrls.has(key)) return;
+          seenPubUrls.add(key);
+          publicNoticeUrls.push({ url: key, label: label || u.hostname });
+        };
+        const walkPublic = (node) => {
+          if (!node || typeof node !== 'object') return;
+          if (Array.isArray(node)) { for (const it of node) walkPublic(it); return; }
+          for (const [k, v] of Object.entries(node)) {
+            if (v == null) continue;
+            if (typeof v === 'string') {
+              const s = v.trim();
+              if (/^https?:\/\//i.test(s)) {
+                // Only consider URL-shaped strings whose key suggests
+                // they're a *notice* link (not a logo, profile, banner).
+                if (/url|link|href|source|notice|publication/i.test(k)) {
+                  pushPublic(s, `${k}`);
+                }
+              } else if (
+                TED_REF_RE.test(s) &&
+                /reference|publication|notice/i.test(k)
+              ) {
+                // TED publication-number style → canonical TED URL.
+                // Pattern matches both old (188432-2026) and new
+                // (00288908-2026) eForms-era IDs.
+                pushPublic(`https://ted.europa.eu/en/notice/-/detail/${s}`, `${k}->ted`);
+              }
+            } else if (typeof v === 'object') {
+              walkPublic(v);
+            }
+          }
+        };
+        for (const { json } of capturedApis) walkPublic(json);
+      }
+
+      const publicNoticeTexts = [];
+      if (publicNoticeUrls.length) {
+        const preview = publicNoticeUrls
+          .slice(0, 4)
+          .map(p => `[${p.label}] ${p.url.slice(0, 70)}`)
+          .join('; ');
+        const tail = publicNoticeUrls.length > 4 ? ` (+${publicNoticeUrls.length - 4} more)` : '';
+        console.log(`    🌐 public notice URLs: ${publicNoticeUrls.length} — ${preview}${tail}`);
+        // Cap at 4 fetches per tender — these pages can be large and
+        // we want to leave context budget for any Mercell-internal docs
+        // that DO succeed.
+        const toFetch = publicNoticeUrls.slice(0, 4);
+        for (const p of toFetch) {
+          let result;
+          try {
+            result = await fetchNode(p.url);
+          } catch (e) {
+            result = { ok: false, error: String(e && e.message || e) };
+          }
+          if (!result || !result.ok || !(result.size > 100)) {
+            const statusTail = result && result.status != null ? `, status=${result.status}` : '';
+            const errTail = result && result.error ? `, err=${String(result.error).slice(0, 60)}` : '';
+            console.log(`    ⚠️ public notice fetch failed: ${p.url.slice(0, 70)}${statusTail}${errTail}`);
+            continue;
+          }
+          // The strip-tag XML extractor handles both XML and HTML safely
+          // (it strips any `<…>` tag and decodes entities). Use ext='xml'
+          // regardless of whether the served body is XML or HTML — the
+          // text content we want is the same.
+          let text = '';
+          try {
+            text = await extractTextFromBuffer(
+              { name: p.label, ext: 'xml', bytes: result.bytes },
+              0,
+            );
+          } catch (e) {
+            console.log(`    ⚠️ public notice extractor failed for ${p.url.slice(0, 70)}: ${e.message}`);
+            continue;
+          }
+          if (!text) {
+            console.log(`    ⚠️ public notice empty after strip: ${p.url.slice(0, 70)}`);
+            continue;
+          }
+          const clipped = text.slice(0, MAX_DOC_TEXT_CHARS);
+          publicNoticeTexts.push(`--- (public:${p.label}) ${p.url} ---\n${clipped}`);
+          console.log(`    🌐 parsed public notice (${result.size}B -> ${clipped.length}ch from ${p.url.slice(0, 70)})`);
+        }
+      }
+
       if (collectedFiles.length) {
         const docTexts = [];
         const toFetch = collectedFiles.slice(0, MAX_DOCS_PER_TENDER);
@@ -2648,6 +2785,20 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           // sistemos prompt'ui. Nesutrumpinta — taip AI mato visą ToR turinį.
           details.pdfText = combined.slice(0, MAX_TOTAL_DOC_CHARS);
         }
+      }
+
+      // Merge public notice text on top of any Mercell-internal doc text.
+      // Public notices go FIRST so the AI sees verbatim qualification /
+      // award-criteria language from TED/FTS before any contract-specific
+      // attachments. This block runs even when collectedFiles was empty —
+      // many tenders have ONLY a public-notice reference, no attachments.
+      if (publicNoticeTexts.length) {
+        const publicCombined = publicNoticeTexts.join('\n\n');
+        const existing = details.pdfText || '';
+        const merged = existing
+          ? `${publicCombined}\n\n${existing}`
+          : publicCombined;
+        details.pdfText = merged.slice(0, MAX_TOTAL_DOC_CHARS);
       }
     } catch (e) {
       console.log(`    ⚠️ document extraction error: ${e.message}`);
