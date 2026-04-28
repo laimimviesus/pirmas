@@ -877,9 +877,16 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         'input[type="password"]:not([disabled]):not([aria-hidden="true"])'
       );
       const shortBody = bodyText.length < 2500;
+      // A visible password field + at least one login-related word in the
+      // page text is a strong enough signal on its own. Cloudia / Mercell
+      // wholesale-portal patterns (tarjouspalvelu.fi, vergabeportal, etc.)
+      // commonly inline a tender-description teaser ABOVE the login form,
+      // which used to push the page over the previous 4000-char cap and
+      // cause the gated detection to silently miss. Body-length only
+      // matters now when there is NO password field at all (rare).
       const loginGated =
         (matchedMarkers >= 2 && (hasPasswordField || shortBody)) ||
-        (hasPasswordField && matchedMarkers >= 1 && bodyText.length < 4000);
+        (hasPasswordField && matchedMarkers >= 1);
 
       if (loginGated) {
         return {
@@ -1333,7 +1340,40 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
     try { await srcPage.setRequestInterception(false); } catch (_) {}
     return result;
   } catch (e) {
-    return { error: e.message || String(e) };
+    const msg = e.message || String(e);
+    // Some portals (notably www.mytenders.co.uk's NoticeBuilder_FileDownload
+    // endpoint, Jaggaer's eu-supply gateway, etc.) trigger a hard redirect
+    // to their login form during page.evaluate(), which Puppeteer surfaces
+    // as "Execution context was destroyed, most likely because of a
+    // navigation". That is functionally a login wall — we never got to
+    // read the page body — so treat it as loginGated so the source-loop
+    // retries with portal credentials instead of silently giving up.
+    const navMidEval =
+      /Execution context was destroyed/i.test(msg) ||
+      /Target closed/i.test(msg) ||
+      /Navigation timeout/i.test(msg) ||
+      /detached Frame/i.test(msg);
+    if (navMidEval) {
+      let host = null;
+      try { host = new URL(sourceUrl).hostname.toLowerCase(); } catch (_) {}
+      // Try one last URL read from the live page in case it stabilised.
+      let finalUrl = '';
+      try { finalUrl = (srcPage && srcPage.url && srcPage.url()) || ''; } catch (_) {}
+      if (finalUrl) {
+        try { host = new URL(finalUrl).hostname.toLowerCase() || host; } catch (_) {}
+      }
+      console.log(`    source nav-mid-extract → treating as login-gated (host: ${host || 'n/a'})`);
+      return {
+        loginGated: true,
+        sourceHost: host,
+        matchedMarkers: 0,
+        hasPasswordField: null,
+        bodyLength: 0,
+        bodyTextPreview: '',
+        navError: msg.slice(0, 200),
+      };
+    }
+    return { error: msg };
   } finally {
     if (srcPage) {
       try { await srcPage.close(); } catch (_) {}
