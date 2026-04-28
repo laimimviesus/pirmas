@@ -671,7 +671,17 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     };
     srcPage.on('request', blockHandler);
-
+    // If we have credentials for this source host, try to log in before scraping.
+    try {
+      const u0 = new URL(sourceUrl);
+      const creds = getPortalCreds(u0.hostname);
+      if (creds) {
+        console.log(`    portal creds found for ${u0.hostname} — attempting login`);
+        await loginToPortal(srcPage, u0.hostname, creds);
+      }
+    } catch (e) {
+      console.log(`    portal-creds lookup/login error: ${e.message}`);
+    }
     try {
       await srcPage.goto(sourceUrl, {
         waitUntil: 'domcontentloaded',
