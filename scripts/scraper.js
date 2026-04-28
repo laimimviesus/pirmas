@@ -1883,6 +1883,12 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       //   odt, ods — atvirkštinis OOXML; bandysim ZIP recurse
       const DOC_EXTENSIONS = new Set([
         'pdf', 'docx', 'doc', 'xlsx', 'xls', 'zip', 'rtf', 'txt', 'odt', 'ods',
+        // XML — Mercell often attaches ONLY the TED OriginalNotice in
+        // eForms XML format (type=OriginalNotice). The XML is structured
+        // and contains qualification criteria, award criteria, lots, and
+        // contract value verbatim. Strip-tag extraction gives us the same
+        // content that would otherwise sit in a ToR PDF.
+        'xml',
       ]);
 
       const pickFromNode = (node) => {
@@ -2110,6 +2116,11 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         if (ex === 'doc' || ex === 'xls') return got === 'cfb';
         if (ex === 'rtf') return got === 'rtf';
         if (ex === 'txt') return got !== 'html'; // accept anything plausible
+        // XML — accept anything that detectFormat classified as 'html'
+        // (which covers `<?xml`, `<html`, and any other `<…>`-prefixed
+        // payload). We don't distinguish XML from HTML at the magic-byte
+        // level; the parser strips both safely.
+        if (ex === 'xml') return got === 'html';
         return true; // unknown ext — be permissive
       };
 
@@ -2157,6 +2168,44 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
               .replace(/[{}]/g, ' ')
               .replace(/\s+/g, ' ')
               .trim();
+          }
+          if (ex === 'xml') {
+            // XML — naivus tag stripping. TED eForms XML talpina visus
+            // mums reikalingus laukus (qualification criteria, award
+            // criteria, lot scope, value). Schema sudėtinga (efbc:, efac:,
+            // cbc:, cac: namespaces), bet text content'as suskaitomas po
+            // tagų pašalinimo. Decode'inam XML entity'es — eForms turi
+            // daug `&amp;`, `&#x2019;`, etc. Apkarpom žemyn iki MAX caps.
+            const raw = bytes.toString('utf8');
+            const stripped = raw
+              // pašalinti CDATA wrapper'ius, paliekant turinį
+              .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+              // pašalinti komentarus
+              .replace(/<!--[\s\S]*?-->/g, ' ')
+              // pašalinti processing instructions (<?xml ?>, <?xsl ?>)
+              .replace(/<\?[\s\S]*?\?>/g, ' ')
+              // pašalinti doctype
+              .replace(/<!DOCTYPE[^>]*>/gi, ' ')
+              // pašalinti VISUS XML/HTML tag'us
+              .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')
+              // decode common entities
+              .replace(/&amp;/g, '&')
+              .replace(/&lt;/g, '<')
+              .replace(/&gt;/g, '>')
+              .replace(/&quot;/g, '"')
+              .replace(/&apos;/g, "'")
+              .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+                try { return String.fromCodePoint(parseInt(hex, 16)); }
+                catch (_e) { return ' '; }
+              })
+              .replace(/&#(\d+);/g, (_, dec) => {
+                try { return String.fromCodePoint(parseInt(dec, 10)); }
+                catch (_e) { return ' '; }
+              })
+              // collapse whitespace
+              .replace(/\s+/g, ' ')
+              .trim();
+            return stripped;
           }
           if (ex === 'zip') {
             if (!AdmZip) return '';
