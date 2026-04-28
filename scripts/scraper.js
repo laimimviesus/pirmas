@@ -17,8 +17,8 @@ const MAX_PAGES = TEST_MODE ? 1 : 200;
 // 6h, o pilnas detail-fetch ciklas per tender'į truko ~5–10s. 4000 tenderių
 // prasilenkdavo su timeout'u ir niekas nebuvo įrašoma. Paliekam override'ą
 // per aplinkos kintamąjį jeigu kada reikės platesnio pirmojo backfill'o.
-const MAX_TENDERS = TEST_MODE ? 50 : Number(process.env.MAX_TENDERS || 500);
-const DETAILS_LIMIT = TEST_MODE ? 50 : Number(process.env.DETAILS_LIMIT || 500);
+const MAX_TENDERS = TEST_MODE ? 9 : Number(process.env.MAX_TENDERS || 500);
+const DETAILS_LIMIT = TEST_MODE ? 9 : Number(process.env.DETAILS_LIMIT || 500);
 const FLUSH_BATCH = TEST_MODE ? 1 : Number(process.env.FLUSH_BATCH || 5);
 const SOURCE_NAV_TIMEOUT = 25000;
 
@@ -2980,14 +2980,38 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
             console.log(`    ⚠️ public notice fetch failed: ${p.url.slice(0, 70)}${statusTail}${errTail}`);
             continue;
           }
-          // The strip-tag XML extractor handles both XML and HTML safely
-          // (it strips any `<…>` tag and decodes entities). Use ext='xml'
-          // regardless of whether the served body is XML or HTML — the
-          // text content we want is the same.
+          // Sniff actual format from magic bytes — public-notice URLs
+          // sometimes resolve to a ZIP attachment (Find-a-Tender's
+          // /Notice/Attachment/A-… serves a 70KB ZIP of XML/PDF) or a
+          // direct PDF. If we blindly passed ext='xml' here the
+          // magic-mismatch guard in extractTextFromBuffer would skip
+          // everything. Map the detected format → an extension the
+          // multi-format extractor knows how to dispatch on, then let
+          // it recurse into ZIP entries / parse PDF / strip XML/HTML
+          // as appropriate.
+          let detectedFmt = 'unknown';
+          try { detectedFmt = detectFormat(result.bytes); } catch (_) {}
+          // URL-tail hint as a tiebreaker for cases where the body
+          // didn't match a known magic (e.g. plain text manifest).
+          let urlExt = '';
+          try {
+            const urlPath = new URL(p.url).pathname.toLowerCase();
+            urlExt = (urlPath.match(/\.([a-z0-9]{1,5})$/) || [])[1] || '';
+          } catch (_) {}
+          let parseExt;
+          if (detectedFmt === 'zip') parseExt = 'zip';
+          else if (detectedFmt === 'pdf') parseExt = 'pdf';
+          else if (detectedFmt === 'cfb') parseExt = (urlExt === 'xls' ? 'xls' : 'doc');
+          else if (detectedFmt === 'rtf') parseExt = 'rtf';
+          else if (detectedFmt === 'json') parseExt = 'json';
+          else if (detectedFmt === 'html') parseExt = 'xml'; // HTML/XML — strip-tag path
+          else parseExt = (urlExt && /^(pdf|zip|docx|xlsx|odt|ods|doc|xls|rtf|json|xml|html|htm|txt)$/.test(urlExt))
+            ? (urlExt === 'htm' || urlExt === 'html' ? 'xml' : urlExt)
+            : 'xml';
           let text = '';
           try {
             text = await extractTextFromBuffer(
-              { name: p.label, ext: 'xml', bytes: result.bytes },
+              { name: p.label, ext: parseExt, bytes: result.bytes },
               0,
             );
           } catch (e) {
@@ -2995,12 +3019,12 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
             continue;
           }
           if (!text) {
-            console.log(`    ⚠️ public notice empty after strip: ${p.url.slice(0, 70)}`);
+            console.log(`    ⚠️ public notice empty after extract (fmt=${detectedFmt}, ext=${parseExt}): ${p.url.slice(0, 70)}`);
             continue;
           }
           const clipped = text.slice(0, MAX_DOC_TEXT_CHARS);
           publicNoticeTexts.push(`--- (public:${p.label}) ${p.url} ---\n${clipped}`);
-          console.log(`    🌐 parsed public notice (${result.size}B -> ${clipped.length}ch from ${p.url.slice(0, 70)})`);
+          console.log(`    🌐 parsed public notice (${result.size}B/${detectedFmt} -> ${clipped.length}ch from ${p.url.slice(0, 70)})`);
         }
       }
 
