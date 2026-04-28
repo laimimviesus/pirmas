@@ -99,6 +99,98 @@ function getPortalCreds(hostOrUrl) {
   }
   return null;
 }
+async function genericPortalLogin(page, creds) {
+  // Best-effort login helper: finds email/username + password + submit button.
+  // Safe to call on any page; if no form is found, it just does nothing.
+  try {
+    await page.waitForTimeout(800);
+    await page.evaluate(() => {
+      // Try to close popups / cookie banners that might block the form
+      const btns = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
+      const acc = btns.find(b => /accept|ok|continue|got it|understand|jeg forstår|jag förstår/i
+        .test((b.textContent || b.value || '').trim()));
+      acc?.click?.();
+    });
+    await page.waitForTimeout(500);
+
+    const hasPw = await page.$('input[type="password"]');
+    if (!hasPw) return false;
+
+    // Fill username/email
+    const userSelectors = [
+      'input[type="email"]',
+      'input[name*="email" i]',
+      'input[name*="user" i]',
+      'input[name*="login" i]',
+      'input[id*="email" i]',
+      'input[id*="user" i]',
+      'input[id*="login" i]',
+    ];
+    for (const sel of userSelectors) {
+      const el = await page.$(sel);
+      if (el) {
+        await el.click({ clickCount: 3 });
+        await el.type(creds.username, { delay: 20 });
+        break;
+      }
+    }
+
+    // Fill password
+    const pwSelectors = [
+      'input[type="password"]',
+      'input[name*="pass" i]',
+      'input[id*="pass" i]',
+    ];
+    for (const sel of pwSelectors) {
+      const el = await page.$(sel);
+      if (el) {
+        await el.click({ clickCount: 3 });
+        await el.type(creds.password, { delay: 20 });
+        break;
+      }
+    }
+
+    // Click submit / login
+    const submitSelectors = [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button',
+      'a[role="button"]',
+    ];
+    let clicked = false;
+    for (const sel of submitSelectors) {
+      const els = await page.$$(sel);
+      for (const el of els) {
+        const txt = (await page.evaluate(e => (e.textContent || e.value || '').trim(), el)).toLowerCase();
+        if (/(login|log in|sign in|continue|enter|submit|ok)/i.test(txt)) {
+          await el.click();
+          clicked = true;
+          break;
+        }
+      }
+      if (clicked) break;
+    }
+
+    if (!clicked) return false;
+
+    await page.waitForTimeout(2000);
+    return true;
+  } catch (e) {
+    console.log(`    portal login helper error: ${e.message}`);
+    return false;
+  }
+}
+
+async function loginToPortal(page, host, creds) {
+  const h = (host || '').toLowerCase().replace(/^www\./, '');
+  console.log(`    portal login: attempting for ${h}`);
+
+  // You can add host‑specific flows here later if needed, e.g.:
+  // if (h.includes('e-avrop.com')) return await loginToEAvrop(page, creds);
+  // For now we just use the generic helper.
+  return await genericPortalLogin(page, creds);
+}
+
 async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperature = 0 } = {}) {
   if (!AI_ENABLED) throw new Error('ANTHROPIC_API_KEY missing');
   const body = JSON.stringify({
@@ -3962,7 +4054,7 @@ async function runScraper() {
     let sampleLogged = false;
     // 500K EUR threshold: drop tenders whose known budget is below this.
     // Keep rows where budget is unknown (empty) or ≥ 500K EUR.
-    const BUDGET_MIN_EUR = 500000;
+    const BUDGET_MIN_EUR = 100000;
     let budgetFilteredCount = 0;
 
     for (let i = 0; i < toFetch.length; i++) {
