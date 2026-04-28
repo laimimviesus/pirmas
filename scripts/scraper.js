@@ -1765,6 +1765,93 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
     page.off('request', blockHandler);
     await page.setRequestInterception(false);
 
+    // --- DOCUMENTS-TAB CLICK PROBE -------------------------------------
+    // Visi keturi failų-fetch'avimo keliai (S3 presign, /files/ search-api,
+    // app/permalink, viešieji TED/FTS pranešimai) yra dead-end'ai. Bet kai
+    // user spaudžia "Documents" tab'ą savo naršyklėje — failai parsisiunčia.
+    // Reiškia, Mercell turi veikiantį endpoint'ą, kurio mes dar nesugavome.
+    // Šis blokas paspaudžia "Documents" tab'ą SPA'oje ir užfiksuoja, kokius
+    // URL'us iškviečia frontend'as — kad kitam iteracijoj galėtume juos atkartoti.
+    const docsClickUrls = [];
+    const docsClickResponseHandler = (res) => {
+      try {
+        const url = res.url();
+        if (!/mercell\.com/i.test(url)) return;
+        const headers = res.headers() || {};
+        const ctype = headers['content-type'] || '';
+        const size = headers['content-length'] || '';
+        docsClickUrls.push({
+          url,
+          status: res.status(),
+          ctype,
+          size,
+        });
+      } catch (_) { /* ignore */ }
+    };
+    page.on('response', docsClickResponseHandler);
+
+    try {
+      const clickResult = await page.evaluate(() => {
+        const labels = [
+          'documents', 'document', 'files', 'attachments', 'attachment',
+          'dokumenter', 'dokumente', 'dokumenten', 'dokumentai', 'dokumenty',
+          'dokument', 'dokumentet', 'dokumentit', 'dokumendid',
+          'asiakirjat', 'liitteet',
+          'documenten', 'documentos', 'documenti', 'documentation',
+          'pieces', 'pièces', 'pieces jointes', 'pièces jointes',
+          'załączniki', 'zalaczniki', 'załącznik',
+          'přílohy', 'prilohy', 'príloha', 'přiloha',
+          'pielikumi', 'priedai',
+          'anexos', 'anexo', 'allegati', 'allegato',
+          'unterlagen', 'anlagen',
+        ];
+        const norm = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+        const candidates = Array.from(
+          document.querySelectorAll(
+            'a, button, [role="tab"], [role="button"], .nav-link, .tab, .mat-tab-label, [class*="tab" i]'
+          )
+        );
+        for (const el of candidates) {
+          const txt = norm(el.innerText || el.textContent || '');
+          if (!txt) continue;
+          for (const lbl of labels) {
+            if (txt === lbl || txt.startsWith(lbl + ' ') || txt.endsWith(' ' + lbl) || txt.includes(' ' + lbl + ' ')) {
+              try {
+                el.scrollIntoView({ block: 'center' });
+                el.click();
+                return { clicked: true, label: txt.slice(0, 60), tag: el.tagName };
+              } catch (_) { /* keep trying */ }
+            }
+          }
+        }
+        return { clicked: false };
+      });
+      if (clickResult && clickResult.clicked) {
+        console.log(`    📑 docs tab clicked (label="${clickResult.label}", tag=${clickResult.tag})`);
+        await new Promise((r) => setTimeout(r, 2500));
+      } else {
+        console.log(`    📑 docs tab not found in SPA`);
+      }
+    } catch (e) {
+      console.log(`    📑 docs-tab click failed: ${e.message}`);
+    }
+
+    try {
+      page.off('response', docsClickResponseHandler);
+    } catch (_) {}
+
+    // Filtruojam triukšmą — nereikia matyti notification/user-service/comments XHR'ų
+    const NOISE_HOST_RE = /(notification|user-management|user-service|comments-service|telemetry|analytics|sentry|tracking)/i;
+    const docsClickFiltered = docsClickUrls.filter((u) => !NOISE_HOST_RE.test(u.url));
+    if (docsClickFiltered.length) {
+      console.log(`    📑 docs-tab XHRs (${docsClickFiltered.length}):`);
+      for (const u of docsClickFiltered.slice(0, 25)) {
+        console.log(`        [${u.status}] ${u.ctype} ${u.size}b ${u.url.slice(0, 180)}`);
+      }
+    } else if (docsClickUrls.length) {
+      console.log(`    📑 docs-tab XHRs: ${docsClickUrls.length} captured but all filtered as noise`);
+    }
+
     // --- MERCELL JSON API ATSAKYMAI ------------------------------------
     // Mercell tender'io puslapis fetchina `/api/v1/search/tenders/{id}`
     // ir `/api/v1/bopp-matches/{id}` iš discover.app.mercell.com. Šiuose
