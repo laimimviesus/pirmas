@@ -1811,6 +1811,27 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         console.log(`    nested: ${JSON.stringify(nestedSummary).slice(0, 500)}`);
       }
 
+      // --- diagnostic: actual VALUES of fields the public-notice harvester
+      // wants to read. We've confirmed `originalNotices` and `fileReference
+      // Number` exist as top-level keys, but the harvest produced 0 URLs —
+      // we need to see the real shape (URL strings? objects? bare IDs?
+      // hostnames?) to build the correct extraction rules. Truncate hard
+      // so log noise stays bounded.
+      const dumpField = (label, value) => {
+        if (value == null) return;
+        try {
+          const s = JSON.stringify(value);
+          if (!s || s === 'null' || s === '""' || s === '{}' || s === '[]') return;
+          console.log(`    🔎 ${label}: ${s.slice(0, 300)}${s.length > 300 ? '…' : ''}`);
+        } catch (_) { /* ignore */ }
+      };
+      if (json && typeof json === 'object') {
+        dumpField('fileReferenceNumber', json.fileReferenceNumber);
+        dumpField('originalNotices', json.originalNotices);
+        dumpField('publicationNumber', json.publicationNumber);
+        dumpField('externalReferences', json.externalReferences);
+      }
+
       const fields = extractFieldsFromTenderJson(json);
 
       // JSON VIRŠ DOM'O — Mercell JSON'as struktūrizuotas ir patikimas,
