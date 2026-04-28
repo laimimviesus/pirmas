@@ -2538,26 +2538,14 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
               .replace(/\s+/g, ' ')
               .trim();
           }
-          if (ex === 'xml') {
-            // XML — naivus tag stripping. TED eForms XML talpina visus
-            // mums reikalingus laukus (qualification criteria, award
-            // criteria, lot scope, value). Schema sudėtinga (efbc:, efac:,
-            // cbc:, cac: namespaces), bet text content'as suskaitomas po
-            // tagų pašalinimo. Decode'inam XML entity'es — eForms turi
-            // daug `&amp;`, `&#x2019;`, etc. Apkarpom žemyn iki MAX caps.
+                    if (ex === 'xml') {
             const raw = bytes.toString('utf8');
             const stripped = raw
-              // pašalinti CDATA wrapper'ius, paliekant turinį
               .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
-              // pašalinti komentarus
               .replace(/<!--[\s\S]*?-->/g, ' ')
-              // pašalinti processing instructions (<?xml ?>, <?xsl ?>)
               .replace(/<\?[\s\S]*?\?>/g, ' ')
-              // pašalinti doctype
               .replace(/<!DOCTYPE[^>]*>/gi, ' ')
-              // pašalinti VISUS XML/HTML tag'us
               .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')
-              // decode common entities
               .replace(/&amp;/g, '&')
               .replace(/&lt;/g, '<')
               .replace(/&gt;/g, '>')
@@ -2571,9 +2559,11 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
                 try { return String.fromCodePoint(parseInt(dec, 10)); }
                 catch (_e) { return ' '; }
               })
-              // collapse whitespace
               .replace(/\s+/g, ' ')
               .trim();
+            if (stripped.length < 50) {
+              console.log(`    ⚠️ XML text very short (${stripped.length}ch) for "${name}"`);
+            }
             return stripped;
           }
           if (ex === 'json') {
