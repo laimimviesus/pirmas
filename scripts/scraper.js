@@ -2352,17 +2352,18 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       // fetchTenderDetails and reuse it across every candidate URL.
       let cdpSession = null;
       let cdpFrameId = null;
-      // Track which extra-header set is currently installed on the CDP
-      // session so we don't redundantly call setExtraHTTPHeaders.
-      // 'bearer' = Authorization header present, 'none' = no extras.
-      let cdpExtraMode = null;
+      // NOTE: Bearer-token injection via Network.setExtraHTTPHeaders has
+      // been REMOVED. Empirically the captured token has /search/ audience
+      // and search-service-api still 401s for /files/ endpoints, so the
+      // injection had zero upside. It also broke 8/9 subsequent tender
+      // navigations: enabling the Network domain + injecting headers on
+      // the page's CDP session leaks state into page.goto() and the SPA
+      // renders blank. We now skip Network.enable entirely and rely on
+      // cookies (via includeCredentials) for any session auth.
       const ensureCdp = async () => {
         if (cdpSession) return cdpSession;
         try {
           cdpSession = await page.target().createCDPSession();
-          // Network domain MUST be enabled for setExtraHTTPHeaders to
-          // take effect — silently no-ops without this.
-          await cdpSession.send('Network.enable').catch(() => {});
           const { frameTree } = await cdpSession.send('Page.getFrameTree');
           cdpFrameId = frameTree.frame.id;
           return cdpSession;
@@ -2370,6 +2371,14 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           cdpSession = null;
           return null;
         }
+      };
+      // Detach the CDP session when we're done with this tender — orphaned
+      // sessions accumulate per-tender and subtly affect page behavior.
+      const detachCdp = async () => {
+        if (!cdpSession) return;
+        try { await cdpSession.detach(); } catch (_) { /* ignore */ }
+        cdpSession = null;
+        cdpFrameId = null;
       };
       // Drain a CDP IO.read stream into a Buffer. Returns Buffer.alloc(0)
       // on any error so the caller can still report status/headers.
@@ -2392,25 +2401,6 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         try {
           const sess = await ensureCdp();
           if (!sess) return { ok: false, error: 'cdp-init-failed' };
-
-          // Inject Authorization: Bearer <token> ONLY for Mercell-internal
-          // hosts. S3 must NOT see an Authorization header — AWS treats
-          // it as an alternate signature and rejects the presigned URL.
-          // We toggle the extra headers via Network.setExtraHTTPHeaders
-          // before each loadNetworkResource call.
-          let isMercell = false;
-          try {
-            isMercell = /\.mercell\.com$/i.test(new URL(url).hostname);
-          } catch (_) { /* ignore */ }
-          const wantMode = (isMercell && mercellBearer) ? 'bearer' : 'none';
-          if (wantMode !== cdpExtraMode) {
-            try {
-              const headers = wantMode === 'bearer' ? { Authorization: mercellBearer } : {};
-              await sess.send('Network.setExtraHTTPHeaders', { headers });
-              cdpExtraMode = wantMode;
-            } catch (_) { /* best-effort */ }
-          }
-
           const r = await sess.send('Network.loadNetworkResource', {
             frameId: cdpFrameId,
             url,
@@ -2661,6 +2651,13 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       }
     } catch (e) {
       console.log(`    ⚠️ document extraction error: ${e.message}`);
+    } finally {
+      // Detach the per-tender CDP session so orphaned sessions don't
+      // accumulate on the page target — leaving them attached over many
+      // tenders correlates with subsequent page.goto()s rendering blank
+      // (`WARN: no h1/content`) and the response sniffer capturing 0
+      // APIs. Detach is best-effort; ignore errors.
+      try { await detachCdp(); } catch (_) { /* ignore */ }
     }
 
     // --- ŠALTINIO PUSLAPIS -------------------------------------------
