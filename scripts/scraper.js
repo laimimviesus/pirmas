@@ -4054,7 +4054,7 @@ async function runScraper() {
     let sampleLogged = false;
     // 500K EUR threshold: drop tenders whose known budget is below this.
     // Keep rows where budget is unknown (empty) or ≥ 500K EUR.
-    const BUDGET_MIN_EUR = 100000;
+    const BUDGET_MIN_EUR = 500000;
     let budgetFilteredCount = 0;
 
     for (let i = 0; i < toFetch.length; i++) {
