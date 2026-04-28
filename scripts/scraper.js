@@ -17,8 +17,8 @@ const MAX_PAGES = TEST_MODE ? 1 : 200;
 // 6h, o pilnas detail-fetch ciklas per tender'į truko ~5–10s. 4000 tenderių
 // prasilenkdavo su timeout'u ir niekas nebuvo įrašoma. Paliekam override'ą
 // per aplinkos kintamąjį jeigu kada reikės platesnio pirmojo backfill'o.
-const MAX_TENDERS = TEST_MODE ? 30 : Number(process.env.MAX_TENDERS || 500);
-const DETAILS_LIMIT = TEST_MODE ? 30 : Number(process.env.DETAILS_LIMIT || 500);
+const MAX_TENDERS = TEST_MODE ? 9 : Number(process.env.MAX_TENDERS || 500);
+const DETAILS_LIMIT = TEST_MODE ? 9 : Number(process.env.DETAILS_LIMIT || 500);
 const FLUSH_BATCH = TEST_MODE ? 1 : Number(process.env.FLUSH_BATCH || 5);
 const SOURCE_NAV_TIMEOUT = 25000;
 
@@ -99,98 +99,6 @@ function getPortalCreds(hostOrUrl) {
   }
   return null;
 }
-async function genericPortalLogin(page, creds) {
-  // Best-effort login helper: finds email/username + password + submit button.
-  // Safe to call on any page; if no form is found, it just does nothing.
-  try {
-    await page.waitForTimeout(800);
-    await page.evaluate(() => {
-      // Try to close popups / cookie banners that might block the form
-      const btns = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
-      const acc = btns.find(b => /accept|ok|continue|got it|understand|jeg forstår|jag förstår/i
-        .test((b.textContent || b.value || '').trim()));
-      acc?.click?.();
-    });
-    await page.waitForTimeout(500);
-
-    const hasPw = await page.$('input[type="password"]');
-    if (!hasPw) return false;
-
-    // Fill username/email
-    const userSelectors = [
-      'input[type="email"]',
-      'input[name*="email" i]',
-      'input[name*="user" i]',
-      'input[name*="login" i]',
-      'input[id*="email" i]',
-      'input[id*="user" i]',
-      'input[id*="login" i]',
-    ];
-    for (const sel of userSelectors) {
-      const el = await page.$(sel);
-      if (el) {
-        await el.click({ clickCount: 3 });
-        await el.type(creds.username, { delay: 20 });
-        break;
-      }
-    }
-
-    // Fill password
-    const pwSelectors = [
-      'input[type="password"]',
-      'input[name*="pass" i]',
-      'input[id*="pass" i]',
-    ];
-    for (const sel of pwSelectors) {
-      const el = await page.$(sel);
-      if (el) {
-        await el.click({ clickCount: 3 });
-        await el.type(creds.password, { delay: 20 });
-        break;
-      }
-    }
-
-    // Click submit / login
-    const submitSelectors = [
-      'button[type="submit"]',
-      'input[type="submit"]',
-      'button',
-      'a[role="button"]',
-    ];
-    let clicked = false;
-    for (const sel of submitSelectors) {
-      const els = await page.$$(sel);
-      for (const el of els) {
-        const txt = (await page.evaluate(e => (e.textContent || e.value || '').trim(), el)).toLowerCase();
-        if (/(login|log in|sign in|continue|enter|submit|ok)/i.test(txt)) {
-          await el.click();
-          clicked = true;
-          break;
-        }
-      }
-      if (clicked) break;
-    }
-
-    if (!clicked) return false;
-
-    await page.waitForTimeout(2000);
-    return true;
-  } catch (e) {
-    console.log(`    portal login helper error: ${e.message}`);
-    return false;
-  }
-}
-
-async function loginToPortal(page, host, creds) {
-  const h = (host || '').toLowerCase().replace(/^www\./, '');
-  console.log(`    portal login: attempting for ${h}`);
-
-  // You can add host‑specific flows here later if needed, e.g.:
-  // if (h.includes('e-avrop.com')) return await loginToEAvrop(page, creds);
-  // For now we just use the generic helper.
-  return await genericPortalLogin(page, creds);
-}
-
 async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperature = 0 } = {}) {
   if (!AI_ENABLED) throw new Error('ANTHROPIC_API_KEY missing');
   const body = JSON.stringify({
@@ -671,17 +579,7 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     };
     srcPage.on('request', blockHandler);
-    // If we have credentials for this source host, try to log in before scraping.
-    try {
-      const u0 = new URL(sourceUrl);
-      const creds = getPortalCreds(u0.hostname);
-      if (creds) {
-        console.log(`    portal creds found for ${u0.hostname} — attempting login`);
-        await loginToPortal(srcPage, u0.hostname, creds);
-      }
-    } catch (e) {
-      console.log(`    portal-creds lookup/login error: ${e.message}`);
-    }
+
     try {
       await srcPage.goto(sourceUrl, {
         waitUntil: 'domcontentloaded',
@@ -2538,14 +2436,26 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
               .replace(/\s+/g, ' ')
               .trim();
           }
-                    if (ex === 'xml') {
+          if (ex === 'xml') {
+            // XML — naivus tag stripping. TED eForms XML talpina visus
+            // mums reikalingus laukus (qualification criteria, award
+            // criteria, lot scope, value). Schema sudėtinga (efbc:, efac:,
+            // cbc:, cac: namespaces), bet text content'as suskaitomas po
+            // tagų pašalinimo. Decode'inam XML entity'es — eForms turi
+            // daug `&amp;`, `&#x2019;`, etc. Apkarpom žemyn iki MAX caps.
             const raw = bytes.toString('utf8');
             const stripped = raw
+              // pašalinti CDATA wrapper'ius, paliekant turinį
               .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+              // pašalinti komentarus
               .replace(/<!--[\s\S]*?-->/g, ' ')
+              // pašalinti processing instructions (<?xml ?>, <?xsl ?>)
               .replace(/<\?[\s\S]*?\?>/g, ' ')
+              // pašalinti doctype
               .replace(/<!DOCTYPE[^>]*>/gi, ' ')
+              // pašalinti VISUS XML/HTML tag'us
               .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')
+              // decode common entities
               .replace(/&amp;/g, '&')
               .replace(/&lt;/g, '<')
               .replace(/&gt;/g, '>')
@@ -2559,11 +2469,9 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
                 try { return String.fromCodePoint(parseInt(dec, 10)); }
                 catch (_e) { return ' '; }
               })
+              // collapse whitespace
               .replace(/\s+/g, ' ')
               .trim();
-            if (stripped.length < 50) {
-              console.log(`    ⚠️ XML text very short (${stripped.length}ch) for "${name}"`);
-            }
             return stripped;
           }
           if (ex === 'json') {
