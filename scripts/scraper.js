@@ -538,6 +538,133 @@ async function goToNextPage(page) {
   return true;
 }
 
+// --- PORTAL LOGIN HELPER -----------------------------------------------
+//
+// Generic best-effort login for portals that proxy the Mercell "Go to
+// source" link (UK MyTenders, Cloudia/tarjouspalvelu.fi, e-avrop, DEUTSCHE
+// EVERGABE, Vergabeportal AT, contrataciondelestado.es, etc.). Looks up
+// creds via getPortalCreds() — host stripping + suffix matching are done
+// there. Opens a fresh page, follows whatever redirect the portal does
+// for an unauthenticated visitor, fills the most common form patterns,
+// submits, and verifies the password field is gone afterwards. Cookies
+// are stored on the default browserContext, so a subsequent
+// fetchSourcePageDetails() call from a fresh page will run authenticated.
+//
+// Returns true on apparent success, false on any failure (no creds, form
+// not found, submission did not clear password field, exception). Logs
+// 🔑 / 🔐 / ✅ / ❌ markers for grep-ability in CI logs.
+// =====================================================================
+async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
+  if (!creds || !creds.password) return false;
+  const page = await browser.newPage();
+  try {
+    page.setDefaultNavigationTimeout(30000);
+    try {
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (e) {
+      console.log(`    ❌ login goto failed for ${hostLabel}: ${(e.message || '').slice(0, 120)}`);
+    }
+    // Allow client-side redirects / SPA login forms to settle.
+    await new Promise((r) => setTimeout(r, 1500));
+
+    const sels = await page.evaluate(() => {
+      const findVisible = (selectors) => {
+        for (const sel of selectors) {
+          try {
+            const el = document.querySelector(sel);
+            if (el && el.offsetParent !== null) return sel;
+          } catch (_) { /* invalid selector — skip */ }
+        }
+        return null;
+      };
+      const userSel = findVisible([
+        'input[type="email"]:not([disabled]):not([aria-hidden="true"])',
+        'input[name="email"]:not([disabled])',
+        'input[id*="email" i]:not([disabled])',
+        'input[name="username"]:not([disabled])',
+        'input[id*="user" i]:not([disabled])',
+        'input[name*="user" i]:not([disabled])',
+        'input[name="login"]:not([disabled])',
+        'input[name*="login" i]:not([disabled])',
+        'input[type="text"]:not([disabled]):not([aria-hidden="true"])',
+      ]);
+      const passSel = findVisible([
+        'input[type="password"]:not([disabled]):not([aria-hidden="true"])',
+      ]);
+      return { userSel, passSel, currentHost: location.host, currentUrl: location.href };
+    }).catch(() => ({ userSel: null, passSel: null, currentHost: hostLabel, currentUrl: '' }));
+
+    if (!sels.passSel) {
+      console.log(`    ❌ no password field on ${hostLabel} (post-redirect: ${sels.currentHost})`);
+      return false;
+    }
+    if (sels.currentHost && sels.currentHost !== hostLabel) {
+      console.log(`    ↪️  login form is on ${sels.currentHost} (redirected from ${hostLabel})`);
+    }
+
+    if (sels.userSel && creds.username) {
+      try { await page.click(sels.userSel, { clickCount: 3 }); } catch (_) {}
+      try { await page.type(sels.userSel, String(creds.username), { delay: 25 }); }
+      catch (e) { console.log(`    ⚠️ username type failed: ${(e.message || '').slice(0, 80)}`); }
+    }
+    try { await page.click(sels.passSel, { clickCount: 3 }); } catch (_) {}
+    try { await page.type(sels.passSel, String(creds.password), { delay: 25 }); }
+    catch (e) {
+      console.log(`    ❌ password type failed on ${hostLabel}: ${(e.message || '').slice(0, 120)}`);
+      return false;
+    }
+
+    const submitSel = await page.evaluate(() => {
+      const candidates = [
+        'button[type="submit"]:not([disabled])',
+        'input[type="submit"]:not([disabled])',
+        'button[name*="login" i]:not([disabled])',
+        'button[id*="login" i]:not([disabled])',
+        'button[class*="login" i]:not([disabled])',
+        'button[name*="signin" i]:not([disabled])',
+        'button[id*="signin" i]:not([disabled])',
+        'button[id*="submit" i]:not([disabled])',
+      ];
+      for (const sel of candidates) {
+        try {
+          const el = document.querySelector(sel);
+          if (el && el.offsetParent !== null) { el.click(); return sel; }
+        } catch (_) {}
+      }
+      return null;
+    }).catch(() => null);
+    if (!submitSel) {
+      try { await page.keyboard.press('Enter'); } catch (_) {}
+    }
+
+    // Wait for either navigation or a settled network. Don't throw if
+    // neither happens — some SPAs just swap the DOM client-side.
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 })
+      .catch(() => null);
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const stillLogin = await page.evaluate(() => {
+      try {
+        const el = document.querySelector(
+          'input[type="password"]:not([disabled]):not([aria-hidden="true"])'
+        );
+        return !!(el && el.offsetParent !== null);
+      } catch (_) { return false; }
+    }).catch(() => false);
+    if (stillLogin) {
+      console.log(`    ❌ login submission did not clear password field on ${hostLabel}`);
+      return false;
+    }
+    console.log(`    ✅ login OK on ${hostLabel} (submit=${submitSel || 'Enter'})`);
+    return true;
+  } catch (e) {
+    console.log(`    ❌ login error on ${hostLabel}: ${(e.message || String(e)).slice(0, 200)}`);
+    return false;
+  } finally {
+    try { await page.close(); } catch (_) {}
+  }
+}
+
 // --- ŠALTINIO PUSLAPIO NUSKAITYMAS -------------------------------------
 //
 // Atidaro naują tabą, nueina į šaltinio URL, nuskaito kelis laukus pagal
@@ -3080,14 +3207,77 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         details.sourceSkipped = src.skipped;
       } else if (src?.loginGated) {
         // Login-gated portal'as (UK MyTenders, Jaggaer, Bravo, DTVP, ...)
-        // — realaus turinio nepaseiksim be autentifikacijos. Paliekam
-        // Mercell laukus nepakitusius; tik pažymim kad šaltinis login-walled.
+        // — realaus turinio nepaseiksim be autentifikacijos. Pirma bandom
+        // prisijungti su PORTAL_CREDS_JSON paslaptyje saugomais
+        // credentials'ais; jei pavyksta, persifetchinam šaltinio puslapį
+        // ir traukiame qualification laukus iš autentikuoto DOM'o.
         console.log(
           `    source login-gated (host: ${src.sourceHost}, markers: ${src.matchedMarkers}, ` +
           `bodyLen: ${src.bodyLength}, passwordField: ${src.hasPasswordField})`
         );
         details.sourceHost = src.sourceHost || null;
-        details.sourceSkipped = 'login-gated';
+        const creds = getPortalCreds(src.sourceHost || details.sourceUrl);
+        let postLoginSrc = null;
+        if (creds && creds.password) {
+          console.log(`    🔑 portal creds found for ${src.sourceHost}`);
+          console.log(`    🔐 logging in to ${src.sourceHost} ...`);
+          const ok = await attemptPortalLogin(
+            browser, details.sourceUrl, creds, src.sourceHost
+          );
+          if (ok) {
+            const t1 = Date.now();
+            postLoginSrc = await fetchSourcePageDetails(browser, details.sourceUrl);
+            console.log(
+              `    🔁 post-login source fetch: ${Date.now() - t1}ms ` +
+              `(gated=${!!postLoginSrc?.loginGated}, err=${postLoginSrc?.error || 'none'})`
+            );
+          }
+        } else {
+          console.log(`    ℹ️  no portal creds configured for ${src.sourceHost}`);
+        }
+        if (postLoginSrc && !postLoginSrc.loginGated && !postLoginSrc.error) {
+          // Reuse the same per-field extraction the success branch does.
+          const srcFieldSummary = {};
+          for (const key of [
+            'maxBudget',
+            'duration',
+            'requirementsForSupplier',
+            'qualificationRequirements',
+            'offerWeighingCriteria',
+            'scopeOfAgreement',
+            'technicalStack',
+          ]) {
+            const v = postLoginSrc[key];
+            srcFieldSummary[key] = v
+              ? `${String(v).length}ch: ${String(v).slice(0, 60).replace(/\s+/g, ' ')}`
+              : null;
+            if (v) details[key] = v;
+          }
+          console.log(`    source fields (post-login):`, JSON.stringify(srcFieldSummary));
+          if (postLoginSrc.bodyTextPreview) {
+            console.log(
+              `    source body preview (first 300ch): ` +
+              postLoginSrc.bodyTextPreview.slice(0, 300).replace(/\s+/g, ' ')
+            );
+          }
+          if (!details.referenceNumber && postLoginSrc.referenceNumberSource) {
+            details.referenceNumber = postLoginSrc.referenceNumberSource;
+          }
+          if (postLoginSrc.sourceFilesText && postLoginSrc.sourceFilesText.length) {
+            const HARD_CAP = 200000;
+            const existing = details.pdfText || '';
+            const sep = existing ? '\n\n' : '';
+            const combined = (existing + sep + postLoginSrc.sourceFilesText).slice(0, HARD_CAP);
+            details.pdfText = combined;
+            console.log(
+              `    → merged ${postLoginSrc.sourceFilesText.length}ch of source-page docs into pdfText ` +
+              `(total now ${combined.length}ch)`
+            );
+          }
+          details.sourceLoggedIn = true;
+        } else {
+          details.sourceSkipped = 'login-gated';
+        }
       } else if (src && !src.error) {
         // Per-field logging — matome ką šaltinio puslapis grąžino
         const srcFieldSummary = {};
