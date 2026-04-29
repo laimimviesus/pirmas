@@ -184,19 +184,51 @@ async function translateToEnglish(text, { hint = '', skipHeuristic = false } = {
   // aiškiai angliško turinio. Trumpiems pavadinimams heuristika klysta
   // (pvz., vokiškas „Beschaffung eines Schulmanagementsystems" neturi
   // umlautų), tad jiems perduodam skipHeuristic=true.
+  //
+  // Diakritikos klasė apima: vakarų Europos (ä ö ü ß ñ ç ø æ å ...),
+  // baltų (ą č ę ė į š ų ū ž), lenkų (ć ł ń ó ś ź ż), čekų/slovakų
+  // (ď ě ň ř ť ů ý ĺ ŕ), estų/vengrų (õ ő ű) — tai praktiškai padengia
+  // visus EU 24 oficialiose kalbose paplitusius akcentuotus simbolius.
+  // Stopword'ai padengia LT/PL/CZ/SK/ET/HU/HR/SL atvejus, kuriuose
+  // diakritikų gali ir nebūti (pvz. „IT sistemos pirkimas" — be
+  // diakritikų, bet ne anglų).
   if (!skipHeuristic) {
-    const looksEnglish =
-      !/[äöüßñçéèêáíóúîôûàèìòùâêîôûãõÿøœæåÄÖÜÑÉÉÈÊÁÍÓÚÎÔÛ]/.test(trimmed) &&
-      !/\b(och|und|der|die|den|het|van|een|de|el|la|les|los|das|für|pour|sur|avec|med|till|fra|para|del|dei|delle|della|zur|zum|mit|auf|bei|nach|ist|sind|wir|sie|ihr|van|voor|naar|niet|wel|als|aan|bij|maar|ook|waar|dan|alleen|geen|meer|kan)\b/i.test(trimmed);
+    const hasNonEnglishDiacritic = /[äöüßñçéèêáíóúîôûàèìòùâêîôûãõÿøœæåÄÖÜÑÉÈÊÁÍÓÚÎÔÛÃÕŸØŒÆÅąčęėįšųūžĄČĘĖĮŠŲŪŽćłńóśźżĆŁŃÓŚŹŻďěňřťůýĎĚŇŘŤŮÝĺŕĹŔőűŐŰ]/.test(trimmed);
+    const hasNonEnglishStopword = /\b(?:och|und|der|die|den|das|dem|für|mit|auf|bei|nach|ist|sind|wir|sie|ihr|het|van|een|voor|naar|niet|wel|als|aan|maar|ook|waar|dan|alleen|geen|meer|kan|el|la|los|las|para|del|por|que|con|una|uno|les|pour|sur|avec|sans|dans|sous|dei|delle|della|degli|alla|allo|zur|zum|med|till|fra|men|att|som|inte|och|eller|ir|su|dėl|kad|yra|kaip|bei|arba|taip|šis|tas|tos|kas|kuris|todėl|prie|po|nuo|iki|i|w|na|dla|z|ze|nie|jest|się|że|do|oraz|który|przez|przy|jako|lub|jeśli|a|je|ve|do|by|se|jako|nebo|pokud|který|však|neboť|vo|zo|sa|alebo|však|preto|ja|on|ei|et|ka|oma|või|kui|aga|és|az|egy|hogy|vagy|van|nem|csak|már|i|u|sa|je|li|nije|ali|ima|kao|samo)\b/i.test(trimmed);
+    const looksEnglish = !hasNonEnglishDiacritic && !hasNonEnglishStopword;
     if (looksEnglish) return trimmed;
   }
   try {
     const out = await callClaude(
-      'You are a precise translator. Translate the user text into clear, concise English. Preserve technical terms, tender reference numbers, organisation names, CPV codes verbatim. Return ONLY the translation, no preface, no explanations, no quotes.',
+      'You are a precise translator from any European language into English. The user text is from a public procurement notice. ' +
+      'ALWAYS translate non-English text into English — do NOT return the source verbatim if it is not already English. ' +
+      'If the text already IS English, return it unchanged. ' +
+      'Preserve tender reference numbers, organisation names, country names, CPV codes, and product/brand names verbatim. ' +
+      'Return ONLY the translation: no preface, no explanations, no quotes, no language label.',
       `${hint ? `Context: ${hint}\n\n` : ''}Text to translate:\n${trimmed}`,
       { maxTokens: 800, temperature: 0 }
     );
-    return out || trimmed;
+    let result = out || trimmed;
+    // Defensive retry: if Claude echoed the input unchanged AND the input
+    // clearly contains non-ASCII characters (i.e. it isn't English), force
+    // a second pass with an even more direct instruction. Avoids the
+    // common Haiku failure mode where it hands back the source string
+    // because the system prompt felt ambiguous.
+    const echoed = out && out.trim() === trimmed.trim();
+    const hasNonAscii = /[^\x00-\x7F]/.test(trimmed);
+    if (echoed && hasNonAscii) {
+      try {
+        const forced = await callClaude(
+          'Translate the following non-English text into English. Output ONLY the English translation. No source language label, no quotes, no explanation.',
+          `Source text (translate to English):\n${trimmed}`,
+          { maxTokens: 800, temperature: 0 }
+        );
+        if (forced && forced.trim() !== trimmed.trim()) {
+          result = forced;
+        }
+      } catch (_) { /* fall back to first result */ }
+    }
+    return result;
   } catch (e) {
     console.log(`    ⚠️ translate failed: ${e.message}`);
     return trimmed;
@@ -4289,7 +4321,17 @@ async function runScraper() {
           !dd.maxBudget || !dd.requirementsForSupplier ||
           !dd.qualificationRequirements || !dd.offerWeighingCriteria ||
           !dd.scopeOfAgreement;
+        // Diagnostic: how much text are we feeding the AI? Empty pdfText
+        // is the #1 reason requirementsForSupplier / qualificationRequirements
+        // come back blank — the AI literally has nothing to extract from.
+        const pdfLen = (dd.pdfText || '').length;
+        const snipLen = (dd.fullTextSnippet || '').length;
+        const descLen = rawScope.length;
+        console.log(`    📏 AI inputs: title=${rawTitle.length}ch, desc=${descLen}ch, snippet=${snipLen}ch, pdfText=${pdfLen}ch (combined=${combinedText.length}ch)`);
         if (needsExtract && combinedText) {
+          if (pdfLen === 0) {
+            console.log(`    ⚠️ no pdfText — AI extract will likely return empty requirements/qualifications`);
+          }
           const ai = await extractFieldsWithAI(combinedText, {
             title: rawTitle,
             buyer: dd.organisation || '',
@@ -4340,6 +4382,9 @@ async function runScraper() {
             skipHeuristic: true,
           });
           if (titleEn) dd.titleEn = titleEn;
+          if (titleEn && titleEn.trim() === rawTitle.trim() && /[^\x00-\x7F]/.test(rawTitle)) {
+            console.log(`    ⚠️ title translation echoed source (likely AI failure): "${rawTitle.slice(0, 60)}"`);
+          }
         }
 
         // 3) Translate scopeOfAgreement if not already English
@@ -4348,6 +4393,9 @@ async function runScraper() {
         if (scopeToTranslate) {
           const scopeEn = await translateToEnglish(scopeToTranslate, { hint: 'Public tender scope of agreement' });
           if (scopeEn) dd.scopeOfAgreementEn = scopeEn;
+          if (scopeEn && scopeEn.trim() === scopeToTranslate.trim() && /[^\x00-\x7F]/.test(scopeToTranslate)) {
+            console.log(`    ℹ️ scope translation skipped/echoed (heuristic flagged as English or AI echoed)`);
+          }
         }
 
         toFetch[i].details = dd;
