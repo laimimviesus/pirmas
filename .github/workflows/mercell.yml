@@ -4,6 +4,10 @@ on:
   # Rankinis paleidimas per GitHub UI (Actions tab → Run workflow)
   workflow_dispatch:
     inputs:
+      retranslate_stale:
+        description: 'Backfill mode — re-translate stale TITLE/SCOPE only'
+        type: boolean
+        default: false
       test_mode:
         description: 'Test mode (tik 2 tender\iai jei true, visi jei false)'
         required: false
@@ -53,6 +57,7 @@ jobs:
           TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PORTAL_CREDS_JSON: ${{ secrets.PORTAL_CREDS_JSON }}
+          RETRANSLATE_STALE: ${{ inputs.retranslate_stale && '1' || '' }}
         run: node scripts/scraper.js
 
       - name: Upload logs on failure
