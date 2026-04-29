@@ -101,6 +101,14 @@ function getPortalCreds(hostOrUrl) {
 }
 async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperature = 0 } = {}) {
   if (!AI_ENABLED) throw new Error('ANTHROPIC_API_KEY missing');
+  // Circuit breaker — once a non-retryable error (credit balance, 401/403)
+  // tripped the circuit earlier in this run, we skip the HTTP call entirely.
+  // We still THROW so the caller's catch fires _markAiFailure() and the per-
+  // tender loop defers the row. The thrown message includes the original
+  // reason so _isAiNonRetryable() classifies it as non-retryable.
+  if (_aiCircuitOpen) {
+    throw new Error(`Claude circuit-open (skipped): ${_aiCircuitReason}`);
+  }
   const body = JSON.stringify({
     model: AI_MODEL,
     max_tokens: maxTokens,
@@ -184,18 +192,37 @@ async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperat
 // never enters the sheet, and the next run picks it up automatically.
 // Reset to null at the start of each tender's AI section.
 let _lastAiNonRetryableError = null;
+
+// Global circuit breaker. Once any AI call hits a non-retryable error, this
+// trips and ALL subsequent callClaude() invocations short-circuit before
+// touching the network or the rate limiter. Saves wall-clock time during
+// outages (no 30–45s rate-limit waits for calls we know will fail). Lasts
+// for the rest of the process lifetime — a fresh GitHub Actions run starts
+// the process clean and the circuit closes again.
+let _aiCircuitOpen = false;
+let _aiCircuitReason = '';
+function _tripAiCircuit(err) {
+  if (_aiCircuitOpen) return;
+  _aiCircuitOpen = true;
+  _aiCircuitReason = String(err && err.message || 'unknown').slice(0, 200);
+  console.log(`    🔌 AI circuit breaker OPEN — skipping all further AI calls this run (${_aiCircuitReason.slice(0, 120)})`);
+}
+
 function _isAiNonRetryable(err) {
   const msg = String(err && err.message || '');
   // Claude HTTP 400 with credit balance / invalid_request_error → not retryable
   // 401/403 → auth/permissions, also not retryable on this run
   // 404 → bad endpoint (config issue), not retryable
+  // "circuit-open" → already tripped, so this is non-retryable by definition
   if (/HTTP\s*40[134]/i.test(msg)) return true;
   if (/credit balance|invalid_request_error|insufficient_quota/i.test(msg)) return true;
+  if (/circuit-open/i.test(msg)) return true;
   return false;
 }
 function _markAiFailure(err) {
   if (_isAiNonRetryable(err)) {
     _lastAiNonRetryableError = String(err && err.message || '').slice(0, 200);
+    _tripAiCircuit(err);
   }
 }
 
