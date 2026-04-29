@@ -17,9 +17,9 @@ on:
           - 'false'
           - 'true'
 
-  # Automatinis paleidimas kasdien 04:00 UTC (07:00 Vilniaus laiku)
+  # Automatinis paleidimas kasdien 00:00 UTC (03:00 Vilniaus laiku)
   schedule:
-    - cron: '0 4 * * *'
+    - cron: '0 0 * * *'
 
 jobs:
   scrape:
