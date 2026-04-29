@@ -177,6 +177,28 @@ async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperat
   }
   throw new Error('Claude: exhausted retries');
 }
+// Module-level flag: set when an AI call fails with a non-retryable error
+// (HTTP 400 invalid_request_error like "credit balance too low", or 401/403
+// auth issues). The per-tender loop checks this between AI calls and DEFERS
+// row-write if any non-retryable failure occurred — that way the tender ID
+// never enters the sheet, and the next run picks it up automatically.
+// Reset to null at the start of each tender's AI section.
+let _lastAiNonRetryableError = null;
+function _isAiNonRetryable(err) {
+  const msg = String(err && err.message || '');
+  // Claude HTTP 400 with credit balance / invalid_request_error → not retryable
+  // 401/403 → auth/permissions, also not retryable on this run
+  // 404 → bad endpoint (config issue), not retryable
+  if (/HTTP\s*40[134]/i.test(msg)) return true;
+  if (/credit balance|invalid_request_error|insufficient_quota/i.test(msg)) return true;
+  return false;
+}
+function _markAiFailure(err) {
+  if (_isAiNonRetryable(err)) {
+    _lastAiNonRetryableError = String(err && err.message || '').slice(0, 200);
+  }
+}
+
 async function translateToEnglish(text, { hint = '', skipHeuristic = false } = {}) {
   if (!AI_ENABLED || !text) return '';
   const trimmed = String(text).slice(0, 6000);
@@ -230,6 +252,7 @@ async function translateToEnglish(text, { hint = '', skipHeuristic = false } = {
     }
     return result;
   } catch (e) {
+    _markAiFailure(e);
     console.log(`    ⚠️ translate failed: ${e.message}`);
     return trimmed;
   }
@@ -284,6 +307,7 @@ async function extractFieldsWithAI(text, meta = {}) {
       scopeOfAgreement: (parsed.scopeOfAgreement || '').toString().trim(),
     };
   } catch (e) {
+    _markAiFailure(e);
     console.log(`    ⚠️ AI extract failed: ${e.message.slice(0, 160)}`);
     return {};
   }
@@ -3436,6 +3460,138 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
   }
 }
 
+// --- RETRANSLATE_STALE BACKFILL ----------------------------------------
+// One-shot mode: when env var RETRANSLATE_STALE=1, scan the sheet for rows
+// whose TITLE (col D) or SCOPE (col M) look like non-English strings that
+// snuck through during a prior run when AI was failing (credit balance
+// exhausted, transient 5xx, etc.). Re-run translateToEnglish on just those
+// two columns and patch the cells in place via spreadsheets.values.batchUpdate
+// — does NOT touch other columns (E-L hold organisation/budget/requirements
+// /qualifications/criteria, which would be unsafe to clobber blindly without
+// re-fetching the source notice).
+//
+// On any non-retryable AI error (credits exhausted again, 401/403),
+// the pass aborts immediately so we don't loop pointlessly.
+async function runRetranslateStale(sheets, SHEET_ID, TAB_NAME) {
+  console.log('=== RETRANSLATE_STALE START ===');
+  if (!AI_ENABLED) {
+    console.log('⚠️ AI disabled — cannot translate. Set ANTHROPIC_API_KEY and re-run.');
+    return;
+  }
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${TAB_NAME}!A1:Q`,
+  });
+  const rows = resp.data.values || [];
+  if (rows.length === 0) {
+    console.log('Sheet is empty — nothing to backfill.');
+    return;
+  }
+  const hasHeader = rows[0] && /DATE OF WHEN ADDED/i.test(rows[0][0] || '');
+  const dataStart = hasHeader ? 1 : 0;
+  console.log(`Read ${rows.length} rows (header: ${hasHeader}, data rows: ${rows.length - dataStart})`);
+
+  // Same heuristic family as translateToEnglish: flags rows whose visible
+  // text contains either non-English diacritics or non-English stopwords,
+  // OR contains any non-ASCII byte at all (catches the case where the
+  // string is a single non-English noun phrase with no stopword and no
+  // diacritic — those would slip past otherwise).
+  function looksNonEnglish(s) {
+    if (!s) return false;
+    const trimmed = String(s).trim();
+    if (!trimmed) return false;
+    const hasNonAscii = /[^\x00-\x7F]/.test(trimmed);
+    const hasNonEnglishDiacritic = /[äöüßñçéèêáíóúîôûàèìòùâêîôûãõÿøœæåÄÖÜÑÉÈÊÁÍÓÚÎÔÛÃÕŸØŒÆÅąčęėįšųūžĄČĘĖĮŠŲŪŽćłńóśźżĆŁŃÓŚŹŻďěňřťůýĎĚŇŘŤŮÝĺŕĹŔőűŐŰ]/.test(trimmed);
+    const hasNonEnglishStopword = /\b(?:och|und|der|die|den|das|dem|für|mit|auf|bei|nach|ist|sind|wir|sie|ihr|het|van|een|voor|naar|niet|wel|als|aan|maar|ook|waar|dan|alleen|geen|meer|kan|el|la|los|las|para|del|por|que|con|una|uno|les|pour|sur|avec|sans|dans|sous|dei|delle|della|degli|alla|allo|zur|zum|med|till|fra|men|att|som|inte|eller|ir|su|dėl|kad|yra|kaip|arba|taip|šis|tas|tos|kas|kuris|todėl|prie|po|nuo|iki|w|na|dla|z|ze|nie|jest|się|że|do|oraz|który|przez|przy|jako|lub|jeśli|a|je|ve|by|se|nebo|pokud|však|neboť|vo|zo|sa|alebo|preto|ja|on|ei|et|ka|oma|või|kui|aga|és|az|egy|hogy|vagy|van|nem|csak|már|u|li|nije|ali|ima|kao|samo)\b/i.test(trimmed);
+    return hasNonAscii || hasNonEnglishDiacritic || hasNonEnglishStopword;
+  }
+
+  const updates = []; // pending batchUpdate payload: [{ range, values }]
+  let scanned = 0, candidates = 0, translated = 0;
+  let aborted = false;
+
+  async function flushUpdates(label) {
+    if (!updates.length) return;
+    try {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: SHEET_ID,
+        requestBody: { valueInputOption: 'RAW', data: updates.splice(0) },
+      });
+      console.log(`  💾 flushed ${label} (${translated} cells so far)`);
+    } catch (e) {
+      console.log(`  ⚠️ batchUpdate failed (${label}): ${e.message}`);
+    }
+  }
+
+  for (let i = dataStart; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r) continue;
+    scanned++;
+    const sheetRow = i + 1; // Sheets API rows are 1-indexed
+    const title = (r[3] || '').toString();   // col D — TENDER NAME
+    const scope = (r[12] || '').toString();  // col M — SCOPE OF AGREEMENT
+
+    const titleStale = looksNonEnglish(title);
+    const scopeStale = looksNonEnglish(scope);
+    if (!titleStale && !scopeStale) continue;
+    candidates++;
+
+    // Reset per-row failure flag — _markAiFailure() will re-set it if a
+    // non-retryable error fires.
+    _lastAiNonRetryableError = null;
+
+    if (titleStale) {
+      const titleEn = await translateToEnglish(title, {
+        hint: 'Public tender title',
+        skipHeuristic: true,
+      });
+      if (titleEn && titleEn.trim() !== title.trim()) {
+        updates.push({ range: `${TAB_NAME}!D${sheetRow}`, values: [[titleEn]] });
+        translated++;
+        console.log(`  [${sheetRow}] D: "${title.slice(0, 50)}" → "${titleEn.slice(0, 50)}"`);
+      } else {
+        console.log(`  [${sheetRow}] D: no change (echoed/empty)`);
+      }
+    }
+
+    if (_lastAiNonRetryableError) {
+      console.log(`⛔ AI non-retryable error (${_lastAiNonRetryableError}) — aborting backfill.`);
+      aborted = true;
+      break;
+    }
+
+    if (scopeStale) {
+      const scopeEn = await translateToEnglish(scope, { hint: 'Public tender scope of agreement' });
+      if (scopeEn && scopeEn.trim() !== scope.trim()) {
+        updates.push({ range: `${TAB_NAME}!M${sheetRow}`, values: [[scopeEn]] });
+        translated++;
+        console.log(`  [${sheetRow}] M: scope translated (${scope.length}ch → ${scopeEn.length}ch)`);
+      } else {
+        console.log(`  [${sheetRow}] M: no change (echoed/empty)`);
+      }
+    }
+
+    if (_lastAiNonRetryableError) {
+      console.log(`⛔ AI non-retryable error (${_lastAiNonRetryableError}) — aborting backfill.`);
+      aborted = true;
+      break;
+    }
+
+    // Periodic flush so partial progress survives a crash.
+    if (updates.length >= 50) {
+      await flushUpdates('batch');
+    }
+
+    await new Promise(res => setTimeout(res, 500));
+  }
+
+  // Final flush.
+  await flushUpdates('final');
+
+  console.log('=== RETRANSLATE_STALE DONE ===');
+  console.log(`Scanned: ${scanned}, candidates: ${candidates}, cells translated: ${translated}, aborted: ${aborted}`);
+}
+
 // --- MAIN SCRAPER FUNKCIJA --------------------------------------------
 
 async function runScraper() {
@@ -3470,6 +3626,37 @@ async function runScraper() {
     console.log('');
   } else {
     console.log(`✓ AI enabled (model: ${AI_MODEL})`);
+  }
+
+  // --- RETRANSLATE_STALE EARLY BRANCH ---------------------------------
+  // Backfill-only mode: skip Mercell scraping entirely. Read the sheet,
+  // re-translate stale TITLE/SCOPE cells in place, exit. Doesn't touch
+  // requirements/qualifications/criteria — those need source text we
+  // don't have at backfill time. Trigger with: RETRANSLATE_STALE=1.
+  if (process.env.RETRANSLATE_STALE === '1' || process.env.RETRANSLATE_STALE === 'true') {
+    console.log('=== RETRANSLATE_STALE MODE — backfill only, no scraping ===');
+    if (!AI_ENABLED) {
+      console.log('⚠️ ANTHROPIC_API_KEY missing — cannot translate. Aborting.');
+      return;
+    }
+    if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+      throw new Error('GOOGLE_SERVICE_ACCOUNT_KEY env var is missing');
+    }
+    if (!process.env.GOOGLE_SHEET_ID) {
+      throw new Error('GOOGLE_SHEET_ID env var is missing');
+    }
+    const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+    const jwt = new google.auth.JWT({
+      email: serviceAccount.client_email,
+      key: serviceAccount.private_key,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    await jwt.authorize();
+    const sheets = google.sheets({ version: 'v4', auth: jwt });
+    const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+    const TAB_NAME = process.env.SHEET_TAB_NAME || 'Sheet1';
+    await runRetranslateStale(sheets, SHEET_ID, TAB_NAME);
+    return;
   }
 
   if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
@@ -4277,6 +4464,11 @@ async function runScraper() {
       }
 
       // --- AI ENRICHMENT (translate + extract missing fields) -------
+      // Reset the per-tender AI failure flag — _markAiFailure() will set it
+      // if any AI call hits a non-retryable error (HTTP 400 invalid_request,
+      // 401/403, "credit balance too low"). Checked below before row-write
+      // to DEFER the tender (skip pendingRows.push) so the next run retries.
+      _lastAiNonRetryableError = null;
       if (AI_ENABLED) {
         const dd = toFetch[i].details || {};
         const rawTitle = cleanDescription(dd.title || toFetch[i].title || '');
@@ -4409,6 +4601,16 @@ async function runScraper() {
           await new Promise(r => setTimeout(r, 200));
           continue;
         }
+      }
+
+      // Defer-on-AI-failure: if any AI call hit a non-retryable error
+      // (credit balance, 400/401/403), DO NOT write this row — the AI fields
+      // (title translation, scope, requirements) would be blank/native-language
+      // and once the tenderId is in the sheet it won't be retried.
+      if (_lastAiNonRetryableError) {
+        console.log(`    ⏭️  deferring row — AI failure (will retry next run): ${_lastAiNonRetryableError}`);
+        await new Promise(r => setTimeout(r, 200));
+        continue;
       }
 
       // Build & buffer
