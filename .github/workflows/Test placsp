@@ -1,0 +1,46 @@
+name: Test PLACSP Detection
+
+# Vienkartinis testas — paleidžia test-placsp.js prieš nurodytą
+# contrataciondelestado.es URL'ą ir parodo, kokias anchor'as scraper
+# rastų puslapyje. Naudoti galima per Actions tab → Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'PLACSP detail page URL (palik tuščią — naudos default Laguna de Duero)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install puppeteer
+        run: npm install puppeteer
+
+      - name: Install Chromium dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+            libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64
+
+      - name: Run PLACSP detector
+        run: |
+          if [ -n "${{ inputs.url }}" ]; then
+            node test-placsp.js "${{ inputs.url }}"
+          else
+            node test-placsp.js
+          fi
