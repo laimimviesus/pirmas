@@ -60,21 +60,77 @@ const URL_PATTERNS = [
       console.log(`Navigation warn: ${e.message}`);
     }
 
-    // Wait for body to populate (matches production behaviour).
+    // Wait for body to populate. PLACSP renders portlets via JavaScript
+    // on top of an empty WebSphere shell — first paint is small (~2k
+    // chars), full content arrives 3–8s later. We wait up to 20s for
+    // body to grow past 5000 chars, then scroll to bottom to trigger
+    // any lazy-loaded portlets.
     await page.waitForFunction(
-      () => (document.body?.innerText || '').trim().length > 800,
-      { timeout: 12000 }
+      () => (document.body?.innerText || '').trim().length > 5000,
+      { timeout: 20000 }
     ).catch(() => {});
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+    await new Promise(r => setTimeout(r, 3000));
+    await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
     await new Promise(r => setTimeout(r, 1500));
 
     const result = await page.evaluate((textPatternsRaw, urlPatternsRaw) => {
       const TEXT_PATTERNS = textPatternsRaw.map(p => ({ name: p.name, re: new RegExp(p.re, 'i') }));
       const URL_PATTERNS  = urlPatternsRaw.map(s => new RegExp(s, 'i'));
-      const anchors = Array.from(document.querySelectorAll('a[href]'));
+
+      // Collect anchors from main document AND any same-origin iframes.
+      // PLACSP sometimes wraps the detail portlet in an iframe; without
+      // this we'd never see Pliego anchors that live inside it.
+      const collectFromDoc = (doc) => {
+        try {
+          return Array.from(doc.querySelectorAll('a[href]'));
+        } catch (_) {
+          return [];
+        }
+      };
+      let anchors = collectFromDoc(document);
+      const iframes = Array.from(document.querySelectorAll('iframe'));
+      const iframeInfo = [];
+      for (const f of iframes) {
+        let iframeAnchorCount = 0;
+        let iframeError = '';
+        try {
+          const iframeDoc = f.contentDocument;
+          if (iframeDoc) {
+            const iframeAnchors = collectFromDoc(iframeDoc);
+            iframeAnchorCount = iframeAnchors.length;
+            anchors = anchors.concat(iframeAnchors);
+          } else {
+            iframeError = 'no-contentDocument (cross-origin?)';
+          }
+        } catch (e) {
+          iframeError = e.message;
+        }
+        iframeInfo.push({
+          src: f.getAttribute('src') || '(no src)',
+          anchorCount: iframeAnchorCount,
+          error: iframeError,
+        });
+      }
+
       const allAnchors = anchors.map(a => ({
         text: ((a.textContent || a.getAttribute('title') || '').trim()).slice(0, 120),
         href: a.getAttribute('href') || '',
       }));
+
+      // Search the FULL HTML source for the word "Pliego" so we can
+      // tell whether it exists at all on the page (even if not inside
+      // an <a>).
+      const html = document.documentElement.outerHTML || '';
+      const pliegoHits = [];
+      const pliegoRe = /\b(pliego|cl[aá]usulas\s+administrativas|prescripciones\s+t[eé]cnicas|anuncio\s+de\s+licitaci[oó]n)/gi;
+      let m;
+      while ((m = pliegoRe.exec(html)) !== null && pliegoHits.length < 8) {
+        const idx = m.index;
+        const ctx = html.slice(Math.max(0, idx - 80), Math.min(html.length, idx + 200))
+                        .replace(/\s+/g, ' ');
+        pliegoHits.push(ctx);
+      }
 
       const matches = [];
       for (const a of allAnchors) {
@@ -92,10 +148,13 @@ const URL_PATTERNS = [
         host: location.host,
         url: location.href,
         bodyLength: (document.body?.innerText || '').length,
-        bodyPreview: (document.body?.innerText || '').slice(0, 400),
+        htmlLength: html.length,
+        bodyPreview: (document.body?.innerText || '').slice(0, 800),
         totalAnchors: allAnchors.length,
+        iframes: iframeInfo,
         matches,
-        sample: allAnchors.slice(0, 30),
+        allAnchors,    // full list now, not slice
+        pliegoHits,
       };
     },
     TEXT_PATTERNS.map(p => ({ name: p.name, re: p.re.source })),
@@ -105,11 +164,25 @@ const URL_PATTERNS = [
     console.log(`Final host:   ${result.host}`);
     console.log(`Final URL:    ${result.url}`);
     console.log(`Body length:  ${result.bodyLength} chars`);
+    console.log(`HTML length:  ${result.htmlLength} chars`);
     console.log(`Total anchors: ${result.totalAnchors}`);
+    console.log(`Iframes:      ${result.iframes.length}`);
+    for (const f of result.iframes) {
+      console.log(`  - src=${f.src.slice(0, 100)} anchors=${f.anchorCount} ${f.error ? `err=${f.error}` : ''}`);
+    }
     console.log('');
 
-    console.log('--- BODY PREVIEW (first 400 chars) ---');
+    console.log('--- BODY PREVIEW (first 800 chars) ---');
     console.log(result.bodyPreview.replace(/\s+/g, ' '));
+    console.log('');
+
+    console.log(`--- "Pliego/Cláusulas/..." occurrences in HTML source (${result.pliegoHits.length}) ---`);
+    if (!result.pliegoHits.length) {
+      console.log('  (NONE — the keyword does not appear anywhere in the rendered HTML)');
+    }
+    for (const ctx of result.pliegoHits) {
+      console.log(`  ... ${ctx} ...`);
+    }
     console.log('');
 
     console.log(`--- PRIORITY MATCHES (${result.matches.length}) ---`);
@@ -127,10 +200,11 @@ const URL_PATTERNS = [
     }
     console.log('');
 
-    console.log('--- FIRST 30 ANCHORS (raw sample) ---');
-    for (const a of result.sample) {
+    console.log(`--- ALL ${result.allAnchors.length} ANCHORS (full list) ---`);
+    for (let i = 0; i < result.allAnchors.length; i++) {
+      const a = result.allAnchors[i];
       const t = a.text || '(empty)';
-      console.log(`  "${t.slice(0, 80)}" → ${a.href.slice(0, 100)}`);
+      console.log(`  [${String(i).padStart(2, '0')}] "${t.slice(0, 80)}" → ${a.href.slice(0, 120)}`);
     }
   } finally {
     await browser.close();
