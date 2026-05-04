@@ -870,6 +870,11 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
     // Licitación") with a 15s ceiling. If the wait times out, we still
     // proceed — the URL pattern fallback may catch GetDocumentByIdServlet
     // anchors even without the type cell.
+    // Snapshot for PLACSP — captured RIGHT after portlet renders so a
+    // later step (cookie banner click, navigation, etc.) can't wipe
+    // the document table before main extraction runs. The main eval
+    // below merges this into result.sourceFiles.
+    let placspSnapshot = null;
     if (isPlacspSource) {
       const t0 = Date.now();
       const tipoFound = await srcPage.waitForFunction(() => {
@@ -880,18 +885,85 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         () => document.querySelectorAll('a[href]').length
       ).catch(() => 0);
       console.log(`    🇪🇸 PLACSP portlet wait: tipoDocumento=${tipoFound} (${elapsed}ms), anchors=${anchorCount}`);
+
+      // Capture document anchors NOW — before any further await /
+      // navigation can disturb the DOM. We replicate the same
+      // text+url matching logic the main IIFE does so the snapshot
+      // is interchangeable with placspResult.files.
+      placspSnapshot = await srcPage.evaluate(() => {
+        const ROW_TYPE_RE = [
+          { rank: 0, name: 'PCAP',       re: /pliego\s+cl[aá]usulas\s+administrativas|cl[aá]usulas\s+administrativas\s+particulares/i },
+          { rank: 1, name: 'PPT',        re: /pliego\s+prescripciones\s+t[eé]cnicas|prescripciones\s+t[eé]cnicas\s+particulares/i },
+          { rank: 2, name: 'Pliego',     re: /\bpliego\b/i },
+          { rank: 3, name: 'Anuncio',    re: /anuncio\s+de\s+licitaci[oó]n/i },
+          { rank: 4, name: 'DocPliegos', re: /documento\s+de\s+pliegos/i },
+          { rank: 5, name: 'Decreto',    re: /decreto\s+aprobando\s+(?:el\s+)?pliego/i },
+        ];
+        const URL_RE = [
+          /\/FileSystem\/servlet\/GetDocumentByIdServlet/i,
+          /docAccCmpnt/i,
+          /GetDocumentsById/i,
+        ];
+        const seen = new Set();
+        const out = [];
+        const allAnchors = Array.from(document.querySelectorAll('a[href]'));
+        for (const a of allAnchors) {
+          const hrefRaw = a.getAttribute('href') || '';
+          if (!hrefRaw || /^javascript:/i.test(hrefRaw) || hrefRaw === '#') continue;
+          let abs;
+          try { abs = new URL(hrefRaw, location.href).toString(); }
+          catch (_) { continue; }
+          if (seen.has(abs)) continue;
+          const ownText = (a.textContent || a.getAttribute('title') || '').trim();
+          const row = a.closest('tr');
+          const rowText = row ? (row.innerText || row.textContent || '').replace(/\s+/g, ' ').trim() : '';
+          const urlMatch = URL_RE.some(re => re.test(abs));
+          let chosenType = null;
+          for (const rt of ROW_TYPE_RE) {
+            if (rt.re.test(rowText) || rt.re.test(ownText)) { chosenType = rt; break; }
+          }
+          if (!urlMatch && !chosenType) continue;
+          const finalRank = chosenType ? chosenType.rank : 50;
+          const finalName = chosenType
+            ? `${chosenType.name}: ${(rowText || ownText).slice(0, 100)}`
+            : (ownText || `placsp-doc-${out.length + 1}`).slice(0, 120);
+          seen.add(abs);
+          out.push({
+            url: abs,
+            name: finalName,
+            ext: 'pdf',
+            priority: true,
+            priorityRank: finalRank,
+            matchType: chosenType && urlMatch ? 'text+url' : (chosenType ? 'text' : 'url'),
+          });
+        }
+        out.sort((a, b) => a.priorityRank - b.priorityRank);
+        return { files: out, anchorCountAtSnapshot: allAnchors.length };
+      }).catch(e => ({ files: [], snapshotError: e.message }));
+
+      console.log(`    🇪🇸 PLACSP snapshot: ${placspSnapshot.files.length} document(s), anchorCount=${placspSnapshot.anchorCountAtSnapshot || 0}${placspSnapshot.snapshotError ? `, err=${placspSnapshot.snapshotError}` : ''}`);
+
       // Extra settle time so any tail anchors finish painting.
       await new Promise(r => setTimeout(r, 1500));
     }
 
-    // Bandome uždaryti cookie banner'us, kurie dažnai uždengia turinį
-    await srcPage.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
-      const acc = btns.find(b => /accept|godkänn|godkend|aksepter|hyväksy|akzeptier|accepter|aanvaard|aceptar|accetta/i
-        .test((b.textContent || b.value || '').trim()));
-      acc?.click?.();
-    }).catch(() => {});
-    await new Promise(r => setTimeout(r, 200));
+    // Bandome uždaryti cookie banner'us, kurie dažnai uždengia turinį.
+    //
+    // SKIP for PLACSP — contrataciondelestado.es detail pages contain
+    // anchors with text like "aceptar la cesión" / "aceptar términos"
+    // that match our cookie-accept regex. Clicking them navigates the
+    // page away from the document table (real-world cost: anchors
+    // dropped 65→31, killing PCAP detection). Cookie banners aren't a
+    // concern on PLACSP anyway — it doesn't show one.
+    if (!isPlacspSource) {
+      await srcPage.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
+        const acc = btns.find(b => /accept|godkänn|godkend|aksepter|hyväksy|akzeptier|accepter|aanvaard|aceptar|accetta/i
+          .test((b.textContent || b.value || '').trim()));
+        acc?.click?.();
+      }).catch(() => {});
+      await new Promise(r => setTimeout(r, 200));
+    }
 
     // --- simap.ch INTERESSE-BEKUNDEN HANDLER --------------------------
     //
@@ -1468,6 +1540,19 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         simapInterestClicked: !!simapInterestClicked,
       };
     }, simapInterestClicked);
+
+    // Defense-in-depth: if the early PLACSP snapshot found docs but the
+    // main eval didn't (page state changed in between), use the
+    // snapshot. We prepend; dedupe by URL against existing files.
+    if (placspSnapshot && placspSnapshot.files && placspSnapshot.files.length) {
+      const existingUrls = new Set((result.sourceFiles || []).map(f => f.url));
+      const fromSnapshot = placspSnapshot.files.filter(f => !existingUrls.has(f.url));
+      if (fromSnapshot.length) {
+        result.sourceFiles = [...fromSnapshot, ...(result.sourceFiles || [])].slice(0, 20);
+        result.placspDocsFound = (result.placspDocsFound || 0) + fromSnapshot.length;
+        console.log(`    🇪🇸 PLACSP snapshot rescue: prepended ${fromSnapshot.length} doc(s) the main eval missed`);
+      }
+    }
 
     // --- PRE-FETCH + PARSE source-page document bytes -------------------
     //
