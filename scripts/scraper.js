@@ -1276,44 +1276,45 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       // --- PLACSP (contrataciondelestado.es) PRIORITY HUNT -----------
       //
       // Spanish public procurement portal (Plataforma de Contratación
-      // del Sector Público) lists contract documents as anchors inside
-      // the "Documento de Pliegos" / "Anuncio de Licitación" section.
-      // Those anchor URLs route through a docAccCmpnt servlet and DO
-      // NOT carry a .pdf extension, so the generic extension-based
-      // harvester above misses them entirely. The Pliego de Cláusulas
-      // Administrativas Particulares (PCAP) is what holds qualification
-      // requirements (cl. 11, 14, 15.3.1, 15.3.2 + Cuadro de
-      // Características apartado 15) and the award criteria (apartado
-      // 21) — i.e. exactly the columns we need to populate in the
-      // sheet. We text-match the anchor labels and force ext='pdf' so
-      // the prefetch loop downloads + parses them; the magic-byte
-      // check downstream still verifies the bytes really are a PDF.
-      // PCAP comes first in priority order so per-file/total caps
-      // never starve it of context for the AI extractor.
+      // del Sector Público) lists each tender's documents as anchors
+      // pointing at /FileSystem/servlet/GetDocumentByIdServlet — that
+      // servlet streams the actual PDF (Pliego Cláusulas Administrativas,
+      // Pliego Prescripciones Técnicas, Anuncio de Licitación). The
+      // anchor's visible text is ALWAYS the generic tooltip "Este
+      // documento se abrirá en una nueva ventana" — the document type
+      // (Pliego / Anuncio / Decreto / etc.) lives in a SIBLING
+      // <td class="tipoDocumento"> cell of the same <tr>. We therefore:
+      //   1. URL-match the GetDocumentByIdServlet servlet (catches all
+      //      document anchors regardless of their text)
+      //   2. Read the document type from the closest <tr>'s row text
+      //      so PCAP gets prioritised over Anuncio/Decreto in the
+      //      per-file/total char caps downstream.
+      // PCAP holds qualification requirements (cl. 11, 14, 15.3.1,
+      // 15.3.2 + Cuadro de Características apartado 15) and award
+      // criteria (apartado 21) — i.e. exactly the columns the sheet
+      // needs.
       const placspResult = (() => {
         const isPlacsp = /(^|\.)contrataciondelestado\.es$/i.test(location.host);
         if (!isPlacsp) {
           return { files: [], stats: null };
         }
-        // PASS A — anchor text patterns (Spanish labels). Order = priority.
-        const PRIORITY_RE = [
-          /pliego\b[^<\n]{0,30}cl[aá]usulas\s+administrativas/i,    // PCAP
-          /pliego\b[^<\n]{0,30}prescripciones\s+t[eé]cnicas/i,      // PPT
-          /anuncio\s+de\s+licitaci[oó]n/i,
-          /documento\s+de\s+pliegos/i,
-          /pliego\s+administrativo/i,
-          /cl[aá]usulas\s+administrativas/i,                        // bare PCAP (no "Pliego" prefix)
-          /prescripciones\s+t[eé]cnicas/i,                          // bare PPT
+        // Document-type patterns we look for in the row's <td class=
+        // "tipoDocumento"> cell. Order = priority (lower index wins).
+        const ROW_TYPE_RE = [
+          { rank: 0, name: 'PCAP',       re: /pliego\s+cl[aá]usulas\s+administrativas|cl[aá]usulas\s+administrativas\s+particulares/i },
+          { rank: 1, name: 'PPT',        re: /pliego\s+prescripciones\s+t[eé]cnicas|prescripciones\s+t[eé]cnicas\s+particulares/i },
+          { rank: 2, name: 'Pliego',     re: /\bpliego\b/i },                  // generic "Pliego" — the PCAP-or-bundle case
+          { rank: 3, name: 'Anuncio',    re: /anuncio\s+de\s+licitaci[oó]n/i },
+          { rank: 4, name: 'DocPliegos', re: /documento\s+de\s+pliegos/i },
+          { rank: 5, name: 'Decreto',    re: /decreto\s+aprobando\s+(?:el\s+)?pliego/i },
         ];
-        // PASS B — URL pattern fallback. PLACSP streams every document
-        // download through the same docAccCmpnt servlet (or its
-        // GetDocumentsById variant). Any anchor whose href hits that
-        // endpoint is, by construction, a Pliego/Anuncio/Documento PDF
-        // — even if the visible anchor text is an icon or empty.
+        // PLACSP servlet patterns — these cover all document download
+        // anchors regardless of which sub-portlet generated them.
         const URL_RE = [
-          /docAccCmpnt/i,
-          /GetDocumentsById/i,
-          /uri=deeplink:detalle_(?:pliego|anuncio)/i,
+          /\/FileSystem\/servlet\/GetDocumentByIdServlet/i,    // primary — observed in real DOM
+          /docAccCmpnt/i,                                       // alt variant (older portlets)
+          /GetDocumentsById/i,                                  // alt variant
+          /uri=deeplink:detalle_(?:pliego|anuncio)/i,           // deeplink-style
         ];
 
         const seenPriority = new Set();
@@ -1324,32 +1325,12 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         let urlMatches = 0;
         const sampleTexts = [];
 
-        // PASS A
-        for (let i = 0; i < PRIORITY_RE.length; i++) {
-          const re = PRIORITY_RE[i];
-          for (const a of allAnchors) {
-            const text = (a.textContent || a.getAttribute('title') || '').trim();
-            if (!text || !re.test(text)) continue;
-            const hrefRaw = a.getAttribute('href') || '';
-            if (!hrefRaw || /^javascript:/i.test(hrefRaw) || hrefRaw === '#') continue;
-            let abs;
-            try { abs = new URL(hrefRaw, location.href).toString(); }
-            catch (_) { continue; }
-            if (seenPriority.has(abs)) continue;
-            seenPriority.add(abs);
-            out2.push({
-              url: abs,
-              name: text.slice(0, 120),
-              ext: 'pdf',
-              priority: true,
-              priorityRank: i,
-              matchType: 'text',
-            });
-            textMatches += 1;
-          }
-        }
-
-        // PASS B — URL pattern fallback (broader catch).
+        // For every anchor, check (a) its text, (b) its closest <tr>'s
+        // row text, (c) the URL pattern. If ANY of those identify it as
+        // a PLACSP document, include it. Document type is decided by
+        // matching the row text against ROW_TYPE_RE — that's how we
+        // distinguish PCAP from PPT from Anuncio when all anchors say
+        // "Este documento se abrirá en una nueva ventana".
         for (const a of allAnchors) {
           const hrefRaw = a.getAttribute('href') || '';
           if (!hrefRaw || /^javascript:/i.test(hrefRaw) || hrefRaw === '#') continue;
@@ -1357,19 +1338,53 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
           try { abs = new URL(hrefRaw, location.href).toString(); }
           catch (_) { continue; }
           if (seenPriority.has(abs)) continue;
-          if (!URL_RE.some(re => re.test(abs))) continue;
-          const text = (a.textContent || a.getAttribute('title') || '').trim();
+
+          const ownText = (a.textContent || a.getAttribute('title') || '').trim();
+          const row = a.closest('tr');
+          const rowText = row ? (row.innerText || row.textContent || '').replace(/\s+/g, ' ').trim() : '';
+          const urlMatch = URL_RE.some(re => re.test(abs));
+
+          // Determine document type from row text. Walk ROW_TYPE_RE in
+          // order; first hit wins. If nothing matches the row, fall
+          // back to the anchor's own text (some portlets embed the
+          // document name directly).
+          let chosenType = null;
+          for (const rt of ROW_TYPE_RE) {
+            if (rt.re.test(rowText) || rt.re.test(ownText)) {
+              chosenType = rt;
+              break;
+            }
+          }
+
+          // Skip anchors that are neither URL-matched NOR text-matched.
+          // This filters out navigation / footer / boilerplate links.
+          if (!urlMatch && !chosenType) continue;
+
+          // If we URL-matched but couldn't ID a type, accept anyway
+          // (the anchor still leads to a PLACSP document — better to
+          // grab it than to miss it).
+          const finalRank = chosenType ? chosenType.rank : 50;
+          const finalName = chosenType
+            ? `${chosenType.name}: ${(rowText || ownText).slice(0, 100)}`
+            : (ownText || `placsp-doc-${out2.length + 1}`).slice(0, 120);
+          const matchType = chosenType && urlMatch ? 'text+url'
+                          : chosenType            ? 'text'
+                          :                         'url';
+
           seenPriority.add(abs);
           out2.push({
             url: abs,
-            name: (text || `placsp-doc-${out2.length + 1}`).slice(0, 120),
+            name: finalName,
             ext: 'pdf',
             priority: true,
-            priorityRank: 50,    // lower than text matches (0–6) but above default
-            matchType: 'url',
+            priorityRank: finalRank,
+            matchType,
           });
-          urlMatches += 1;
+          if (chosenType) textMatches += 1;
+          if (urlMatch && !chosenType) urlMatches += 1;
         }
+        // Sort by rank — PCAP first, PPT next, etc.
+        out2.sort((a, b) => a.priorityRank - b.priorityRank);
 
         // Diagnostic sample of first 6 anchor texts so we can see what
         // the page actually looked like when nothing matched.
