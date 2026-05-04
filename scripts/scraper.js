@@ -813,6 +813,28 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
           sourceHost: finalUrl.host,
         };
       }
+      // Dead-site early bail — when the source DNS-fails or the server
+      // never responds, Chrome lands on its built-in error page whose
+      // host is "chromewebdata". Without this guard we'd burn the full
+      // 12s waitForFunction + cookie-banner sleep + per-tender file
+      // prefetch loop on the error page. Real-world cost (run on
+      // 2026-05-04): 134s wasted on a single dead host.
+      const isDeadChromePage = finalUrl.hostname === 'chromewebdata' ||
+        finalUrl.hostname === '' ||
+        srcPage.url().startsWith('chrome-error://');
+      if (isDeadChromePage) {
+        const bodyPreview = await srcPage.evaluate(
+          () => (document.body?.innerText || '').slice(0, 200)
+        ).catch(() => '');
+        console.log(`    source dead — Chrome error page (host: ${finalUrl.hostname || 'empty'}, preview: "${bodyPreview.replace(/\s+/g, ' ').slice(0, 120)}") — skipping`);
+        srcPage.off('request', blockHandler);
+        try { await srcPage.setRequestInterception(false); } catch (_) {}
+        return {
+          skipped: 'dead-site',
+          sourceHost: finalUrl.hostname || 'chromewebdata',
+          error: 'Chrome error page (DNS / connection / timeout)',
+        };
+      }
     } catch (_) {}
 
     // Trumpam palaukti kol renderis stabilizuosis — SPA'oms (pvz., Finnish
