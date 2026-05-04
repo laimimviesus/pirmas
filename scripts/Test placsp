@@ -1,0 +1,141 @@
+// =====================================================================
+// PLACSP standalone tester
+// =====================================================================
+// Run locally:
+//   node test-placsp.js [URL]
+//
+// If no URL given, uses the Laguna de Duero tender from your earlier
+// upload (Expediente 16114/2025). With a URL argument, it processes
+// that one — useful for sanity-checking before deploying scraper.js.
+//
+// What it does:
+//   1. Launches headless Chromium via puppeteer
+//   2. Navigates to the PLACSP detail page
+//   3. Dumps total anchor count, body length, and the EXACT same
+//      regex matching the production scraper does
+//   4. Lists every anchor that matched a text/URL pattern
+//   5. Lists the first 30 anchors as a sample, so if 0 matched you
+//      can see what the page actually had
+//
+// Requires: npm install puppeteer
+// =====================================================================
+
+const puppeteer = require('puppeteer');
+
+const DEFAULT_URL =
+  'https://contrataciondelestado.es/wps/poc?uri=deeplink:detalle_licitacion&idEvl=cD43%2F%2Bhd4N7mnwcj%2BxbdTg%3D%3D';
+
+const TEST_URL = process.argv[2] || DEFAULT_URL;
+
+const TEXT_PATTERNS = [
+  { name: 'PCAP',    re: /pliego\b[^<\n]{0,30}cl[aá]usulas\s+administrativas/i },
+  { name: 'PPT',     re: /pliego\b[^<\n]{0,30}prescripciones\s+t[eé]cnicas/i },
+  { name: 'Anuncio', re: /anuncio\s+de\s+licitaci[oó]n/i },
+  { name: 'DocPliegos', re: /documento\s+de\s+pliegos/i },
+  { name: 'PliegoAdm',  re: /pliego\s+administrativo/i },
+  { name: 'BareCl', re: /cl[aá]usulas\s+administrativas/i },
+  { name: 'BarePT', re: /prescripciones\s+t[eé]cnicas/i },
+];
+const URL_PATTERNS = [
+  /docAccCmpnt/i,
+  /GetDocumentsById/i,
+  /uri=deeplink:detalle_(?:pliego|anuncio)/i,
+];
+
+(async () => {
+  console.log(`Fetching: ${TEST_URL}\n`);
+
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setDefaultNavigationTimeout(25000);
+
+    try {
+      await page.goto(TEST_URL, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    } catch (e) {
+      console.log(`Navigation warn: ${e.message}`);
+    }
+
+    // Wait for body to populate (matches production behaviour).
+    await page.waitForFunction(
+      () => (document.body?.innerText || '').trim().length > 800,
+      { timeout: 12000 }
+    ).catch(() => {});
+    await new Promise(r => setTimeout(r, 1500));
+
+    const result = await page.evaluate((textPatternsRaw, urlPatternsRaw) => {
+      const TEXT_PATTERNS = textPatternsRaw.map(p => ({ name: p.name, re: new RegExp(p.re, 'i') }));
+      const URL_PATTERNS  = urlPatternsRaw.map(s => new RegExp(s, 'i'));
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      const allAnchors = anchors.map(a => ({
+        text: ((a.textContent || a.getAttribute('title') || '').trim()).slice(0, 120),
+        href: a.getAttribute('href') || '',
+      }));
+
+      const matches = [];
+      for (const a of allAnchors) {
+        let textHits = [];
+        for (const p of TEXT_PATTERNS) {
+          if (p.re.test(a.text)) textHits.push(p.name);
+        }
+        let urlHit = URL_PATTERNS.some(re => re.test(a.href));
+        if (textHits.length || urlHit) {
+          matches.push({ ...a, textHits, urlHit });
+        }
+      }
+
+      return {
+        host: location.host,
+        url: location.href,
+        bodyLength: (document.body?.innerText || '').length,
+        bodyPreview: (document.body?.innerText || '').slice(0, 400),
+        totalAnchors: allAnchors.length,
+        matches,
+        sample: allAnchors.slice(0, 30),
+      };
+    },
+    TEXT_PATTERNS.map(p => ({ name: p.name, re: p.re.source })),
+    URL_PATTERNS.map(re => re.source));
+
+    console.log('--- PAGE STATE ---');
+    console.log(`Final host:   ${result.host}`);
+    console.log(`Final URL:    ${result.url}`);
+    console.log(`Body length:  ${result.bodyLength} chars`);
+    console.log(`Total anchors: ${result.totalAnchors}`);
+    console.log('');
+
+    console.log('--- BODY PREVIEW (first 400 chars) ---');
+    console.log(result.bodyPreview.replace(/\s+/g, ' '));
+    console.log('');
+
+    console.log(`--- PRIORITY MATCHES (${result.matches.length}) ---`);
+    if (!result.matches.length) {
+      console.log('  (none — neither text nor URL patterns matched any anchor)');
+    }
+    for (const m of result.matches) {
+      const tags = [
+        ...m.textHits.map(t => `[T:${t}]`),
+        m.urlHit ? '[URL]' : '',
+      ].filter(Boolean).join(' ');
+      console.log(`  ${tags}`);
+      console.log(`     text: "${m.text}"`);
+      console.log(`     href: ${m.href.slice(0, 200)}`);
+    }
+    console.log('');
+
+    console.log('--- FIRST 30 ANCHORS (raw sample) ---');
+    for (const a of result.sample) {
+      const t = a.text || '(empty)';
+      console.log(`  "${t.slice(0, 80)}" → ${a.href.slice(0, 100)}`);
+    }
+  } finally {
+    await browser.close();
+  }
+})().catch((e) => {
+  console.error('FATAL:', e);
+  process.exit(1);
+});
