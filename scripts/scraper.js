@@ -778,11 +778,28 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
     await srcPage.setDefaultNavigationTimeout(SOURCE_NAV_TIMEOUT);
     await srcPage.setDefaultTimeout(SOURCE_NAV_TIMEOUT);
 
-    // Block heavy resources
+    // Detect PLACSP source URLs ahead of interception so we can keep
+    // stylesheets enabled — the IBM WebSphere portal that PLACSP uses
+    // ships portlet rendering logic in CSS-coupled scripts; aborting
+    // stylesheets leaves the documents table un-rendered (real-world
+    // run on 2026-05-04 returned only the 6-language welcome banner +
+    // 31 nav anchors instead of the full 63 with Pliego links).
+    const isPlacspSource = (() => {
+      try { return /(^|\.)contrataciondelestado\.es$/i.test(new URL(sourceUrl).hostname); }
+      catch (_) { return false; }
+    })();
+    if (isPlacspSource) {
+      console.log(`    🇪🇸 PLACSP host detected — keeping stylesheets/fonts enabled for full portlet render`);
+    }
+
+    // Block heavy resources (skip for PLACSP — see comment above).
     await srcPage.setRequestInterception(true);
     const blockHandler = (req) => {
       const type = req.resourceType();
-      if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+      const blocked = isPlacspSource
+        ? ['image', 'media']                              // minimal block — keep CSS+fonts
+        : ['image', 'media', 'font', 'stylesheet'];       // default — block all heavy
+      if (blocked.includes(type)) {
         req.abort();
       } else {
         req.continue();
@@ -844,6 +861,28 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       return t.length > 800;
     }, { timeout: 12000 }).catch(() => {});
     await new Promise(r => setTimeout(r, 1200));
+
+    // PLACSP portlets load asynchronously via AJAX — the 800-char body
+    // threshold above resolves on the welcome banner alone (Bienvenidos
+    // / Ongi Etorri / etc.), well before the documents table appears.
+    // Wait specifically for `td.tipoDocumento` (the cell that holds
+    // each document's type label, e.g. "Pliego" / "Anuncio de
+    // Licitación") with a 15s ceiling. If the wait times out, we still
+    // proceed — the URL pattern fallback may catch GetDocumentByIdServlet
+    // anchors even without the type cell.
+    if (isPlacspSource) {
+      const t0 = Date.now();
+      const tipoFound = await srcPage.waitForFunction(() => {
+        return document.querySelector('td.tipoDocumento, .tipoDocumento') !== null;
+      }, { timeout: 15000 }).then(() => true).catch(() => false);
+      const elapsed = Date.now() - t0;
+      const anchorCount = await srcPage.evaluate(
+        () => document.querySelectorAll('a[href]').length
+      ).catch(() => 0);
+      console.log(`    🇪🇸 PLACSP portlet wait: tipoDocumento=${tipoFound} (${elapsed}ms), anchors=${anchorCount}`);
+      // Extra settle time so any tail anchors finish painting.
+      await new Promise(r => setTimeout(r, 1500));
+    }
 
     // Bandome uždaryti cookie banner'us, kurie dažnai uždengia turinį
     await srcPage.evaluate(() => {
