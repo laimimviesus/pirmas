@@ -1268,20 +1268,41 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       // check downstream still verifies the bytes really are a PDF.
       // PCAP comes first in priority order so per-file/total caps
       // never starve it of context for the AI extractor.
-      const placspFiles = (() => {
+      const placspResult = (() => {
         const isPlacsp = /(^|\.)contrataciondelestado\.es$/i.test(location.host);
-        if (!isPlacsp) return [];
-        // Order = priority. PCAP MUST come first.
+        if (!isPlacsp) {
+          return { files: [], stats: null };
+        }
+        // PASS A — anchor text patterns (Spanish labels). Order = priority.
         const PRIORITY_RE = [
           /pliego\b[^<\n]{0,30}cl[aá]usulas\s+administrativas/i,    // PCAP
           /pliego\b[^<\n]{0,30}prescripciones\s+t[eé]cnicas/i,      // PPT
           /anuncio\s+de\s+licitaci[oó]n/i,
           /documento\s+de\s+pliegos/i,
           /pliego\s+administrativo/i,
+          /cl[aá]usulas\s+administrativas/i,                        // bare PCAP (no "Pliego" prefix)
+          /prescripciones\s+t[eé]cnicas/i,                          // bare PPT
         ];
+        // PASS B — URL pattern fallback. PLACSP streams every document
+        // download through the same docAccCmpnt servlet (or its
+        // GetDocumentsById variant). Any anchor whose href hits that
+        // endpoint is, by construction, a Pliego/Anuncio/Documento PDF
+        // — even if the visible anchor text is an icon or empty.
+        const URL_RE = [
+          /docAccCmpnt/i,
+          /GetDocumentsById/i,
+          /uri=deeplink:detalle_(?:pliego|anuncio)/i,
+        ];
+
         const seenPriority = new Set();
         const out2 = [];
         const allAnchors = Array.from(document.querySelectorAll('a[href]'));
+        const totalAnchors = allAnchors.length;
+        let textMatches = 0;
+        let urlMatches = 0;
+        const sampleTexts = [];
+
+        // PASS A
         for (let i = 0; i < PRIORITY_RE.length; i++) {
           const re = PRIORITY_RE[i];
           for (const a of allAnchors) {
@@ -1299,12 +1320,49 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
               name: text.slice(0, 120),
               ext: 'pdf',
               priority: true,
-              priorityRank: i,    // 0 = PCAP, lower wins
+              priorityRank: i,
+              matchType: 'text',
             });
+            textMatches += 1;
           }
         }
-        return out2;
+
+        // PASS B — URL pattern fallback (broader catch).
+        for (const a of allAnchors) {
+          const hrefRaw = a.getAttribute('href') || '';
+          if (!hrefRaw || /^javascript:/i.test(hrefRaw) || hrefRaw === '#') continue;
+          let abs;
+          try { abs = new URL(hrefRaw, location.href).toString(); }
+          catch (_) { continue; }
+          if (seenPriority.has(abs)) continue;
+          if (!URL_RE.some(re => re.test(abs))) continue;
+          const text = (a.textContent || a.getAttribute('title') || '').trim();
+          seenPriority.add(abs);
+          out2.push({
+            url: abs,
+            name: (text || `placsp-doc-${out2.length + 1}`).slice(0, 120),
+            ext: 'pdf',
+            priority: true,
+            priorityRank: 50,    // lower than text matches (0–6) but above default
+            matchType: 'url',
+          });
+          urlMatches += 1;
+        }
+
+        // Diagnostic sample of first 6 anchor texts so we can see what
+        // the page actually looked like when nothing matched.
+        for (const a of allAnchors.slice(0, 30)) {
+          const t = (a.textContent || '').trim().slice(0, 80);
+          if (t) sampleTexts.push(t);
+          if (sampleTexts.length >= 6) break;
+        }
+
+        return {
+          files: out2,
+          stats: { totalAnchors, textMatches, urlMatches, sampleTexts },
+        };
       })();
+      const placspFiles = placspResult.files;
 
       // Merge PLACSP priority docs at the FRONT of the file list, drop
       // duplicates from the generic harvest. Cap the combined list at
@@ -1330,6 +1388,7 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         bodyTextPreview: bodyText.slice(0, 600),
         sourceFiles: sourceFilesMerged,
         placspDocsFound: placspFiles.length,
+        placspStats: placspResult.stats,
         simapInterestClicked: !!simapInterestClicked,
       };
     }, simapInterestClicked);
@@ -1449,43 +1508,127 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
           return '';
         };
 
+        // --- PDF ANNOTATION URI EXTRACTOR ----------------------------
+        //
+        // PLACSP "Documento de Pliegos" PDFs embed clickable hyperlinks
+        // (e.g. anchor "Pliego Cláusulas Administrativas" → real PCAP
+        // PDF) as PDF link annotations. pdf-parse only returns rendered
+        // text, so the URLs are invisible in `parsed.text`. We scan the
+        // raw buffer for `/URI (https://...)` annotation entries — works
+        // for uncompressed object streams (which PLACSP-generated PDFs
+        // typically have). FlateDecode-compressed PDFs would hide them;
+        // those need pdf-lib, but in practice the gov-issued PLACSP
+        // bundles ship uncompressed annotations.
+        const extractPdfAnnotationUrls = (bytes) => {
+          if (!bytes || !bytes.length) return [];
+          let raw;
+          try { raw = bytes.toString('latin1'); }
+          catch (_) { return []; }
+          const out = new Set();
+          const re = /\/URI\s*\(([^)]{8,500})\)/g;
+          let m;
+          while ((m = re.exec(raw)) !== null) {
+            // PDF strings can be padded with whitespace and may contain
+            // escaped chars — strip the obvious ones.
+            const url = m[1].replace(/\\([rnt()\\])/g, ' ').trim();
+            if (/^https?:\/\//i.test(url)) out.add(url);
+          }
+          return Array.from(out);
+        };
+        // Recognise the URL patterns that PLACSP uses for PCAP / Pliego
+        // downloads. Anchor text "Pliego Cláusulas Administrativas"
+        // typically links to a `docAccCmpnt` servlet URL with a
+        // DocumentIdParam query param. We also accept any URL that
+        // mentions "Pliego" or "Cláusulas" outright.
+        const isPlacspPliegoUrl = (url) => {
+          if (!url) return false;
+          if (!/contrataciondelestado\.es/i.test(url)) return false;
+          return /docAccCmpnt|GetDocumentsById|cl[aá]usulas|pliego/i.test(url);
+        };
+
+        // Track URLs we've already fetched so we don't loop on
+        // self-referencing PDFs (the "Documento de Pliegos" sometimes
+        // includes its own link, etc.).
+        const fetchedUrls = new Set();
+
+        // Inner helper: fetch + parse one URL, append text to docTexts,
+        // return the buffer so callers can mine annotations.
+        const fetchParseOne = async (sf, capOverride) => {
+          if (fetchedUrls.has(sf.url)) return { skipped: true };
+          fetchedUrls.add(sf.url);
+          const fetched = await srcPage.evaluate(async (url) => {
+            try {
+              const r = await fetch(url, { credentials: 'include' });
+              const ct = r.headers.get('content-type') || '';
+              if (!r.ok) return { ok: false, status: r.status, contentType: ct };
+              const buf = await r.arrayBuffer();
+              const arr = Array.from(new Uint8Array(buf));
+              return { ok: true, status: r.status, contentType: ct, data: arr, size: arr.length };
+            } catch (e) {
+              return { ok: false, error: String(e) };
+            }
+          }, sf.url);
+          if (!(fetched && fetched.ok && fetched.size > 100)) {
+            const tail = fetched ? `status=${fetched.status || '?'}, ct=${(fetched.contentType || '').slice(0, 40)}` : 'no-response';
+            console.log(`    ⚠️ src fetch failed "${sf.name}" (${tail})`);
+            return { error: 'fetch-failed' };
+          }
+          const buf = Buffer.from(fetched.data);
+          const text = await parseBuf(sf.name, sf.ext, buf);
+          if (text) {
+            const perFileCap = capOverride
+              || (sf.priority ? SRC_DOC_CHAR_CAP_PRIORITY : SRC_DOC_CHAR_CAP_DEFAULT);
+            const clipped = text.slice(0, perFileCap);
+            docTexts.push(`--- (source) ${sf.name} ---\n${clipped}`);
+            totalChars += clipped.length;
+            okCount += 1;
+            const tag = sf.priority ? '⭐ PRIORITY' : '📄';
+            console.log(`    ${tag} parsed source ${String(sf.ext).toUpperCase()} "${sf.name}" (${buf.length}B → ${clipped.length}ch${sf.priority ? `, cap=${perFileCap}` : ''})`);
+          } else {
+            console.log(`    ⚠️ src ${String(sf.ext).toUpperCase()} "${sf.name}" had no extractable text`);
+          }
+          return { buf, hadText: !!text };
+        };
+
         const docTexts = [];
         let okCount = 0;
         let totalChars = 0;
+
+        // PASS 1 — fetch + parse the original sourceFiles (PLACSP
+        // priority docs first thanks to the front-of-array merge).
         for (const sf of result.sourceFiles.slice(0, MAX_SRC_FILES)) {
           if (totalChars >= SRC_TOTAL_CHAR_CAP) break;
           try {
-            const fetched = await srcPage.evaluate(async (url) => {
-              try {
-                const r = await fetch(url, { credentials: 'include' });
-                const ct = r.headers.get('content-type') || '';
-                if (!r.ok) return { ok: false, status: r.status, contentType: ct };
-                const buf = await r.arrayBuffer();
-                const arr = Array.from(new Uint8Array(buf));
-                return { ok: true, status: r.status, contentType: ct, data: arr, size: arr.length };
-              } catch (e) {
-                return { ok: false, error: String(e) };
+            const r1 = await fetchParseOne(sf);
+            if (r1.skipped || r1.error || !r1.buf) continue;
+
+            // PASS 2 — when this PDF was a PLACSP priority doc (e.g.
+            // "Documento de Pliegos"), mine its link annotations for an
+            // embedded PCAP URL and follow it. Cap recursion at 1 hop.
+            if (sf.priority && sf.ext === 'pdf' && /(^|\.)contrataciondelestado\.es$/i.test(result.sourceHost || '')) {
+              const innerUrls = extractPdfAnnotationUrls(r1.buf);
+              const candidates = innerUrls
+                .filter(isPlacspPliegoUrl)
+                .filter(u => !fetchedUrls.has(u));
+              if (innerUrls.length) {
+                console.log(`    🔗 PDF "${sf.name}" embedded ${innerUrls.length} URL(s); ${candidates.length} match PCAP/Pliego pattern`);
               }
-            }, sf.url);
-            if (!(fetched && fetched.ok && fetched.size > 100)) {
-              const tail = fetched ? `status=${fetched.status || '?'}, ct=${(fetched.contentType || '').slice(0, 40)}` : 'no-response';
-              console.log(`    ⚠️ src fetch failed "${sf.name}" (${tail})`);
-              continue;
-            }
-            const buf = Buffer.from(fetched.data);
-            const text = await parseBuf(sf.name, sf.ext, buf);
-            if (text) {
-              const perFileCap = sf.priority
-                ? SRC_DOC_CHAR_CAP_PRIORITY
-                : SRC_DOC_CHAR_CAP_DEFAULT;
-              const clipped = text.slice(0, perFileCap);
-              docTexts.push(`--- (source) ${sf.name} ---\n${clipped}`);
-              totalChars += clipped.length;
-              okCount += 1;
-              const tag = sf.priority ? '⭐ PRIORITY' : '📄';
-              console.log(`    ${tag} parsed source ${String(sf.ext).toUpperCase()} "${sf.name}" (${buf.length}B → ${clipped.length}ch${sf.priority ? `, cap=${perFileCap}` : ''})`);
-            } else {
-              console.log(`    ⚠️ src ${String(sf.ext).toUpperCase()} "${sf.name}" had no extractable text`);
+              // Heuristic: prefer URLs whose surrounding raw bytes
+              // mention "Cláusulas Administrativas" (PCAP). We can't do
+              // proper context-anchoring without a real PDF parser, so
+              // we just pull at most 3 candidates and let pdf-parse
+              // tell us which one had real PCAP body via char count.
+              for (const url of candidates.slice(0, 3)) {
+                if (totalChars >= SRC_TOTAL_CHAR_CAP) break;
+                console.log(`    ↳ following embedded link: ${url.slice(0, 100)}`);
+                await fetchParseOne({
+                  url,
+                  name: 'PCAP (embedded link from Documento de Pliegos)',
+                  ext: 'pdf',
+                  priority: true,
+                  fromAnnotation: true,
+                });
+              }
             }
           } catch (e) {
             console.log(`    ⚠️ src file "${sf.name}" error: ${e.message}`);
@@ -1494,7 +1637,7 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         if (docTexts.length) {
           result.sourceFilesText = docTexts.join('\n\n').slice(0, SRC_TOTAL_CHAR_CAP);
         }
-        console.log(`    source files prefetched/parsed: ${okCount}/${result.sourceFiles.length} (host: ${result.sourceHost})`);
+        console.log(`    source files prefetched/parsed: ${okCount}/${result.sourceFiles.length} (host: ${result.sourceHost})${fetchedUrls.size > result.sourceFiles.length ? `, +${fetchedUrls.size - result.sourceFiles.length} via embedded annotations` : ''}`);
         // Trim raw bytes from result (we no longer need them to leave the helper)
         result.sourceFiles = result.sourceFiles.map(sf => ({
           name: sf.name, ext: sf.ext, url: sf.url,
@@ -3432,6 +3575,16 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       const src = await fetchSourcePageDetails(browser, details.sourceUrl);
       const elapsed = Date.now() - t0;
       console.log(`    source done in ${elapsed}ms (host: ${src?.sourceHost || 'n/a'}, err: ${src?.error || 'none'}${src?.skipped ? ', skipped: ' + src.skipped : ''}${src?.placspDocsFound ? `, placsp=${src.placspDocsFound}` : ''})`);
+
+      // PLACSP-specific diagnostic so we can see why 0 priority docs
+      // were found on contrataciondelestado.es pages even when the
+      // detail page rendered. Shows total anchors, text-pattern hits,
+      // url-pattern hits, plus a sample of first 6 anchor texts.
+      if (src?.placspStats) {
+        const ps = src.placspStats;
+        const sample = (ps.sampleTexts || []).map(t => `"${t}"`).join(', ');
+        console.log(`    🇪🇸 PLACSP stats: anchors=${ps.totalAnchors}, textMatches=${ps.textMatches}, urlMatches=${ps.urlMatches}; sample=[${sample}]`);
+      }
 
       if (src?.skipped) {
         // Mercell-internis permalink'as — nefetchinam, tik paliekam žymę.
