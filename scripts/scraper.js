@@ -301,9 +301,9 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- maxBudget: total ceiling / max contract value AS STATED in the tender or attached docs (with currency code, ex-VAT if specified). Examples: "1,200,000 EUR (ex VAT)", "8 500 000 SEK". Empty string if not explicitly stated anywhere.\n' +
     '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND the description/documents give enough basis (scope, deliverables, duration, country, complexity). Use realistic public-sector IT contract rates for that country. Output a plain integer like 850000 (no separators, no currency, no words). Empty string if you cannot estimate responsibly.\n' +
     '- duration: contract length in months or years. Example: "36 months" or "2 years + 2 x 1 year option". Empty string if not stated.\n' +
-    '- requirementsForSupplier: bullet-style summary (≤400 chars) of MANDATORY supplier/bidder requirements (legal status, insurance, ISO certifications, security clearance, technical staff, financial standing). Look in DOCUMENTS for sections titled "Requirements", "Mandatory requirements", "Reikalavimai tiekėjui", "Wymagania", "Anforderungen an den Bieter", "Krav til leverandør", "Eisen aan inschrijver", "Exigences", "Requisitos". Empty string if truly absent.\n' +
-    '- qualificationRequirements: bullet-style summary (≤400 chars) of SELECTION / qualification criteria (turnover thresholds, references, past similar projects, team CVs, certifications). Look for "Selection criteria", "Qualification", "Kvalifikaciniai reikalavimai", "Kwalifikacja", "Eignungskriterien", "Kvalifikasjonskrav". Empty string if truly absent.\n' +
-    '- offerWeighingCriteria: award criteria with weights if present. Example: "Price 40%, Quality 35%, Delivery time 25%" or "MEAT — lowest price". Look for "Award criteria", "Evaluation", "Vertinimo kriterijai", "Kryteria oceny", "Zuschlagskriterien", "Tildelingskriterier". Empty string if truly absent.\n' +
+    '- requirementsForSupplier: bullet-style summary (≤400 chars) of MANDATORY supplier/bidder requirements (legal status, insurance, ISO certifications, security clearance, technical staff, financial standing). Look in DOCUMENTS for sections titled "Requirements", "Mandatory requirements", "Reikalavimai tiekėjui", "Wymagania", "Anforderungen an den Bieter", "Krav til leverandør", "Eisen aan inschrijver", "Exigences", "Requisitos", "Condiciones de admisión", "Requisitos de participación de los licitadores", "Aptitud para contratar". Empty string if truly absent.\n' +
+    '- qualificationRequirements: bullet-style summary (≤400 chars) of SELECTION / qualification criteria (turnover thresholds, references, past similar projects, team CVs, certifications). Look for "Selection criteria", "Qualification", "Kvalifikaciniai reikalavimai", "Kwalifikacja", "Eignungskriterien", "Kvalifikasjonskrav", "Solvencia económica, financiera y técnica", "Solvencia técnica o profesional", "Solvencia económica y financiera", "Criterio de Solvencia Técnica-Profesional", "Criterio de Solvencia Económica-Financiera", "Cláusula 11", "Cláusula 14", "Cláusula 15", "Apartado 15", "Cuadro de Características" (PLACSP/Spanish PCAP docs put hard numbers — minimum annual turnover, mandatory ISO/ENS/ENI/SARA-PdP certificates, references for similar projects of size >X — under those exact headings). Empty string if truly absent.\n' +
+    '- offerWeighingCriteria: award criteria with weights if present. Example: "Price 40%, Quality 35%, Delivery time 25%" or "MEAT — lowest price". Look for "Award criteria", "Evaluation", "Vertinimo kriterijai", "Kryteria oceny", "Zuschlagskriterien", "Tildelingskriterier", "Criterios de adjudicación", "Criterios evaluables mediante aplicación de fórmulas", "Criterios evaluables mediante un juicio de valor", "Apartado 21", "Ponderación". When weights add up to 100, list each named criterion with its weight. Empty string if truly absent.\n' +
     '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English.\n' +
     'Write all field values in English even if the source is in another language. Never invent specifics — but DO synthesize when documents clearly imply requirements (e.g., "ISO 27001 certificate" listed under "Mandatory documents" → include in requirementsForSupplier). If a field is genuinely not present, use an empty string.';
   const metaLine = [
@@ -1251,6 +1251,71 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         return out;
       })();
 
+      // --- PLACSP (contrataciondelestado.es) PRIORITY HUNT -----------
+      //
+      // Spanish public procurement portal (Plataforma de Contratación
+      // del Sector Público) lists contract documents as anchors inside
+      // the "Documento de Pliegos" / "Anuncio de Licitación" section.
+      // Those anchor URLs route through a docAccCmpnt servlet and DO
+      // NOT carry a .pdf extension, so the generic extension-based
+      // harvester above misses them entirely. The Pliego de Cláusulas
+      // Administrativas Particulares (PCAP) is what holds qualification
+      // requirements (cl. 11, 14, 15.3.1, 15.3.2 + Cuadro de
+      // Características apartado 15) and the award criteria (apartado
+      // 21) — i.e. exactly the columns we need to populate in the
+      // sheet. We text-match the anchor labels and force ext='pdf' so
+      // the prefetch loop downloads + parses them; the magic-byte
+      // check downstream still verifies the bytes really are a PDF.
+      // PCAP comes first in priority order so per-file/total caps
+      // never starve it of context for the AI extractor.
+      const placspFiles = (() => {
+        const isPlacsp = /(^|\.)contrataciondelestado\.es$/i.test(location.host);
+        if (!isPlacsp) return [];
+        // Order = priority. PCAP MUST come first.
+        const PRIORITY_RE = [
+          /pliego\b[^<\n]{0,30}cl[aá]usulas\s+administrativas/i,    // PCAP
+          /pliego\b[^<\n]{0,30}prescripciones\s+t[eé]cnicas/i,      // PPT
+          /anuncio\s+de\s+licitaci[oó]n/i,
+          /documento\s+de\s+pliegos/i,
+          /pliego\s+administrativo/i,
+        ];
+        const seenPriority = new Set();
+        const out2 = [];
+        const allAnchors = Array.from(document.querySelectorAll('a[href]'));
+        for (let i = 0; i < PRIORITY_RE.length; i++) {
+          const re = PRIORITY_RE[i];
+          for (const a of allAnchors) {
+            const text = (a.textContent || a.getAttribute('title') || '').trim();
+            if (!text || !re.test(text)) continue;
+            const hrefRaw = a.getAttribute('href') || '';
+            if (!hrefRaw || /^javascript:/i.test(hrefRaw) || hrefRaw === '#') continue;
+            let abs;
+            try { abs = new URL(hrefRaw, location.href).toString(); }
+            catch (_) { continue; }
+            if (seenPriority.has(abs)) continue;
+            seenPriority.add(abs);
+            out2.push({
+              url: abs,
+              name: text.slice(0, 120),
+              ext: 'pdf',
+              priority: true,
+              priorityRank: i,    // 0 = PCAP, lower wins
+            });
+          }
+        }
+        return out2;
+      })();
+
+      // Merge PLACSP priority docs at the FRONT of the file list, drop
+      // duplicates from the generic harvest. Cap the combined list at
+      // 20 entries (same as before) so the prefetch loop terminates.
+      const sourceFilesMerged = (() => {
+        if (!placspFiles.length) return sourceFiles;
+        const priorityUrls = new Set(placspFiles.map(f => f.url));
+        const generic = sourceFiles.filter(f => !priorityUrls.has(f.url));
+        return [...placspFiles, ...generic].slice(0, 20);
+      })();
+
       return {
         maxBudget,
         duration,
@@ -1263,7 +1328,8 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         sourceTitle: document.querySelector('h1')?.innerText?.trim() || null,
         sourceHost: location.host,
         bodyTextPreview: bodyText.slice(0, 600),
-        sourceFiles,
+        sourceFiles: sourceFilesMerged,
+        placspDocsFound: placspFiles.length,
         simapInterestClicked: !!simapInterestClicked,
       };
     }, simapInterestClicked);
@@ -1281,9 +1347,24 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
     // `details.pdfText` without needing to know about the source domain.
     try {
       if (Array.isArray(result?.sourceFiles) && result.sourceFiles.length) {
+        const hasPriority = result.sourceFiles.some(f => f && f.priority);
+        if (result.placspDocsFound) {
+          console.log(`    🇪🇸 PLACSP: ${result.placspDocsFound} priority document(s) detected (PCAP/PPT/Anuncio) — bumping char caps`);
+        }
         const MAX_SRC_FILES = 8;
-        const SRC_DOC_CHAR_CAP = 30000;       // per-file
-        const SRC_TOTAL_CHAR_CAP = 80000;     // across all source files
+        // PLACSP PCAP files routinely run 40-50 pages (≈100k chars) and
+        // hold the qualification + award-criteria sections we need to
+        // extract. Bump per-file cap from 30k→60k and total from
+        // 80k→140k whenever any priority file is in the queue, so the
+        // AI prompt actually sees Apartado 15 / 21 / 31 of the
+        // Cuadro de Características (which sit deep in the PCAP body).
+        const SRC_DOC_CHAR_CAP_DEFAULT  = 30000;       // per non-priority file
+        const SRC_DOC_CHAR_CAP_PRIORITY = 60000;       // per PLACSP priority file
+        const SRC_TOTAL_CHAR_CAP        = hasPriority ? 140000 : 80000;
+        // Keep legacy name `SRC_DOC_CHAR_CAP` for the inner zip recursion
+        // — for zip entries we always use the default cap, since priority
+        // PCAP/PPT docs themselves are PDFs, not zips.
+        const SRC_DOC_CHAR_CAP = SRC_DOC_CHAR_CAP_DEFAULT;
         // Lazy-load optional deps; missing ones just degrade per-format.
         let pdfParse2 = null, mammoth2 = null, XLSX2 = null, AdmZip2 = null;
         try { pdfParse2 = require('pdf-parse'); } catch (_) {}
@@ -1394,11 +1475,15 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
             const buf = Buffer.from(fetched.data);
             const text = await parseBuf(sf.name, sf.ext, buf);
             if (text) {
-              const clipped = text.slice(0, SRC_DOC_CHAR_CAP);
+              const perFileCap = sf.priority
+                ? SRC_DOC_CHAR_CAP_PRIORITY
+                : SRC_DOC_CHAR_CAP_DEFAULT;
+              const clipped = text.slice(0, perFileCap);
               docTexts.push(`--- (source) ${sf.name} ---\n${clipped}`);
               totalChars += clipped.length;
               okCount += 1;
-              console.log(`    📄 parsed source ${String(sf.ext).toUpperCase()} "${sf.name}" (${buf.length}B → ${clipped.length}ch)`);
+              const tag = sf.priority ? '⭐ PRIORITY' : '📄';
+              console.log(`    ${tag} parsed source ${String(sf.ext).toUpperCase()} "${sf.name}" (${buf.length}B → ${clipped.length}ch${sf.priority ? `, cap=${perFileCap}` : ''})`);
             } else {
               console.log(`    ⚠️ src ${String(sf.ext).toUpperCase()} "${sf.name}" had no extractable text`);
             }
@@ -3346,7 +3431,7 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       const t0 = Date.now();
       const src = await fetchSourcePageDetails(browser, details.sourceUrl);
       const elapsed = Date.now() - t0;
-      console.log(`    source done in ${elapsed}ms (host: ${src?.sourceHost || 'n/a'}, err: ${src?.error || 'none'}${src?.skipped ? ', skipped: ' + src.skipped : ''})`);
+      console.log(`    source done in ${elapsed}ms (host: ${src?.sourceHost || 'n/a'}, err: ${src?.error || 'none'}${src?.skipped ? ', skipped: ' + src.skipped : ''}${src?.placspDocsFound ? `, placsp=${src.placspDocsFound}` : ''})`);
 
       if (src?.skipped) {
         // Mercell-internis permalink'as — nefetchinam, tik paliekam žymę.
