@@ -313,7 +313,7 @@ async function extractFieldsWithAI(text, meta = {}) {
     'You extract structured procurement tender fields from free-form notice text plus attached document text. ' +
     'The user message has sections labeled TITLE / DESCRIPTION / MERCELL_PAGE / DOCUMENTS — the DOCUMENTS section, when present, contains the FULL TEXT of one or more attached PDF specifications and is usually where requirements, qualifications, and award criteria are spelled out. SCAN IT THOROUGHLY before deciding a field is empty. ' +
     'Return ONLY a JSON object (no prose, no markdown fences) with these keys: ' +
-    'maxBudget, estimatedBudgetEur, duration, requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement.\n' +
+    'maxBudget, estimatedBudgetEur, duration, requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement, rejectReason, rejectCategory.\n' +
     'Rules:\n' +
     '- maxBudget: total ceiling / max contract value AS STATED in the tender or attached docs (with currency code, ex-VAT if specified). Examples: "1,200,000 EUR (ex VAT)", "8 500 000 SEK". Empty string if not explicitly stated anywhere.\n' +
     '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND the description/documents give enough basis (scope, deliverables, duration, country, complexity). Use realistic public-sector IT contract rates for that country. Output a plain integer like 850000 (no separators, no currency, no words). Empty string if you cannot estimate responsibly.\n' +
@@ -322,6 +322,19 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- qualificationRequirements: bullet-style summary (≤400 chars) of SELECTION / qualification criteria (turnover thresholds, references, past similar projects, team CVs, certifications). Look for "Selection criteria", "Qualification", "Kvalifikaciniai reikalavimai", "Kwalifikacja", "Eignungskriterien", "Kvalifikasjonskrav", "Solvencia económica, financiera y técnica", "Solvencia técnica o profesional", "Solvencia económica y financiera", "Criterio de Solvencia Técnica-Profesional", "Criterio de Solvencia Económica-Financiera", "Cláusula 11", "Cláusula 14", "Cláusula 15", "Apartado 15", "Cuadro de Características" (PLACSP/Spanish PCAP docs put hard numbers — minimum annual turnover, mandatory ISO/ENS/ENI/SARA-PdP certificates, references for similar projects of size >X — under those exact headings). Empty string if truly absent.\n' +
     '- offerWeighingCriteria: award criteria with weights if present. Example: "Price 40%, Quality 35%, Delivery time 25%" or "MEAT — lowest price". Look for "Award criteria", "Evaluation", "Vertinimo kriterijai", "Kryteria oceny", "Zuschlagskriterien", "Tildelingskriterier", "Criterios de adjudicación", "Criterios evaluables mediante aplicación de fórmulas", "Criterios evaluables mediante un juicio de valor", "Apartado 21", "Ponderación". When weights add up to 100, list each named criterion with its weight. Empty string if truly absent.\n' +
     '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English.\n' +
+    '- rejectReason: short English string (≤120 chars) explaining WHY this tender is a poor fit for our company, OR empty string if a good fit. We are a small custom-software development & consulting firm. We BUILD our own software from scratch and provide development/advisory services. We DO NOT resell licences, deliver hardware, install branded products, or do on-site work. Reject (set rejectReason) when ANY of these apply, with priority on the FIRST match found:\n' +
+    '   • License/reseller partnership required: tender wants an "authorized partner", "license partner", "licence reseller", "OEM partner", "channel partner", "official representative" of a named vendor (Microsoft, Oracle, SAP, Cisco, IBM, VMware, Adobe, Salesforce, Atlassian, ServiceNow, AWS, Azure, GCP, etc.). Set rejectReason="license_partner_required: <vendor>".\n' +
+    '   • Branded/named product supply or installation: tender procures specific named software/hardware (e.g. "supply and install Cisco switches", "Milestone XProtect maintenance", "SAP S/4HANA implementation", "Oracle DB licences"). Set rejectReason="branded_product_supply: <product>".\n' +
+    '   • SaaS development for a third party (we don\'t build SaaS platforms for others to resell). Set rejectReason="saas_development".\n' +
+    '   • Physical / on-site / contact-based work: equipment delivery, hardware installation, cabling, on-premises implementation requiring presence at client site, field service, biuro/objekto remontas. Set rejectReason="physical_onsite_work".\n' +
+    '   • Network / telecom infrastructure: LAN/WAN setup, switches/routers/firewalls, telephony, ISP services, network monitoring infrastructure. Set rejectReason="network_infrastructure".\n' +
+    '   • AI research projects (academic-style ML research, not applied AI integration). Set rejectReason="ai_research".\n' +
+    '   • Cybersecurity-only services (penetration testing, SOC, incident response, security audits as primary deliverable). Set rejectReason="cybersecurity_only".\n' +
+    '   • Helpdesk / client management / end-user support (tier-1 support, ticket triage, call centre, end-user training delivery). NOTE: developer support, technical consulting, application maintenance development = ACCEPT. Set rejectReason="helpdesk_support".\n' +
+    '   • Authorized representation requirement: tender requires being an authorized agent / certified representative of a specific organization for the deliverable. Set rejectReason="authorized_representation".\n' +
+    '   AMBIGUOUS PROCUREMENT — when the tender says "procurement of a system" / "system implementation": look for clarifying signals. If documents indicate it\'s a NEW system being built from scratch, custom development, bespoke solution → ACCEPT (empty rejectReason). If it\'s installation of an existing finished product / off-the-shelf software / branded vendor product → REJECT with rejectReason="branded_product_supply: <product>". If unclear, default to ACCEPT and add rejectReason="ambiguous_procurement_check_manually" so the human can decide.\n' +
+    '   ACCEPT (empty rejectReason) when the tender is: custom software development, system development, application development, web/mobile app development, software consulting, advisory services, technical analysis, business analysis, requirements engineering, architecture design, software maintenance/evolution of custom systems, code-level support, agile delivery teams.\n' +
+    '- rejectCategory: short machine-readable category matching the rejectReason prefix (e.g. "license_partner_required", "branded_product_supply", "saas_development", "physical_onsite_work", "network_infrastructure", "ai_research", "cybersecurity_only", "helpdesk_support", "authorized_representation", "ambiguous_procurement_check_manually"). Empty string if not rejected.\n' +
     'Write all field values in English even if the source is in another language. Never invent specifics — but DO synthesize when documents clearly imply requirements (e.g., "ISO 27001 certificate" listed under "Mandatory documents" → include in requirementsForSupplier). If a field is genuinely not present, use an empty string.';
   const metaLine = [
     meta.title ? `Title: ${meta.title}` : '',
@@ -349,6 +362,8 @@ async function extractFieldsWithAI(text, meta = {}) {
       qualificationRequirements: (parsed.qualificationRequirements || '').toString().trim(),
       offerWeighingCriteria: (parsed.offerWeighingCriteria || '').toString().trim(),
       scopeOfAgreement: (parsed.scopeOfAgreement || '').toString().trim(),
+      rejectReason: (parsed.rejectReason || '').toString().trim(),
+      rejectCategory: (parsed.rejectCategory || '').toString().trim(),
     };
   } catch (e) {
     _markAiFailure(e);
@@ -4816,8 +4831,17 @@ async function runScraper() {
       // Pavadinimui ir scope — jei turim AI išverstą versiją, rodom ją
       // (lengviau sales komandai dirbti angliškai). Jei AI išjungtas, rodom
       // originalą.
-      const titleOut = d.titleEn || cleanDescription(d.title || t.title || '');
-      const scopeOut = d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || '');
+      let titleOut = d.titleEn || cleanDescription(d.title || t.title || '');
+      let scopeOut = d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || '');
+
+      // Surface ambiguous-procurement reviews in the sheet so the
+      // sales reviewer can spot them at a glance. We prefix the title
+      // with "[REVIEW]" and inject the AI's reason into the scope cell
+      // so they don't have to re-read the source notice.
+      if (d.rejectCategory === 'ambiguous_procurement_check_manually' && d.rejectReason) {
+        titleOut = `[REVIEW] ${titleOut}`;
+        scopeOut = `[NEEDS HUMAN REVIEW: ${d.rejectReason}] ${scopeOut}`;
+      }
       const reqOut = cleanDescription(d.requirementsForSupplier || '');
       const qualOut = cleanDescription(d.qualificationRequirements || '');
       const critOut = cleanDescription(d.offerWeighingCriteria || '');
@@ -4895,6 +4919,8 @@ async function runScraper() {
     // Keep rows where budget is unknown (empty) or ≥ 500K EUR.
     const BUDGET_MIN_EUR = 500000;
     let budgetFilteredCount = 0;
+    let contentFilteredCount = 0;
+    const contentFilterCategories = {};
 
     for (let i = 0; i < toFetch.length; i++) {
       const cleanUrl = getCleanTenderUrl(toFetch[i].tenderId);
@@ -5009,6 +5035,9 @@ async function runScraper() {
           if (!dd.offerWeighingCriteria && ai.offerWeighingCriteria) { dd.offerWeighingCriteria = ai.offerWeighingCriteria; filled.push('criteria'); }
           // scopeOfAgreement: AI's English summary overrides native-language description
           if (ai.scopeOfAgreement) { dd.scopeOfAgreement = ai.scopeOfAgreement; filled.push('scope'); }
+          // Carry reject decision through (used by the content filter below)
+          if (ai.rejectReason) { dd.rejectReason = ai.rejectReason; }
+          if (ai.rejectCategory) { dd.rejectCategory = ai.rejectCategory; }
           if (filled.length) console.log(`    🤖 AI filled: ${filled.join(', ')}`);
         }
 
@@ -5022,6 +5051,36 @@ async function runScraper() {
           toFetch[i].details = dd;
           await new Promise(r => setTimeout(r, 200));
           continue;
+        }
+
+        // --- POST-AI CONTENT FILTER --------------------------------
+        // Reject tenders whose scope/requirements indicate poor fit:
+        // license partnerships, branded product supply, on-site work,
+        // pure cybersecurity, helpdesk, network infra, etc. The AI
+        // prompt populates dd.rejectReason / dd.rejectCategory based
+        // on the rules. Ambiguous procurement cases are NOT rejected
+        // by default — they pass through with rejectReason set to
+        // "ambiguous_procurement_check_manually" so a human can review
+        // them in the sheet.
+        //
+        // Escape hatch: set CONTENT_FILTER_DISABLED=1 to force-include
+        // every tender (useful when comparing what the filter would
+        // strip vs. raw output).
+        const CONTENT_FILTER_DISABLED = process.env.CONTENT_FILTER_DISABLED === '1';
+        const isAmbiguous = (dd.rejectCategory || '') === 'ambiguous_procurement_check_manually';
+        if (!CONTENT_FILTER_DISABLED && dd.rejectReason && !isAmbiguous) {
+          contentFilteredCount++;
+          const catKey = dd.rejectCategory || 'uncategorized';
+          contentFilterCategories[catKey] = (contentFilterCategories[catKey] || 0) + 1;
+          const cat = dd.rejectCategory ? `[${dd.rejectCategory}] ` : '';
+          console.log(`    ⏭️  skipping (post-AI): content filter — ${cat}${dd.rejectReason.slice(0, 200)}`);
+          toFetch[i].details = dd;
+          await new Promise(r => setTimeout(r, 200));
+          continue;
+        } else if (isAmbiguous) {
+          // Surface ambiguous cases in the log so the user sees them
+          // come through for manual review.
+          console.log(`    ⚠️  ambiguous procurement (sent to sheet for manual review): ${dd.rejectReason.slice(0, 200)}`);
         }
 
         // 2) Translate title (always — short, heuristika klysta trumpiems).
@@ -5106,6 +5165,14 @@ async function runScraper() {
     console.log(`New tenders: ${newTenders.length}`);
     console.log(`Rows appended: ${totalAppended}`);
     console.log(`Budget-filtered (<500K EUR): ${budgetFilteredCount}`);
+    console.log(`Content-filtered (poor fit):  ${contentFilteredCount}`);
+    if (contentFilteredCount > 0) {
+      const breakdown = Object.entries(contentFilterCategories)
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `${k}=${v}`)
+        .join(', ');
+      console.log(`  Content filter breakdown: ${breakdown}`);
+    }
 
     return { ok: true, tendersFound: allTenders.length, rowsAppended: totalAppended };
 
