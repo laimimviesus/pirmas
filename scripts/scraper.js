@@ -318,8 +318,8 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- maxBudget: total ceiling / max contract value AS STATED in the tender or attached docs (with currency code, ex-VAT if specified). Examples: "1,200,000 EUR (ex VAT)", "8 500 000 SEK". Empty string if not explicitly stated anywhere.\n' +
     '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND the description/documents give enough basis (scope, deliverables, duration, country, complexity). Use realistic public-sector IT contract rates for that country. Output a plain integer like 850000 (no separators, no currency, no words). Empty string if you cannot estimate responsibly.\n' +
     '- duration: contract length in months or years. Example: "36 months" or "2 years + 2 x 1 year option". Empty string if not stated.\n' +
-    '- requirementsForSupplier: bullet-style summary (≤400 chars) of MANDATORY supplier/bidder requirements (legal status, insurance, ISO certifications, security clearance, technical staff, financial standing). Look in DOCUMENTS for sections titled "Requirements", "Mandatory requirements", "Reikalavimai tiekėjui", "Wymagania", "Anforderungen an den Bieter", "Krav til leverandør", "Eisen aan inschrijver", "Exigences", "Requisitos", "Condiciones de admisión", "Requisitos de participación de los licitadores", "Aptitud para contratar". Empty string if truly absent.\n' +
-    '- qualificationRequirements: bullet-style summary (≤400 chars) of SELECTION / qualification criteria (turnover thresholds, references, past similar projects, team CVs, certifications). Look for "Selection criteria", "Qualification", "Kvalifikaciniai reikalavimai", "Kwalifikacja", "Eignungskriterien", "Kvalifikasjonskrav", "Solvencia económica, financiera y técnica", "Solvencia técnica o profesional", "Solvencia económica y financiera", "Criterio de Solvencia Técnica-Profesional", "Criterio de Solvencia Económica-Financiera", "Cláusula 11", "Cláusula 14", "Cláusula 15", "Apartado 15", "Cuadro de Características" (PLACSP/Spanish PCAP docs put hard numbers — minimum annual turnover, mandatory ISO/ENS/ENI/SARA-PdP certificates, references for similar projects of size >X — under those exact headings). Empty string if truly absent.\n' +
+    '- requirementsForSupplier: concise bullet-style summary (≤600 chars) of MANDATORY supplier/bidder requirements. Include CONCRETE values verbatim where present (e.g. "ISO 27001 certificate", "minimum 3 years operation", "SARA-PdP accreditation", "Plan de Igualdad inscrito", "≥2% trabajadores con discapacidad", "Tier IV CPD certified"). Look in DOCUMENTS for: "Requirements", "Mandatory requirements", "Reikalavimai tiekėjui", "Wymagania", "Anforderungen an den Bieter", "Krav til leverandør", "Eisen aan inschrijver", "Exigences", "Requisitos", "Condiciones de admisión", "Requisitos de participación de los licitadores", "Aptitud para contratar". Empty string if truly absent.\n' +
+    '- qualificationRequirements: concise bullet-style summary (≤700 chars) of SELECTION / qualification criteria. Copy CONCRETE NUMBERS VERBATIM — turnover thresholds in EUR, technical-experience minimums in EUR/years, certification names (ISO 27001/27017/27018, ENS Alto, Eurprivacy, ENI, SARA-PdP), reference counts ("≥2 verifiable references"), team-size minimums. When the document gives PER-LOTE values (Lote 1/2/3), include all of them. Look for: "Selection criteria", "Qualification", "Kvalifikaciniai reikalavimai", "Kwalifikacja", "Eignungskriterien", "Kvalifikasjonskrav", "Solvencia económica, financiera y técnica", "Solvencia técnica o profesional", "Solvencia económica y financiera", "Criterio de Solvencia Técnica-Profesional", "Criterio de Solvencia Económica-Financiera", "Cláusula 11", "Cláusula 14", "Cláusula 15", "Apartado 15", "Cuadro de Características", "ANEXO 3", "Volumen anual de negocios", "Cifra anual de negocio", "Importe anual acumulado". The PLACSP / Spanish PCAP format puts the concrete numbers in ANEXO 3 (page 49–55 typically) under "SOLVENCIA ECONÓMICA Y FINANCIERA" and "SOLVENCIA TÉCNICA". Spanish German Vergabe puts them under "Eignungskriterien". Empty string if truly absent.\n' +
     '- offerWeighingCriteria: award criteria with weights if present. Example: "Price 40%, Quality 35%, Delivery time 25%" or "MEAT — lowest price". Look for "Award criteria", "Evaluation", "Vertinimo kriterijai", "Kryteria oceny", "Zuschlagskriterien", "Tildelingskriterier", "Criterios de adjudicación", "Criterios evaluables mediante aplicación de fórmulas", "Criterios evaluables mediante un juicio de valor", "Apartado 21", "Ponderación". When weights add up to 100, list each named criterion with its weight. Empty string if truly absent.\n' +
     '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English.\n' +
     '- rejectReason: short English string (≤120 chars) explaining WHY this tender is a poor fit for our company, OR empty string if a good fit. We are a small custom-software development & consulting firm. We BUILD our own software from scratch and provide development/advisory services. We DO NOT resell licences, deliver hardware, install branded products, or do on-site work. Reject (set rejectReason) when ANY of these apply, with priority on the FIRST match found:\n' +
@@ -1604,15 +1604,21 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
           console.log(`    🇪🇸 PLACSP: ${result.placspDocsFound} priority document(s) detected (PCAP/PPT/Anuncio) — bumping char caps`);
         }
         const MAX_SRC_FILES = 8;
-        // PLACSP PCAP files routinely run 40-50 pages (≈100k chars) and
-        // hold the qualification + award-criteria sections we need to
-        // extract. Bump per-file cap from 30k→60k and total from
-        // 80k→140k whenever any priority file is in the queue, so the
-        // AI prompt actually sees Apartado 15 / 21 / 31 of the
-        // Cuadro de Características (which sit deep in the PCAP body).
+        // PLACSP PCAP files routinely run 50–70 pages (≈100–180k chars).
+        // The detailed solvency / award-criteria numbers (ANEXO 3 with
+        // hard turnover thresholds, technical-experience minimums, ISO
+        // certificate lists, and Cuadro de Características apartado 21
+        // weights) are typically on pages 45–55 of the PDF, deep in
+        // the body. Originally we capped each priority file at 60k
+        // chars (≈25 pages) — that cut off ANEXO 3 entirely and the
+        // AI was left only with the 1–15 generic legal preamble
+        // (DEUC / Social Security boilerplate every Spanish tender
+        // shares). Bumping per-file to 150k captures the full PCAP,
+        // and 180k total fits Anuncio + PCAP + PPT in one AI prompt.
+        // Claude Haiku 4.5 has 200k context so it has headroom.
         const SRC_DOC_CHAR_CAP_DEFAULT  = 30000;       // per non-priority file
-        const SRC_DOC_CHAR_CAP_PRIORITY = 60000;       // per PLACSP priority file
-        const SRC_TOTAL_CHAR_CAP        = hasPriority ? 140000 : 80000;
+        const SRC_DOC_CHAR_CAP_PRIORITY = 150000;      // per PLACSP priority file
+        const SRC_TOTAL_CHAR_CAP        = hasPriority ? 180000 : 80000;
         // Keep legacy name `SRC_DOC_CHAR_CAP` for the inner zip recursion
         // — for zip entries we always use the default cap, since priority
         // PCAP/PPT docs themselves are PDFs, not zips.
@@ -2991,7 +2997,12 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       // užtikrina, kad pirmi yra reikšmingiausi.
       const MAX_DOCS_PER_TENDER = 6;
       const MAX_DOC_TEXT_CHARS = 30000;       // per single document
-      const MAX_TOTAL_DOC_CHARS = 120000;     // total for AI prompt
+      // Bumped from 120k → 180k. Spanish PCAPs and German Vergabe ZIPs
+      // routinely exceed 100k of body text once we follow embedded
+      // links and the deep ANEXOs (solvency tables, award-criteria
+      // weights). Claude Haiku 4.5 has a 200k context window so 180k
+      // leaves enough headroom for system prompt + meta + question.
+      const MAX_TOTAL_DOC_CHARS = 180000;     // total for AI prompt
       const MAX_INNER_BYTES = 10 * 1024 * 1024; // ZIP inner-file size cap
       const MAX_ZIP_DEPTH = 2;
 
