@@ -330,7 +330,7 @@ async function extractFieldsWithAI(text, meta = {}) {
     '   • Network / telecom infrastructure: LAN/WAN setup, switches/routers/firewalls, telephony, ISP services, network monitoring infrastructure. Set rejectReason="network_infrastructure".\n' +
     '   • AI research projects (academic-style ML research, not applied AI integration). Set rejectReason="ai_research".\n' +
     '   • Cybersecurity-only services (penetration testing, SOC, incident response, security audits as primary deliverable). Set rejectReason="cybersecurity_only".\n' +
-    '   • Helpdesk / client management / end-user support (tier-1 support, ticket triage, call centre, end-user training delivery). NOTE: developer support, technical consulting, application maintenance development = ACCEPT. Set rejectReason="helpdesk_support".\n' +
+    '   • Helpdesk / end-user support (TIER-1 / first-level only). REJECT only if the tender CLEARLY requires staffing a call centre / ticket-triage queue for ordinary end-users — look for explicit signals: "atención a usuarios", "primer nivel de atención", "call centre", "ticket triage", "soporte de primera línea", "Anwenderbetreuung", "Helpdesk de usuarios". DO NOT REJECT if the tender mentions "soporte técnico" alongside "mantenimiento", "evolución", "desarrollo", "L2/L3", "soporte avanzado", "consultoría", or describes maintenance of CUSTOM systems (servicios de soporte y mantenimiento de sistemas) — that is application maintenance / dev-ops support and ACCEPTED. When in doubt, ACCEPT and let the human review. Set rejectReason="helpdesk_support" only on clear tier-1 cases.\n' +
     '   • Authorized representation requirement: tender requires being an authorized agent / certified representative of a specific organization for the deliverable. Set rejectReason="authorized_representation".\n' +
     '   AMBIGUOUS PROCUREMENT — when the tender says "procurement of a system" / "system implementation": look for clarifying signals. If documents indicate it\'s a NEW system being built from scratch, custom development, bespoke solution → ACCEPT (empty rejectReason). If it\'s installation of an existing finished product / off-the-shelf software / branded vendor product → REJECT with rejectReason="branded_product_supply: <product>". If unclear, default to ACCEPT and add rejectReason="ambiguous_procurement_check_manually" so the human can decide.\n' +
     '   ACCEPT (empty rejectReason) when the tender is: custom software development, system development, application development, web/mobile app development, software consulting, advisory services, technical analysis, business analysis, requirements engineering, architecture design, software maintenance/evolution of custom systems, code-level support, agile delivery teams.\n' +
@@ -788,6 +788,24 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
 // =====================================================================
 
 async function fetchSourcePageDetails(browser, sourceUrl) {
+  // URL scheme normalisation — Mercell sometimes returns sourceUrl
+  // values like "www.conselleriadefacenda.es/silex" without an
+  // http(s):// scheme. Puppeteer's page.goto() rejects those with
+  // "Cannot navigate to invalid URL" and the call lands on Chrome's
+  // chromewebdata error page (which our dead-site bail then catches —
+  // but we waste 8s and lose the source). Best to prefix https://
+  // upfront for any URL that lacks a scheme but otherwise looks
+  // valid (has a dot). Real-world impact (Spanish PLACSP run on
+  // 2026-05-05): 3 of 9 tenders had this issue.
+  if (sourceUrl && typeof sourceUrl === 'string' && !/^[a-z][a-z0-9+.-]*:\/\//i.test(sourceUrl)) {
+    const trimmed = sourceUrl.trim();
+    if (trimmed && /\./.test(trimmed)) {
+      const fixed = `https://${trimmed.replace(/^\/+/, '')}`;
+      console.log(`    ↪️  source URL missing scheme — normalising "${sourceUrl}" → "${fixed}"`);
+      sourceUrl = fixed;
+    }
+  }
+
   // Mercell-internų permalink'ų atpažinimas — jei "Go to source" veda į
   // patį Mercell (permalink.mercell.com ar mercell.com/*), šaltinio
   // skrapinti nėra prasmės, nes tai yra tiesiog redirect'as į patį
