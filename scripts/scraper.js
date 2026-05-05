@@ -12,7 +12,20 @@ const { google } = require('googleapis');
 
 // --- Config ------------------------------------------------------------
 const TEST_MODE = process.env.TEST_MODE === 'true';
-const MAX_PAGES = TEST_MODE ? 1 : 200;
+// COUNTRY_FILTER — comma-separated country names (e.g. "Spain" or
+// "Spain,Portugal"). When set, the listing-page collector skips
+// tenders whose country doesn't match. Useful for one-off debug runs
+// against a specific procurement portal (e.g. Spain → PLACSP /
+// contrataciondelestado.es).
+const COUNTRY_FILTER = (process.env.COUNTRY_FILTER || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const COUNTRY_FILTER_ACTIVE = COUNTRY_FILTER.length > 0;
+// When a filter is active, allow many more listing pages than usual —
+// matching tenders may be sparse (e.g. Spanish IT tenders are <2% of
+// the global feed), so a 1-page cap in TEST_MODE would never find any.
+const MAX_PAGES = COUNTRY_FILTER_ACTIVE
+  ? Number(process.env.MAX_PAGES || 50)
+  : (TEST_MODE ? 1 : 200);
 // Prod limits sąmoningai konservatyvūs — GitHub Actions jobs are capped at
 // 6h, o pilnas detail-fetch ciklas per tender'į truko ~5–10s. 4000 tenderių
 // prasilenkdavo su timeout'u ir niekas nebuvo įrašoma. Paliekam override'ą
@@ -21,6 +34,10 @@ const MAX_TENDERS = TEST_MODE ? 9 : Number(process.env.MAX_TENDERS || 500);
 const DETAILS_LIMIT = TEST_MODE ? 9 : Number(process.env.DETAILS_LIMIT || 500);
 const FLUSH_BATCH = TEST_MODE ? 1 : Number(process.env.FLUSH_BATCH || 5);
 const SOURCE_NAV_TIMEOUT = 25000;
+
+if (COUNTRY_FILTER_ACTIVE) {
+  console.log(`🔎 COUNTRY_FILTER active: only collecting tenders from ${COUNTRY_FILTER.join(', ')} (max pages: ${MAX_PAGES})`);
+}
 
 // --- Anthropic Claude API ---------------------------------------------
 // Naudojam Claude Haiku 4.5 (pigus, greitas) dviem užduotims:
@@ -4373,7 +4390,10 @@ async function runScraper() {
     const seenIds = new Set();
 
     let emptyPagesInRow = 0;
-    const MAX_EMPTY_PAGES_IN_ROW = 2;
+    // When COUNTRY_FILTER is active, sparse matches are expected — we
+    // bump the empty-pages tolerance so the loop keeps scanning until
+    // it finds enough matching tenders or hits MAX_PAGES.
+    const MAX_EMPTY_PAGES_IN_ROW = COUNTRY_FILTER_ACTIVE ? 25 : 2;
 
     for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum++) {
       try {
@@ -4441,6 +4461,7 @@ async function runScraper() {
 
       let newOnThisPage = 0;
       let dupesOnThisPage = 0;
+      let filteredOnThisPage = 0;
       for (const t of pageTenders) {
         const id = extractTenderId(t.href);
         if (!id) continue;
@@ -4448,13 +4469,24 @@ async function runScraper() {
           dupesOnThisPage++;
           continue;
         }
+        // COUNTRY_FILTER — skip tenders whose country doesn't match.
+        // We DON'T mark them as seen, in case a later run lifts the
+        // filter and wants to process them. We DO count them in
+        // filteredOnThisPage so the page-emptiness heuristic still
+        // triggers correctly when no matches exist.
+        if (COUNTRY_FILTER_ACTIVE) {
+          if (!t.country || !COUNTRY_FILTER.includes(t.country)) {
+            filteredOnThisPage++;
+            continue;
+          }
+        }
         seenIds.add(id);
         const url = getCleanTenderUrl(id);
         allTenders.push({ ...t, tenderId: id, url });
         newOnThisPage++;
         if (allTenders.length >= MAX_TENDERS) break;
       }
-      console.log(`Page ${pageNum}: +${newOnThisPage} new, ${dupesOnThisPage} dupes (total: ${allTenders.length})`);
+      console.log(`Page ${pageNum}: +${newOnThisPage} new, ${dupesOnThisPage} dupes${COUNTRY_FILTER_ACTIVE ? `, ${filteredOnThisPage} country-filtered` : ''} (total: ${allTenders.length})`);
 
       if (allTenders.length >= MAX_TENDERS) {
         console.log(`Hit MAX_TENDERS limit (${MAX_TENDERS})`);
