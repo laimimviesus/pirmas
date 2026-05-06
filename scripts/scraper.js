@@ -148,9 +148,15 @@ function hostRequiresLogin(host) {
 // browser cookie jar to authenticate subsequent fetchSourcePageDetails
 // calls within the same browser context.
 const LOGIN_URLS = {
-  'e-avrop.com':              'https://www.e-avrop.com/e-User/Default.aspx',
+  // e-avrop.com — confirmed direct login URL is /login.aspx (not the
+  // earlier /e-User/Default.aspx which renders without a visible form).
+  'e-avrop.com':              'https://www.e-avrop.com/login.aspx',
   'kommersannons.se':         'https://www.kommersannons.se/fmv/Default.aspx',
-  'marches-publics.gouv.fr':  'https://www.marches-publics.gouv.fr/entreprise',
+  // marches-publics.gouv.fr — the source URL itself has a "Login" button
+  // in the corner; clicking it pops up a form whose fields are
+  // form[_username] / form[_password] (action=/entreprise/login). The
+  // new login-button-click logic in attemptPortalLogin handles that
+  // popup automatically, so no dedicated URL is needed.
   // tendsign.com keeps its login form on the tender URL via redirect,
   // so the default flow works — no override needed.
 };
@@ -740,6 +746,47 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     }
     // Allow client-side redirects / SPA login forms to settle.
     await new Promise((r) => setTimeout(r, 1500));
+
+    // Some portals (e-avrop.com, certain TendSign / Cloudia variants) land
+    // on a "shell" page whose login form is hidden behind a "Logga in" /
+    // "Login" / "Sign in" button or tab — the password input only enters
+    // the DOM after that click. If we don't see a password field yet,
+    // try clicking such a button by visible text and let the form
+    // materialise. This is a no-op when the form is already visible.
+    const preCheckPass = await page.evaluate(() => {
+      try {
+        const el = document.querySelector(
+          'input[type="password"]:not([disabled]):not([aria-hidden="true"])'
+        );
+        return !!(el && el.offsetParent !== null);
+      } catch (_) { return false; }
+    }).catch(() => false);
+    if (!preCheckPass) {
+      const clicked = await page.evaluate(() => {
+        const RX = /^(\s*)(logga\s*in|log\s*in|login|sign\s*in|anmelden|connexion|se\s*connecter|iniciar\s*sesi[oó]n|acceder|entrar|kirjaudu|logg\s*inn|prijava|prihl[aá]senie|p[rř]ihl[aá]sit|bejelentkez[eé]s|conectare|είσοδος|pieslēgties|prisijungti|ulogi[ts]e|вход)(\s*)$/i;
+        // Prefer real buttons / links / role=button. Match by trimmed
+        // text to avoid clicking a header that just contains the word.
+        const candidates = Array.from(document.querySelectorAll(
+          'button, a, [role="button"], input[type="button"], input[type="submit"]'
+        )).filter((el) => {
+          if (!el || el.offsetParent === null) return false;
+          const txt = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+          if (!txt || txt.length > 30) return false;
+          return RX.test(txt);
+        });
+        if (candidates.length === 0) return null;
+        // Prefer the smallest / least nested element first.
+        candidates.sort((a, b) => (a.innerText || a.value || '').length - (b.innerText || b.value || '').length);
+        try {
+          candidates[0].click();
+          return (candidates[0].innerText || candidates[0].value || '').trim().slice(0, 40);
+        } catch (_) { return null; }
+      }).catch(() => null);
+      if (clicked) {
+        console.log(`    ↪️  clicked login button "${clicked}" on ${hostLabel} to expose form`);
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
 
     const sels = await page.evaluate(() => {
       const findVisible = (selectors) => {
