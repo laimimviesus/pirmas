@@ -116,6 +116,27 @@ function getPortalCreds(hostOrUrl) {
   }
   return null;
 }
+
+// Hosts that ALWAYS need login, even when the loginGated heuristic doesn't
+// fire. These portals serve a thin "shell" page (~100–500 chars) when the
+// visitor is anonymous and lazy-load actual tender content via AJAX after
+// authentication. Login-marker regex misses them because the shell page
+// shows almost no body text. Real-world example: e-avrop.com renders
+// "Download and Subscribe / Go to My Subscriptions / Current Notices /
+// Places / RÄDDNINGSTJÄNSTEN STORGÖTEBORG / NOTICE / SV EN / Register
+// account / © 1999-2026 Antirio AB Help Support" — total ≈190 chars,
+// only 1 marker matches ("Register account"), so the heuristic skips
+// login. We force login here.
+const ALWAYS_LOGIN_HOSTS = [
+  'e-avrop.com',          // Swedish — Antirio platform shell
+  'tendsign.com',          // Swedish/Norwegian — TendSign platform
+  'kommersannons.se',      // Swedish FMV — Kommers Annons shell
+];
+function hostRequiresLogin(host) {
+  if (!host) return false;
+  const h = String(host).trim().toLowerCase().replace(/^www\./, '');
+  return ALWAYS_LOGIN_HOSTS.some((k) => h === k || h.endsWith('.' + k));
+}
 async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperature = 0 } = {}) {
   if (!AI_ENABLED) throw new Error('ANTHROPIC_API_KEY missing');
   // Circuit breaker — once a non-retryable error (credit balance, 401/403)
@@ -1584,6 +1605,7 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         sourceTitle: document.querySelector('h1')?.innerText?.trim() || null,
         sourceHost: location.host,
         bodyTextPreview: bodyText.slice(0, 600),
+        bodyLength: bodyText.length,
         sourceFiles: sourceFilesMerged,
         placspDocsFound: placspFiles.length,
         placspStats: placspResult.stats,
@@ -3808,6 +3830,24 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         console.log(`    🇪🇸 PLACSP stats: anchors=${ps.totalAnchors}, textMatches=${ps.textMatches}, urlMatches=${ps.urlMatches}; sample=[${sample}]`);
       }
 
+      // FORCE-LOGIN coercion — if host is in ALWAYS_LOGIN_HOSTS and the
+      // loginGated heuristic didn't fire (typical for SPA portals that
+      // serve a thin shell page anonymously), upgrade the result to
+      // loginGated so the next branch tries the credentials we have.
+      // We only coerce when source DIDN'T error out and DOESN'T already
+      // have meaningful content (body short → likely shell).
+      if (src && !src.error && !src.skipped && !src.loginGated) {
+        const bodyLen = src.bodyTextPreview?.length || 0;
+        const looksThinShell = bodyLen < 600;  // preview is capped at 600
+        if (hostRequiresLogin(src.sourceHost) && looksThinShell) {
+          console.log(`    🔐 host ${src.sourceHost} in ALWAYS_LOGIN_HOSTS + thin shell (${bodyLen}ch preview) — forcing login`);
+          src.loginGated = true;
+          src.matchedMarkers = src.matchedMarkers || 0;
+          src.hasPasswordField = false;
+          src.bodyLength = src.bodyLength || bodyLen;
+        }
+      }
+
       if (src?.skipped) {
         // Mercell-internis permalink'as — nefetchinam, tik paliekam žymę.
         details.sourceHost = src.sourceHost || null;
@@ -3838,6 +3878,33 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
               `    🔁 post-login source fetch: ${Date.now() - t1}ms ` +
               `(gated=${!!postLoginSrc?.loginGated}, err=${postLoginSrc?.error || 'none'})`
             );
+
+            // Post-login FALSE-POSITIVE override — even after a successful
+            // login, the loginGated detector can fire again on pages that
+            // still render a "log in / register" link in their header
+            // (typical of TendSign, Cloudia, etc. — once you're logged in
+            // they keep the login menu visible). When we see a clear
+            // "logged-in marker" in the body, override gated=false so the
+            // pipeline trusts the post-login state.
+            if (postLoginSrc && postLoginSrc.loginGated) {
+              const loggedInRe = /\b(?:log\s*out|logout|logga\s*ut|cerrar\s*sesi[oó]n|logg\s*ut|abmelden|d[eé]connexion|uitloggen|kirjaudu\s*ulos|wyloguj|sign\s*out|min(?:a)?\s*(?:profil|sidor)|mein\s*konto|mon\s*compte|my\s*account|mitt\s*konto)\b/i;
+              const preview = postLoginSrc.bodyTextPreview || '';
+              if (loggedInRe.test(preview)) {
+                console.log(`    ✅ post-login still flagged as gated, but logged-in markers present — overriding to non-gated`);
+                postLoginSrc.loginGated = false;
+                postLoginSrc.loginOverride = 'logged-in markers detected';
+              } else {
+                // Secondary heuristic: post-login body grew significantly
+                // → likely real content rendered, not the login form.
+                const preLen = src.bodyLength || src.bodyTextPreview?.length || 0;
+                const postLen = postLoginSrc.bodyLength || preview.length || 0;
+                if (preLen > 0 && postLen > preLen * 3 && postLen > 1500) {
+                  console.log(`    ✅ post-login body grew ${preLen}→${postLen}ch (3×+ expansion) — overriding gated to non-gated`);
+                  postLoginSrc.loginGated = false;
+                  postLoginSrc.loginOverride = `body expanded ${preLen}→${postLen}ch`;
+                }
+              }
+            }
           }
         } else {
           console.log(`    ℹ️  no portal creds configured for ${src.sourceHost}`);
