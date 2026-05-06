@@ -747,45 +747,73 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     // Allow client-side redirects / SPA login forms to settle.
     await new Promise((r) => setTimeout(r, 1500));
 
-    // Some portals (e-avrop.com, certain TendSign / Cloudia variants) land
-    // on a "shell" page whose login form is hidden behind a "Logga in" /
-    // "Login" / "Sign in" button or tab — the password input only enters
-    // the DOM after that click. If we don't see a password field yet,
-    // try clicking such a button by visible text and let the form
-    // materialise. This is a no-op when the form is already visible.
-    const preCheckPass = await page.evaluate(() => {
-      try {
-        const el = document.querySelector(
-          'input[type="password"]:not([disabled]):not([aria-hidden="true"])'
-        );
-        return !!(el && el.offsetParent !== null);
-      } catch (_) { return false; }
-    }).catch(() => false);
-    if (!preCheckPass) {
-      const clicked = await page.evaluate(() => {
-        const RX = /^(\s*)(logga\s*in|log\s*in|login|sign\s*in|anmelden|connexion|se\s*connecter|iniciar\s*sesi[oó]n|acceder|entrar|kirjaudu|logg\s*inn|prijava|prihl[aá]senie|p[rř]ihl[aá]sit|bejelentkez[eé]s|conectare|είσοδος|pieslēgties|prisijungti|ulogi[ts]e|вход)(\s*)$/i;
-        // Prefer real buttons / links / role=button. Match by trimmed
-        // text to avoid clicking a header that just contains the word.
-        const candidates = Array.from(document.querySelectorAll(
-          'button, a, [role="button"], input[type="button"], input[type="submit"]'
-        )).filter((el) => {
-          if (!el || el.offsetParent === null) return false;
-          const txt = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
-          if (!txt || txt.length > 30) return false;
-          return RX.test(txt);
-        });
-        if (candidates.length === 0) return null;
-        // Prefer the smallest / least nested element first.
-        candidates.sort((a, b) => (a.innerText || a.value || '').length - (b.innerText || b.value || '').length);
+    // Some portals (e-avrop.com, marches-publics.gouv.fr, certain
+    // TendSign / Cloudia variants) land on a page whose login form is
+    // either inside a popup that opens after a "Logga in" / "Login" /
+    // "Connexion" / "Identification entreprise" click, or whose form
+    // exists in the DOM but is initially aria-hidden. The popup-trigger
+    // button is normally the SMALL header item, not the form's own
+    // submit button (whose text is also some variant of "Log in"). We
+    // ALWAYS attempt this click — even when a password field appears
+    // present — because the apparent visibility check is unreliable
+    // (popup form may be in DOM but inside a display:none container
+    // that fools offsetParent on Chromium). Clicking is harmless when
+    // the form is already open: at worst we click the submit button
+    // before fields are filled, but no submission goes through (csrf /
+    // empty fields). The `excludeSubmit` filter avoids clicking inside
+    // a form's own submit input/button when a real form is open.
+    const clickInfo = await page.evaluate(() => {
+      const RX = /^(\s*)(logga\s*in|log\s*in|login|sign\s*in|anmelden|connexion|se\s*connecter|conn?exion|identification|s'identifier|iniciar\s*sesi[oó]n|acceder|entrar|kirjaudu|logg\s*inn|prijava|prihl[aá]senie|p[rř]ihl[aá]sit|bejelentkez[eé]s|conectare|είσοδος|pieslēgties|prisijungti|ulogi[ts]e|вход|mon\s*compte|espace\s*entreprise|espace\s*personnel)(\s*)$/i;
+      const candidates = Array.from(document.querySelectorAll(
+        'button, a, [role="button"], input[type="button"], input[type="submit"]'
+      ));
+      // Skip elements that are inside a visible login form (those are
+      // the form's submit button, not the popup-opener).
+      const insideOpenForm = (el) => {
         try {
-          candidates[0].click();
-          return (candidates[0].innerText || candidates[0].value || '').trim().slice(0, 40);
-        } catch (_) { return null; }
-      }).catch(() => null);
-      if (clicked) {
-        console.log(`    ↪️  clicked login button "${clicked}" on ${hostLabel} to expose form`);
-        await new Promise((r) => setTimeout(r, 2000));
+          const f = el.closest('form');
+          if (!f) return false;
+          if (f.querySelector('input[type="password"]:not([aria-hidden="true"])')) return true;
+        } catch (_) {}
+        return false;
+      };
+      const matches = candidates.filter((el) => {
+        if (!el || el.offsetParent === null) return false;
+        const text = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+        if (!text || text.length > 40) return false;
+        if (!RX.test(text)) return false;
+        if (insideOpenForm(el)) return false;
+        return true;
+      });
+      if (matches.length === 0) {
+        // Diagnostic: list visible button-ish texts so we can broaden
+        // the matcher next iteration if needed.
+        const sample = candidates
+          .filter((el) => el.offsetParent !== null)
+          .slice(0, 12)
+          .map((el) => (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 30))
+          .filter(Boolean);
+        return { clicked: null, sample };
       }
+      matches.sort((a, b) =>
+        (a.innerText || a.value || '').length - (b.innerText || b.value || '').length
+      );
+      try {
+        const target = matches[0];
+        target.click();
+        return {
+          clicked: (target.innerText || target.value || '').trim().slice(0, 40),
+          sample: [],
+        };
+      } catch (_) { return { clicked: null, sample: [] }; }
+    }).catch(() => ({ clicked: null, sample: [] }));
+    if (clickInfo.clicked) {
+      console.log(`    ↪️  clicked login trigger "${clickInfo.clicked}" on ${hostLabel}`);
+      await new Promise((r) => setTimeout(r, 2000));
+    } else if (clickInfo.sample && clickInfo.sample.length) {
+      // Only log when we couldn't find a match — helps diagnose silent
+      // failures like "no password field" without indicating a click.
+      console.log(`    ⚠️  no login-trigger button matched on ${hostLabel}; visible buttons: ${JSON.stringify(clickInfo.sample.slice(0, 6))}`);
     }
 
     const sels = await page.evaluate(() => {
