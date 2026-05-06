@@ -137,6 +137,33 @@ function hostRequiresLogin(host) {
   const h = String(host).trim().toLowerCase().replace(/^www\./, '');
   return ALWAYS_LOGIN_HOSTS.some((k) => h === k || h.endsWith('.' + k));
 }
+
+// Dedicated login URLs for portals where the tender page (Mercell "Go to
+// source" target) does NOT contain a login form. attemptPortalLogin's
+// default behaviour of navigating to the source URL fails on these
+// portals because the announcement page renders only an empty shell —
+// the actual login form lives at a separate URL (typically a /Default
+// or /Login route). When a host appears in this map, we navigate to
+// the dedicated URL FIRST, complete the login flow, and rely on the
+// browser cookie jar to authenticate subsequent fetchSourcePageDetails
+// calls within the same browser context.
+const LOGIN_URLS = {
+  'e-avrop.com':              'https://www.e-avrop.com/e-User/Default.aspx',
+  'kommersannons.se':         'https://www.kommersannons.se/fmv/Default.aspx',
+  'marches-publics.gouv.fr':  'https://www.marches-publics.gouv.fr/entreprise',
+  // tendsign.com keeps its login form on the tender URL via redirect,
+  // so the default flow works — no override needed.
+};
+function getDedicatedLoginUrl(host) {
+  if (!host) return null;
+  const h = String(host).trim().toLowerCase().replace(/^www\./, '');
+  if (LOGIN_URLS[h]) return LOGIN_URLS[h];
+  // suffix match
+  for (const key of Object.keys(LOGIN_URLS)) {
+    if (h === key || h.endsWith('.' + key)) return LOGIN_URLS[key];
+  }
+  return null;
+}
 async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperature = 0 } = {}) {
   if (!AI_ENABLED) throw new Error('ANTHROPIC_API_KEY missing');
   // Circuit breaker — once a non-retryable error (credit balance, 401/403)
@@ -695,8 +722,19 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
   const page = await browser.newPage();
   try {
     page.setDefaultNavigationTimeout(30000);
+
+    // Dedicated login URL? Some portals (e-avrop, marches-publics-gouv,
+    // FMV / kommersannons) serve their login form on a fixed URL rather
+    // than redirecting from the tender page. In that case, navigate to
+    // the dedicated URL first — the browser cookie jar persists, so a
+    // post-login fetchSourcePageDetails(sourceUrl) will be authenticated.
+    const dedicatedLoginUrl = getDedicatedLoginUrl(hostLabel);
+    const loginNavTarget = dedicatedLoginUrl || sourceUrl;
+    if (dedicatedLoginUrl) {
+      console.log(`    ↪️  using dedicated login URL: ${dedicatedLoginUrl}`);
+    }
     try {
-      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.goto(loginNavTarget, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e) {
       console.log(`    ❌ login goto failed for ${hostLabel}: ${(e.message || '').slice(0, 120)}`);
     }
