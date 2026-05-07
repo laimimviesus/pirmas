@@ -763,12 +763,23 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     // empty fields). The `excludeSubmit` filter avoids clicking inside
     // a form's own submit input/button when a real form is open.
     const clickInfo = await page.evaluate(() => {
-      const RX = /^(\s*)(logga\s*in|log\s*in|login|sign\s*in|anmelden|connexion|se\s*connecter|conn?exion|identification|s'identifier|iniciar\s*sesi[oó]n|acceder|entrar|kirjaudu|logg\s*inn|prijava|prihl[aá]senie|p[rř]ihl[aá]sit|bejelentkez[eé]s|conectare|είσοδος|pieslēgties|prisijungti|ulogi[ts]e|вход|mon\s*compte|espace\s*entreprise|espace\s*personnel)(\s*)$/i;
+      // Word-boundary regex covers any positioning of these tokens, so
+      // `entreprise-auth` (marches-publics popup trigger) matches via
+      // \bauth\b, while harmless words like "author"/"authority" do not
+      // (no word boundary inside "author"). Includes EN/SV/FR/DE/ES/PT/
+      // FI/NO/SI/SK/CZ/HU/RO/EL/LV/LT/Cyrillic synonyms.
+      const RX = /\b(login|log[-\s]?in|logga[-\s]?in|logon|sign[-\s]?in|signin|auth|authent\w*|anmelden|connexion|se[-\s]?connecter|identification|s'identifier|identifier|iniciar[-\s]?sesi[oó]n|acceder|entrar|kirjaudu|logg[-\s]?inn|prijava|prihl[aá]senie|p[rř]ihl[aá]sit|bejelentkez[eé]s|conectare|είσοδος|pieslēgties|prisijungti|ulogi[ts]e|вход|mon[-\s]?compte|espace[-\s]?(entreprise|personnel|fournisseur))\b/i;
+      // Skip-list for common navigation buttons whose attributes
+      // sometimes accidentally match (e.g. a help link containing
+      // "auth-help" in its href). We only apply this when the visible
+      // text clearly indicates the element is NOT a login trigger.
+      const SKIP_TEXT = /\b(aller\s*au|skip\s*to|menu|contenu|content|contact|accueil|home|search|recherche|lancer|toggle\s*navigation|kontakt|footer|impressum|datenschutz)\b/i;
       const candidates = Array.from(document.querySelectorAll(
         'button, a, [role="button"], input[type="button"], input[type="submit"]'
       ));
-      // Skip elements that are inside a visible login form (those are
-      // the form's submit button, not the popup-opener).
+      // Skip elements that are inside a form already showing a visible
+      // password field — those are the form's own submit button, not
+      // a popup-opening trigger.
       const insideOpenForm = (el) => {
         try {
           const f = el.closest('form');
@@ -777,43 +788,73 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         } catch (_) {}
         return false;
       };
-      const matches = candidates.filter((el) => {
-        if (!el || el.offsetParent === null) return false;
-        const text = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
-        if (!text || text.length > 40) return false;
-        if (!RX.test(text)) return false;
-        if (insideOpenForm(el)) return false;
-        return true;
-      });
-      if (matches.length === 0) {
-        // Diagnostic: list visible button-ish texts so we can broaden
-        // the matcher next iteration if needed.
+      const scoreEl = (el) => {
+        if (!el || el.offsetParent === null) return -1;
+        if (insideOpenForm(el)) return -1;
+        const innerText = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+        // Primary: visible text matches (HIGH confidence, score 3)
+        if (innerText && innerText.length <= 40 && RX.test(innerText)) {
+          if (SKIP_TEXT.test(innerText)) return -1;
+          return 3;
+        }
+        // Fallback: attribute-based (LOWER confidence, score 1)
+        const attrBlob = [
+          el.id || '',
+          el.className || '',
+          el.getAttribute('href') || '',
+          el.getAttribute('aria-label') || '',
+          el.getAttribute('data-target') || '',
+          el.getAttribute('data-toggle') || '',
+        ].join(' ').toLowerCase();
+        if (RX.test(attrBlob)) {
+          if (innerText && SKIP_TEXT.test(innerText)) return -1;
+          return 1;
+        }
+        return -1;
+      };
+      const scored = candidates
+        .map((el) => ({ el, score: scoreEl(el) }))
+        .filter((x) => x.score > 0);
+      if (scored.length === 0) {
         const sample = candidates
           .filter((el) => el.offsetParent !== null)
           .slice(0, 12)
-          .map((el) => (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 30))
+          .map((el) => {
+            const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+            const i = el.id ? `#${el.id}` : '';
+            return (t || i || '').slice(0, 30);
+          })
           .filter(Boolean);
         return { clicked: null, sample };
       }
-      matches.sort((a, b) =>
-        (a.innerText || a.value || '').length - (b.innerText || b.value || '').length
-      );
+      // Prefer high-confidence (text) matches; among same score prefer
+      // shorter text (header link vs. paragraph).
+      scored.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        const aLen = (a.el.innerText || a.el.value || '').length;
+        const bLen = (b.el.innerText || b.el.value || '').length;
+        return aLen - bLen;
+      });
       try {
-        const target = matches[0];
+        const target = scored[0].el;
         target.click();
+        const usedText = (target.innerText || target.value || target.getAttribute('aria-label') || '').trim();
+        const usedId = target.id ? `#${target.id}` : '';
         return {
-          clicked: (target.innerText || target.value || '').trim().slice(0, 40),
+          clicked: (usedText || usedId).slice(0, 40),
           sample: [],
+          confidence: scored[0].score,
         };
       } catch (_) { return { clicked: null, sample: [] }; }
     }).catch(() => ({ clicked: null, sample: [] }));
     if (clickInfo.clicked) {
-      console.log(`    ↪️  clicked login trigger "${clickInfo.clicked}" on ${hostLabel}`);
-      await new Promise((r) => setTimeout(r, 2000));
+      const conf = clickInfo.confidence === 3 ? 'text' : 'attr';
+      console.log(`    ↪️  clicked login trigger "${clickInfo.clicked}" on ${hostLabel} (match=${conf})`);
+      await new Promise((r) => setTimeout(r, 2500));
     } else if (clickInfo.sample && clickInfo.sample.length) {
       // Only log when we couldn't find a match — helps diagnose silent
       // failures like "no password field" without indicating a click.
-      console.log(`    ⚠️  no login-trigger button matched on ${hostLabel}; visible buttons: ${JSON.stringify(clickInfo.sample.slice(0, 6))}`);
+      console.log(`    ⚠️  no login-trigger button matched on ${hostLabel}; visible buttons: ${JSON.stringify(clickInfo.sample.slice(0, 8))}`);
     }
 
     const sels = await page.evaluate(() => {
