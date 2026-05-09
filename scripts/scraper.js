@@ -30,8 +30,8 @@ const MAX_PAGES = COUNTRY_FILTER_ACTIVE
 // 6h, o pilnas detail-fetch ciklas per tender'į truko ~5–10s. 4000 tenderių
 // prasilenkdavo su timeout'u ir niekas nebuvo įrašoma. Paliekam override'ą
 // per aplinkos kintamąjį jeigu kada reikės platesnio pirmojo backfill'o.
-const MAX_TENDERS = TEST_MODE ? 30 : Number(process.env.MAX_TENDERS || 500);
-const DETAILS_LIMIT = TEST_MODE ? 30 : Number(process.env.DETAILS_LIMIT || 500);
+const MAX_TENDERS = TEST_MODE ? 9 : Number(process.env.MAX_TENDERS || 500);
+const DETAILS_LIMIT = TEST_MODE ? 9 : Number(process.env.DETAILS_LIMIT || 500);
 const FLUSH_BATCH = TEST_MODE ? 1 : Number(process.env.FLUSH_BATCH || 5);
 const SOURCE_NAV_TIMEOUT = 25000;
 
@@ -170,6 +170,89 @@ function getDedicatedLoginUrl(host) {
   }
   return null;
 }
+
+// =====================================================================
+// extractQualificationHints
+// ---------------------------------------------------------------------
+// Scan a flattened public-notice text (TED, FTS, Doffin, hilma, etc.)
+// for known qualification-section anchors and return up to ~6000 chars
+// of structured snippets (one per anchor hit). The caller prepends the
+// result to the AI input so Claude sees the qualification cues UP-FRONT
+// instead of buried in 30k chars of breadcrumbs / metadata.
+//
+// Anchors are multilingual because TED renders in 24 EU langs and many
+// portals republish the notice in the buyer's local language. We match
+// case-insensitively, on word boundaries, and look for headings that
+// sit on their own line OR start a sentence (TED's flat text often
+// concatenates: "5.1.9.\nSelection criteria\n  Criterion: Type:
+// Suitability...\n").
+//
+// Output format (compact, keeps Claude focused):
+//   [HINT: Selection criteria]
+//   <up to 1200 chars of context>
+//   [HINT: Eignungskriterien]
+//   <…>
+// Returns '' (empty string) if no anchors hit.
+// =====================================================================
+function extractQualificationHints(text) {
+  if (!text || typeof text !== 'string' || text.length < 100) return '';
+  const ANCHORS = [
+    // English (TED / FTS)
+    /\b(Selection criteria|Conditions for participation|Suitability to pursue the professional activity|Economic and financial standing|Technical and professional ability|Award criteria)\b/i,
+    // Spanish (PLACSP, BOE)
+    /\b(Solvencia económica(?: y financiera)?|Solvencia técnica(?: o profesional)?|Criterios? de selección|Criterios de adjudicación|Condiciones de admisión|Criterio de Solvencia (?:Técnica|Económica))\b/i,
+    // German (DTVP, evergabe)
+    /\b(Eignungskriterien|Eignungsnachweise|Auswahlkriterien|Zuschlagskriterien|Wirtschaftliche und finanzielle Leistungsfähigkeit|Technische und berufliche Leistungsfähigkeit|Anforderungen an den Bieter)\b/i,
+    // French (marches-publics, awsolutions)
+    /\b(Critères de sélection|Conditions de participation|Capacité économique et financière|Capacité technique et professionnelle|Critères d['’]attribution)\b/i,
+    // Dutch (tenderned)
+    /\b(Selectiecriteria|Geschiktheidseisen|Economische en financiële draagkracht|Technische en beroepsbekwaamheid|Gunningscriteria|Eisen aan inschrijver)\b/i,
+    // Swedish (e-avrop, kommersannons, tendsign)
+    /\b(Urvalskriterier|Kvalificeringskrav|Krav på leverantören|Tilldelningskriterier|Ekonomisk(?: och finansiell)? ställning|Teknisk(?: och yrkesmässig)? kapacitet)\b/i,
+    // Finnish (tarjouspalvelu, hilma)
+    /\b(Valintaperusteet|Soveltuvuusvaatimukset|Taloudellinen ja rahoituksellinen tilanne|Tekninen ja ammatillinen pätevyys|Vertailuperusteet)\b/i,
+    // Norwegian (doffin)
+    /\b(Utvelgelseskriterier|Kvalifikasjonskrav|Tildelingskriterier)\b/i,
+    // Lithuanian (CVPP)
+    /\b(Kvalifikacijos reikalavimai|Pasiūlymų vertinimo kriterijai|Tiekėjų kvalifikacija)\b/i,
+    // Italian
+    /\b(Criteri di selezione|Condizioni di partecipazione|Capacità economica e finanziaria|Capacità tecnica e professionale|Criteri di aggiudicazione)\b/i,
+    // Portuguese
+    /\b(Critérios de seleção|Capacidade económica e financeira|Capacidade técnica e profissional|Critérios de adjudicação)\b/i,
+  ];
+  const hits = [];
+  const seen = new Set();
+  for (const rx of ANCHORS) {
+    // Find ALL matches per anchor (some notices have multiple lots
+    // each with their own selection-criteria block).
+    const globalRx = new RegExp(rx.source, rx.flags + 'g');
+    let m;
+    while ((m = globalRx.exec(text)) !== null) {
+      const matchStart = m.index;
+      const heading = m[0];
+      // Avoid duplicates within ~200 chars (some notices repeat the
+      // heading in nav + body — we want the body match).
+      const bucket = `${heading.toLowerCase()}@${Math.floor(matchStart / 500)}`;
+      if (seen.has(bucket)) continue;
+      seen.add(bucket);
+      // Window: 200 chars before (catch lot/section number prefix
+      // like "5.1.9." or "Apartado 15"), 1200 chars after.
+      const winStart = Math.max(0, matchStart - 200);
+      const winEnd = Math.min(text.length, matchStart + heading.length + 1200);
+      let snippet = text.slice(winStart, winEnd).replace(/\s+/g, ' ').trim();
+      if (snippet.length < 80) continue; // too thin to be useful
+      hits.push(`[HINT: ${heading}]\n${snippet}`);
+      if (hits.length >= 6) break; // hard cap so we don't overflow
+    }
+    if (hits.length >= 6) break;
+  }
+  if (hits.length === 0) return '';
+  // Total cap ~6000 chars across all hints.
+  let combined = hits.join('\n\n');
+  if (combined.length > 6000) combined = combined.slice(0, 6000) + '…';
+  return combined;
+}
+
 async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperature = 0 } = {}) {
   if (!AI_ENABLED) throw new Error('ANTHROPIC_API_KEY missing');
   // Circuit breaker — once a non-retryable error (credit balance, 401/403)
@@ -366,6 +449,7 @@ async function extractFieldsWithAI(text, meta = {}) {
   const system =
     'You extract structured procurement tender fields from free-form notice text plus attached document text. ' +
     'The user message has sections labeled TITLE / DESCRIPTION / MERCELL_PAGE / DOCUMENTS — the DOCUMENTS section, when present, contains the FULL TEXT of one or more attached PDF specifications and is usually where requirements, qualifications, and award criteria are spelled out. SCAN IT THOROUGHLY before deciding a field is empty. ' +
+    'Inside the DOCUMENTS section you may see one or more [STRUCTURED HINTS] … [/STRUCTURED HINTS] blocks: those contain ~1200-char windows centred on the SPECIFIC heading anchors ("Selection criteria", "Solvencia técnica", "Eignungskriterien", "Critères de sélection", etc.) where the qualification thresholds, certification names, and award-criteria weights live. Treat the text inside [STRUCTURED HINTS] as the PRIMARY source for `requirementsForSupplier`, `qualificationRequirements`, and `offerWeighingCriteria` — only fall back to scanning the surrounding flat text when the hints block is missing or doesn\'t cover a particular field. ' +
     'Return ONLY a JSON object (no prose, no markdown fences) with these keys: ' +
     'maxBudget, estimatedBudgetEur, duration, requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement, rejectReason, rejectCategory.\n' +
     'Rules:\n' +
@@ -763,12 +847,21 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     // empty fields). The `excludeSubmit` filter avoids clicking inside
     // a form's own submit input/button when a real form is open.
     const clickInfo = await page.evaluate(() => {
-      // Word-boundary regex covers any positioning of these tokens, so
-      // `entreprise-auth` (marches-publics popup trigger) matches via
-      // \bauth\b, while harmless words like "author"/"authority" do not
-      // (no word boundary inside "author"). Includes EN/SV/FR/DE/ES/PT/
-      // FI/NO/SI/SK/CZ/HU/RO/EL/LV/LT/Cyrillic synonyms.
-      const RX = /\b(login|log[-\s]?in|logga[-\s]?in|logon|sign[-\s]?in|signin|auth|authent\w*|anmelden|connexion|se[-\s]?connecter|identification|s'identifier|identifier|iniciar[-\s]?sesi[oó]n|acceder|entrar|kirjaudu|logg[-\s]?inn|prijava|prihl[aá]senie|p[rř]ihl[aá]sit|bejelentkez[eé]s|conectare|είσοδος|pieslēgties|prisijungti|ulogi[ts]e|вход|mon[-\s]?compte|espace[-\s]?(entreprise|personnel|fournisseur))\b/i;
+      // STRICT regex for visible-text matching — requires word boundaries
+      // on both sides so we don't pick up "Author" / "Authority" / nav
+      // headings. Covers EN/SV/FR/DE/ES/PT/FI/NO/SI/SK/CZ/HU/RO/EL/LV/
+      // LT/Cyrillic synonyms.
+      const RX_TEXT = /\b(login|log[-\s]?in|logga[-\s]?in|logon|sign[-\s]?in|signin|auth|anmelden|connexion|se[-\s]?connecter|identification|s'identifier|iniciar[-\s]?sesi[oó]n|acceder|entrar|kirjaudu|logg[-\s]?inn|prijava|prihl[aá]senie|p[rř]ihl[aá]sit|bejelentkez[eé]s|conectare|είσοδος|pieslēgties|prisijungti|ulogi[ts]e|вход|mon[-\s]?compte|espace[-\s]?(entreprise|personnel|fournisseur))\b/i;
+      // PERMISSIVE regex for ASP.NET / framework-generated identifiers
+      // where "login" / "auth" appear as camelCase tokens INSIDE a single
+      // underscore-joined id (e.g. `Header1_LoginControl1_blogLink` on
+      // e-avrop, where `_` is a word char and `\b` never matches inside).
+      // Drops boundary requirements but uses distinct enough tokens so
+      // false-positives are unlikely: "login" doesn't substring inside
+      // "logout"/"logo"/"logical"; "signin" is one word; "connexion" is
+      // distinctively French. We keep "auth" but exclude "author"/
+      // "authority" via negative lookahead.
+      const RX_ATTR = /(login|signin|sign-in|logon|auth(?!or)|connexion|connect-entreprise|entreprise-auth|identification|s-identifier|iniciar-sesion|kirjaudu|loggainn|prisijungti)/i;
       // Skip-list for common navigation buttons whose attributes
       // sometimes accidentally match (e.g. a help link containing
       // "auth-help" in its href). We only apply this when the visible
@@ -793,11 +886,14 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         if (insideOpenForm(el)) return -1;
         const innerText = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
         // Primary: visible text matches (HIGH confidence, score 3)
-        if (innerText && innerText.length <= 40 && RX.test(innerText)) {
+        if (innerText && innerText.length <= 40 && RX_TEXT.test(innerText)) {
           if (SKIP_TEXT.test(innerText)) return -1;
           return 3;
         }
-        // Fallback: attribute-based (LOWER confidence, score 1)
+        // Fallback: attribute-based (LOWER confidence, score 1).
+        // Use the permissive RX_ATTR so we catch identifiers like
+        // `Header1_LoginControl1_blogLink` (e-avrop) where word
+        // boundaries don't fire inside underscore-joined ids.
         const attrBlob = [
           el.id || '',
           el.className || '',
@@ -806,7 +902,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
           el.getAttribute('data-target') || '',
           el.getAttribute('data-toggle') || '',
         ].join(' ').toLowerCase();
-        if (RX.test(attrBlob)) {
+        if (RX_ATTR.test(attrBlob)) {
           if (innerText && SKIP_TEXT.test(innerText)) return -1;
           return 1;
         }
@@ -3954,6 +4050,36 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           ? `${publicCombined}\n\n${existing}`
           : publicCombined;
         details.pdfText = merged.slice(0, MAX_TOTAL_DOC_CHARS);
+      }
+
+      // STRUCTURED HINTS pre-extraction — scan the FINAL combined doc
+      // text (TED public notice + PLACSP PCAP + any source-side files)
+      // for known qualification-section anchors and prepend a labeled
+      // [STRUCTURED HINTS] block at the very top. Claude's system
+      // prompt instructs it to treat this block as the PRIMARY source
+      // for `qualificationRequirements` / `requirementsForSupplier` /
+      // `offerWeighingCriteria` — without this, those fields stayed
+      // empty on TED-only tenders (tenderned, marches-publics, evergabe
+      // .de) where the cues are buried inside 30k chars of metadata.
+      // Keeping the original text intact afterward so Claude can still
+      // verify / cross-reference if needed.
+      if (details.pdfText && details.pdfText.length > 500) {
+        try {
+          const hints = extractQualificationHints(details.pdfText);
+          if (hints) {
+            const headerBlock = `[STRUCTURED HINTS — qualification anchors found in source docs]\n${hints}\n[/STRUCTURED HINTS]\n\n`;
+            // Cap result at MAX_TOTAL_DOC_CHARS — hints are usually
+            // ≤6000 chars and the original text is already capped, so
+            // worst-case we trim ~6000 chars from the tail of the
+            // flat text. That tail is typically navigation / footer
+            // boilerplate in TED notices, so the trade is favourable.
+            const merged = (headerBlock + details.pdfText).slice(0, MAX_TOTAL_DOC_CHARS);
+            details.pdfText = merged;
+            console.log(`    🎯 hints extracted: ${hints.length}ch prepended (${details.pdfText.length}ch total)`);
+          }
+        } catch (e) {
+          console.log(`    ⚠️ hint extraction failed: ${(e.message || '').slice(0, 80)}`);
+        }
       }
     } catch (e) {
       console.log(`    ⚠️ document extraction error: ${e.message}`);
