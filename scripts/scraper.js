@@ -486,12 +486,59 @@ async function extractFieldsWithAI(text, meta = {}) {
       `${metaLine ? metaLine + '\n\n' : ''}Notice text:\n${trimmed}`,
       { maxTokens: 1200, temperature: 0 }
     );
-    // Claude sometimes wraps JSON in fences; strip them defensively.
-    const cleaned = out
+    // Claude sometimes wraps JSON in fences AND trails commentary
+    // ("Here's the extracted data: {...}\nNote that the duration was
+    // estimated."). The previous JSON.parse(cleaned) blew up on any
+    // trailing non-whitespace and we lost the entire extraction (real-
+    // world: "Unexpected non-whitespace character after JSON at
+    // position 637" on a tenderned tender, dropped its requirements
+    // /qualifications). Strategy: walk through the cleaned string
+    // tracking string-state and brace depth, slice from the first `{`
+    // up to the matching `}`, and parse just that substring. Falls
+    // back to whole-string parse if no balanced block is found.
+    const stripped = out
       .replace(/^```(?:json)?\s*/i, '')
       .replace(/```\s*$/i, '')
       .trim();
-    const parsed = JSON.parse(cleaned);
+    const sliceFirstJsonObject = (s) => {
+      const start = s.indexOf('{');
+      if (start === -1) return null;
+      let depth = 0;
+      let inStr = false;
+      let escape = false;
+      for (let i = start; i < s.length; i++) {
+        const ch = s[i];
+        if (escape) { escape = false; continue; }
+        if (inStr) {
+          if (ch === '\\') escape = true;
+          else if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') { inStr = true; continue; }
+        if (ch === '{') depth++;
+        else if (ch === '}') {
+          depth--;
+          if (depth === 0) return s.slice(start, i + 1);
+        }
+      }
+      return null;
+    };
+    const candidateJson = sliceFirstJsonObject(stripped) || stripped;
+    let parsed;
+    try {
+      parsed = JSON.parse(candidateJson);
+    } catch (parseErr) {
+      // Last-resort recovery: if Claude truncated the JSON mid-string
+      // (max-tokens hit), try a heuristic: append `"}` and retry.
+      // Only triggers when the error mentions an unterminated string.
+      const msg = String(parseErr.message || '');
+      if (/Unterminated string/i.test(msg)) {
+        try { parsed = JSON.parse(candidateJson + '"}'); }
+        catch (_) { throw parseErr; }
+      } else {
+        throw parseErr;
+      }
+    }
     return {
       maxBudget: (parsed.maxBudget || '').toString().trim(),
       estimatedBudgetEur: (parsed.estimatedBudgetEur || '').toString().trim(),
@@ -1002,29 +1049,60 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       try { await page.click(sels.userSel, { clickCount: 3 }); } catch (_) {}
       try { await page.type(sels.userSel, String(creds.username), { delay: 25 }); }
       catch (e) { console.log(`    ⚠️ multi-step username type failed: ${(e.message || '').slice(0, 80)}`); }
-      // Click any visible submit-like button. Prefer text "Next" /
-      // "Continue" / "Toliau" / "Pirmyn" before generic submits.
-      const advanced = await page.evaluate(() => {
-        const TXT = /^\s*(next|continue|weiter|suivant|siguiente|seuraava|nästa|pirmyn|toliau|dalej|další|další\s*krok|dalej|→)\s*$/i;
-        // Pass 1: button/input with matching visible text
-        const all = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
+      // Click the submit button that's PART OF THE SAME FORM as the
+      // username field — that's almost always the right one. Pure
+      // text-match ("Next") works in ~half of multi-step pages but
+      // fails on ASP.NET pages where the button text is something
+      // unrelated like "Logga in" / "Lähetä". Form-scope match is
+      // more reliable. Real-world failure (e-avrop run on 2026-05-09):
+      // generic "first button" fallback clicked a contact/info form's
+      // submit and we were redirected to info.e-avrop.com instead of
+      // the password step.
+      const advanced = await page.evaluate((userSelStr) => {
+        const TXT = /^\s*(next|continue|weiter|suivant|siguiente|seuraava|nästa|pirmyn|toliau|dalej|další|další\s*krok|→|logga\s*in|log\s*in|login|sign\s*in|kirjaudu|lähetä|prisijungti)\s*$/i;
+        const userEl = userSelStr ? document.querySelector(userSelStr) : null;
+        const userForm = userEl ? userEl.closest('form') : null;
+        const all = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]'));
+        // Tier 1: submit/button that's INSIDE the same form as the username field.
+        if (userForm) {
+          const inForm = all.filter((el) => {
+            if (!el || el.offsetParent === null) return false;
+            return el.closest('form') === userForm;
+          });
+          // Among in-form candidates, prefer ones whose text matches
+          // login/next, then any submit type.
+          const inFormByText = inForm.find((el) => {
+            const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+            return t.length <= 20 && TXT.test(t);
+          });
+          if (inFormByText) {
+            try { inFormByText.click(); return 'form-text:' + (inFormByText.innerText || inFormByText.value || '').trim().slice(0, 20); } catch (_) {}
+          }
+          const inFormSubmit = inForm.find((el) => {
+            const tag = el.tagName.toLowerCase();
+            if (tag === 'input') return el.type === 'submit';
+            if (tag === 'button') return el.type === 'submit' || el.type === '';
+            return false;
+          });
+          if (inFormSubmit) {
+            try { inFormSubmit.click(); return 'form-submit:' + inFormSubmit.tagName; } catch (_) {}
+          }
+        }
+        // Tier 2 (fallback): visible button with matching text anywhere
+        // on the page. Restricted to login/next vocabulary to avoid
+        // hitting Search or Subscribe buttons.
         const byText = all.find((el) => {
           if (!el || el.offsetParent === null) return false;
           const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
           return t.length <= 20 && TXT.test(t);
         });
-        if (byText) { try { byText.click(); return 'text:' + (byText.innerText || byText.value || '').trim().slice(0, 20); } catch (_) {} }
-        // Pass 2: any visible submit button / input[type=submit]
-        const generic = all.find((el) => {
-          if (!el || el.offsetParent === null) return false;
-          const tag = el.tagName.toLowerCase();
-          if (tag === 'button' && el.type !== 'submit' && el.type !== '') return false;
-          if (tag === 'input' && el.type !== 'submit') return false;
-          return tag === 'button' || tag === 'input';
-        });
-        if (generic) { try { generic.click(); return 'submit:' + generic.tagName; } catch (_) {} }
+        if (byText) {
+          try { byText.click(); return 'text:' + (byText.innerText || byText.value || '').trim().slice(0, 20); } catch (_) {}
+        }
+        // No reliable candidate — DON'T click random buttons (prevents
+        // the e-avrop info.e-avrop.com redirect failure mode).
         return null;
-      }).catch(() => null);
+      }, sels.userSel).catch(() => null);
       if (advanced) {
         console.log(`    ↪️  advanced multi-step (${advanced})`);
         // Long settle window — Microsoft / AspNet round-trips take 2-4s
