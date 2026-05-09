@@ -870,14 +870,26 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       const candidates = Array.from(document.querySelectorAll(
         'button, a, [role="button"], input[type="button"], input[type="submit"]'
       ));
-      // Skip elements that are inside a form already showing a visible
-      // password field — those are the form's own submit button, not
-      // a popup-opening trigger.
+      // Skip elements that are inside a form already showing a VISIBLE
+      // password field — those are the form's own submit button, not a
+      // popup-opening trigger. CRITICAL: we must check visibility, not
+      // just existence + aria-hidden, because some pages (e-avrop's
+      // /login.aspx) render a hidden password input via display:none
+      // for password-manager autofill hints. Without the visibility
+      // check, ALL elements inside that form (including header "Login"
+      // links) get filtered out and we never click anything.
       const insideOpenForm = (el) => {
         try {
           const f = el.closest('form');
           if (!f) return false;
-          if (f.querySelector('input[type="password"]:not([aria-hidden="true"])')) return true;
+          const passInputs = f.querySelectorAll('input[type="password"]:not([aria-hidden="true"])');
+          for (const p of passInputs) {
+            // offsetParent is null when the element OR any ancestor has
+            // display:none. Width/height === 0 covers visibility:hidden.
+            if (p.offsetParent !== null && p.offsetWidth > 0 && p.offsetHeight > 0) {
+              return true;
+            }
+          }
         } catch (_) {}
         return false;
       };
@@ -979,6 +991,72 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       ]);
       return { userSel, passSel, currentHost: location.host, currentUrl: location.href };
     }).catch(() => ({ userSel: null, passSel: null, currentHost: hostLabel, currentUrl: '' }));
+
+    // MULTI-STEP LOGIN — when a username field is visible but password
+    // isn't, the page is using the email-first / username-first pattern
+    // (Microsoft Entra, modern AspNet, e-avrop's /login.aspx). Type the
+    // username, click the submit/Next/Continue button, wait for the
+    // password field to materialise, then re-query selectors.
+    if (sels.userSel && !sels.passSel && creds.username) {
+      console.log(`    ↪️  multi-step login detected (username field present, password hidden) — typing username + advancing`);
+      try { await page.click(sels.userSel, { clickCount: 3 }); } catch (_) {}
+      try { await page.type(sels.userSel, String(creds.username), { delay: 25 }); }
+      catch (e) { console.log(`    ⚠️ multi-step username type failed: ${(e.message || '').slice(0, 80)}`); }
+      // Click any visible submit-like button. Prefer text "Next" /
+      // "Continue" / "Toliau" / "Pirmyn" before generic submits.
+      const advanced = await page.evaluate(() => {
+        const TXT = /^\s*(next|continue|weiter|suivant|siguiente|seuraava|nästa|pirmyn|toliau|dalej|další|další\s*krok|dalej|→)\s*$/i;
+        // Pass 1: button/input with matching visible text
+        const all = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
+        const byText = all.find((el) => {
+          if (!el || el.offsetParent === null) return false;
+          const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+          return t.length <= 20 && TXT.test(t);
+        });
+        if (byText) { try { byText.click(); return 'text:' + (byText.innerText || byText.value || '').trim().slice(0, 20); } catch (_) {} }
+        // Pass 2: any visible submit button / input[type=submit]
+        const generic = all.find((el) => {
+          if (!el || el.offsetParent === null) return false;
+          const tag = el.tagName.toLowerCase();
+          if (tag === 'button' && el.type !== 'submit' && el.type !== '') return false;
+          if (tag === 'input' && el.type !== 'submit') return false;
+          return tag === 'button' || tag === 'input';
+        });
+        if (generic) { try { generic.click(); return 'submit:' + generic.tagName; } catch (_) {} }
+        return null;
+      }).catch(() => null);
+      if (advanced) {
+        console.log(`    ↪️  advanced multi-step (${advanced})`);
+        // Long settle window — Microsoft / AspNet round-trips take 2-4s
+        await new Promise((r) => setTimeout(r, 4000));
+      } else {
+        // No submit found — try Enter as last resort
+        try { await page.keyboard.press('Enter'); } catch (_) {}
+        await new Promise((r) => setTimeout(r, 4000));
+      }
+      // Re-query selectors after the multi-step advance.
+      const sels2 = await page.evaluate(() => {
+        const findVisible = (selectors) => {
+          for (const sel of selectors) {
+            try {
+              const el = document.querySelector(sel);
+              if (el && el.offsetParent !== null) return sel;
+            } catch (_) {}
+          }
+          return null;
+        };
+        const passSel = findVisible([
+          'input[type="password"]:not([disabled]):not([aria-hidden="true"])',
+        ]);
+        return { passSel, currentHost: location.host, currentUrl: location.href };
+      }).catch(() => ({ passSel: null }));
+      if (sels2.passSel) {
+        sels.passSel = sels2.passSel;
+        if (sels2.currentHost) sels.currentHost = sels2.currentHost;
+        sels.userSel = null; // already typed
+        console.log(`    ✓ password field appeared after multi-step advance`);
+      }
+    }
 
     if (!sels.passSel) {
       console.log(`    ❌ no password field on ${hostLabel} (post-redirect: ${sels.currentHost})`);
