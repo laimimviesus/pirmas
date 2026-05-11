@@ -2038,6 +2038,186 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
   }
 }
 
+// =====================================================================
+// fetchTenderNedDocuments
+// ---------------------------------------------------------------------
+// Mercell tenders sourced from tenderned.nl (~all NL public tenders)
+// expose attachments via Mercell's `files[]` JSON, but the URLs all
+// point to old-dc-import-notices-prod.s3.eu... — the S3 bucket returns
+// 403 for our session. TenderNed itself hosts the SAME documents on
+// its own domain with public download. We open the announcement page,
+// scrape in-page anchors that point to tenderned.nl document download
+// endpoints, fetch each PDF/DOCX directly, and parse text. Returns a
+// list of text snippets (one per parsed doc) that the caller merges
+// into result.sourceFilesText.
+//
+// Priority terms (Dutch / EU procurement):
+//   Selectieleidraad      — selection guide (top-priority qualifications)
+//   Selectiecriterium     — selection criterion (most direct match)
+//   Programma van Eisen   — requirements programme (technical reqs)
+//   UEA / ESPD            — Uniform European Procurement Document
+//   Aanbestedingsleidraad — procurement guide (often contains both reqs and quals)
+// =====================================================================
+async function fetchTenderNedDocuments(browser, sourceUrl) {
+  let noticeId = null;
+  try {
+    const u = new URL(sourceUrl);
+    if (!/(^|\.)tenderned\.nl$/i.test(u.hostname)) return [];
+    const m = u.pathname.match(/\/aankondigingen\/overzicht\/(\d+)/i);
+    if (!m) return [];
+    noticeId = m[1];
+  } catch (_) { return []; }
+
+  // Optional libs — same lazy-load pattern as fetchEuSupplyDocuments.
+  let pdfParseLib = null;
+  let mammothLib = null;
+  try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(20000);
+    page.setDefaultTimeout(20000);
+
+    try {
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    } catch (e) {
+      console.log(`    🇳🇱 tenderned: nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // Harvest in-page document anchors. TenderNed renders document
+    // links inline on the announcement page (Documenten section).
+    // Typical hrefs are absolute paths like /papi/tenderned-rs-tns/...
+    // /publicaties/<noticeId>/documenten/<docId> with PDF/DOCX content.
+    // We capture ANY href on tenderned.nl that looks document-y plus
+    // the anchor's visible text (used for priority scoring).
+    const docs = await page.evaluate(() => {
+      const RX_DOC_EXT = /\.(pdf|docx?|xlsx?|zip|rtf|odt|ods)(?:[?#]|$)/i;
+      const RX_DOC_PATH = /\/(?:document(?:en)?|bestand(?:en)?|attachment|download|papi\/.*?\/documenten)\b/i;
+      const seen = new Set();
+      const out = [];
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      for (const a of anchors) {
+        const hrefRaw = a.getAttribute('href') || '';
+        if (!hrefRaw || hrefRaw.startsWith('#') || /^javascript:/i.test(hrefRaw)) continue;
+        let abs;
+        try { abs = new URL(hrefRaw, location.href).toString(); }
+        catch (_) { continue; }
+        // Same-domain only — skip cross-host like Mercell S3.
+        let absHost;
+        try { absHost = new URL(abs).hostname.toLowerCase(); }
+        catch (_) { continue; }
+        if (!/(^|\.)tenderned\.nl$/i.test(absHost)) continue;
+        // Must look document-y (extension or path keyword).
+        const path = (new URL(abs)).pathname;
+        const search = (new URL(abs)).search;
+        if (!RX_DOC_EXT.test(path) && !RX_DOC_EXT.test(search) && !RX_DOC_PATH.test(path)) continue;
+        if (seen.has(abs)) continue;
+        seen.add(abs);
+        const text = ((a.innerText || a.textContent || '') + ' ' + (a.getAttribute('title') || ''))
+          .trim().replace(/\s+/g, ' ').slice(0, 200);
+        out.push({ url: abs, name: text || abs.slice(-80) });
+      }
+      return out;
+    }).catch(() => []);
+
+    if (!docs.length) {
+      console.log(`    🇳🇱 tenderned: notice ${noticeId} — no document anchors found on page`);
+      return [];
+    }
+    console.log(`    🇳🇱 tenderned: notice ${noticeId} — ${docs.length} document anchor(s) found`);
+
+    // Priority — Selectieleidraad / Selectiecriterium > Aanbestedingsleidraad
+    // > Programma van Eisen > UEA/ESPD > rest. Higher score = fetched first.
+    // We hard-cap at the top 6 docs to bound runtime.
+    const SCORE_RULES = [
+      { rx: /selectie\s*leidraad|selectiecriteri|selectie[-\s]?eisen|selection\s*criteria/i, score: 25 },
+      { rx: /aanbestedings?\s*leidraad|procurement\s*guide/i, score: 18 },
+      { rx: /programma\s*van\s*eisen|requirements\s*programme/i, score: 12 },
+      { rx: /uea|espd|uniform\s*europees\s*aanbestedingsdocument/i, score: 8 },
+      { rx: /aankondiging|EF16/i, score: 5 },
+    ];
+    for (const d of docs) {
+      d.score = 0;
+      for (const r of SCORE_RULES) {
+        if (r.rx.test(d.name) || r.rx.test(d.url)) { d.score = Math.max(d.score, r.score); }
+      }
+    }
+    docs.sort((a, b) => b.score - a.score);
+    const topDocs = docs.slice(0, 6);
+    console.log(`    🇳🇱 tenderned: priority docs: ${topDocs.map(d => `${d.name.slice(0, 40)}[s=${d.score}]`).join(' | ')}`);
+
+    const texts = [];
+    for (const doc of topDocs) {
+      const labelName = doc.name.slice(0, 100);
+      // Fetch via page.evaluate so we keep the same session cookies.
+      const result = await page.evaluate(async (url) => {
+        try {
+          const resp = await fetch(url, {
+            credentials: 'include',
+            redirect: 'follow',
+          });
+          if (!resp.ok) return { ok: false, status: resp.status };
+          const ct = resp.headers.get('content-type') || '';
+          const cd = resp.headers.get('content-disposition') || '';
+          const ab = await resp.arrayBuffer();
+          return {
+            ok: true,
+            status: resp.status,
+            ct,
+            cd,
+            url: resp.url || url,
+            data: Array.from(new Uint8Array(ab)),
+          };
+        } catch (e) {
+          return { ok: false, error: String(e).slice(0, 200) };
+        }
+      }, doc.url).catch((e) => ({ ok: false, error: e.message }));
+
+      if (!result || !result.ok || !result.data || result.data.length < 500) {
+        const status = result?.status || result?.error || '?';
+        console.log(`    ⚠️  tenderned: download failed for "${labelName}" (status=${status})`);
+        continue;
+      }
+      const buf = Buffer.from(result.data);
+      const ctL = (result.ct || '').toLowerCase();
+      const isPdf = buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
+      const isDocx = ctL.includes('officedocument.wordprocessingml')
+        || (buf[0] === 0x50 && buf[1] === 0x4b && /\.docx(?:[?#]|$)/i.test(doc.url));
+      try {
+        let text = '';
+        if (isPdf && pdfParseLib) {
+          const parsed = await pdfParseLib(buf);
+          text = ((parsed && parsed.text) || '').trim();
+        } else if (isDocx && mammothLib) {
+          const out = await mammothLib.extractRawText({ buffer: buf });
+          text = ((out && out.value) || '').trim();
+        } else {
+          console.log(`    ⚠️  tenderned: "${labelName}" — unsupported type (ct=${ctL.slice(0, 40)})`);
+          continue;
+        }
+        if (text.length > 200) {
+          const clipped = text.slice(0, 80000);
+          texts.push(`--- (tenderned) ${labelName} ---\n${clipped}`);
+          console.log(`    🇳🇱 tenderned: parsed "${labelName}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+        } else {
+          console.log(`    ⚠️  tenderned: "${labelName}" extracted text too short (${text.length}ch)`);
+        }
+      } catch (e) {
+        console.log(`    ⚠️  tenderned: parse failed for "${labelName}": ${(e.message || '').slice(0, 80)}`);
+      }
+    }
+    return texts;
+  } catch (e) {
+    console.log(`    ⚠️  tenderned handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
 async function fetchSourcePageDetails(browser, sourceUrl) {
   // URL scheme normalisation — Mercell sometimes returns sourceUrl
   // values like "www.conselleriadefacenda.es/silex" without an
@@ -3219,6 +3399,26 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     } catch (e) {
       console.log(`    ⚠️ eu-supply handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // TenderNed (www.tenderned.nl) Documents handler — NL public tenders.
+    // The announcement page itself only contains metadata + scope; the
+    // formal Selectiecriteria / Programma van Eisen sit in attached
+    // PDFs/DOCXs that Mercell exposes as S3 URLs (all 403). TenderNed
+    // hosts the same documents on its own domain — we harvest in-page
+    // anchors and download directly. No-op for non-tenderned sources.
+    try {
+      const tenderNedTexts = await fetchTenderNedDocuments(browser, sourceUrl);
+      if (tenderNedTexts && tenderNedTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + tenderNedTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇳🇱 tenderned: appended ${tenderNedTexts.length} doc(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ tenderned handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     srcPage.off('request', blockHandler);
