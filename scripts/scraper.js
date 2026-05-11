@@ -998,6 +998,12 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       });
       try {
         const target = scored[0].el;
+        // Capture the href BEFORE click — some single-page-app handlers
+        // mutate the element's href on click (or replace it entirely).
+        // We need the original to follow it as a fallback if the click
+        // itself didn't trigger navigation.
+        const hrefRaw = (target.tagName === 'A') ? (target.getAttribute('href') || '') : '';
+        const urlBefore = location.href;
         target.click();
         const usedText = (target.innerText || target.value || target.getAttribute('aria-label') || '').trim();
         const usedId = target.id ? `#${target.id}` : '';
@@ -1005,13 +1011,58 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
           clicked: (usedText || usedId).slice(0, 40),
           sample: [],
           confidence: scored[0].score,
+          href: hrefRaw,
+          urlBefore,
         };
       } catch (_) { return { clicked: null, sample: [] }; }
     }).catch(() => ({ clicked: null, sample: [] }));
     if (clickInfo.clicked) {
       const conf = clickInfo.confidence === 3 ? 'text' : 'attr';
       console.log(`    ↪️  clicked login trigger "${clickInfo.clicked}" on ${hostLabel} (match=${conf})`);
-      await new Promise((r) => setTimeout(r, 2500));
+      // Nav-aware settle — if the click triggered a real navigation
+      // (typical for ASP.NET LoginControl links that navigate to a
+      // separate /secure/login page), wait for it to finish before
+      // checking selectors. Without this we'd hit the OLD page's DOM
+      // and conclude "no password field" while the real one was still
+      // loading. Race against a 3s upper bound so we don't hang when
+      // the click is a no-op (JS handler with no nav).
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => null),
+        new Promise((r) => setTimeout(r, 3000)),
+      ]);
+      // Href fallback — if the click attached to an <a> with a real
+      // URL but did NOT change page location (handler stopped event
+      // propagation, returned false, or used a JS modal we can't see),
+      // navigate to that URL directly. Skips javascript: hrefs and
+      // anchor-only "#foo" fragments. This handles e-avrop's
+      // Header1_LoginControl1_blogLink which sometimes only swaps the
+      // header DOM in-place without exposing a password input.
+      try {
+        const currentUrl = page.url();
+        const sameLocation = currentUrl === clickInfo.urlBefore;
+        const href = String(clickInfo.href || '').trim();
+        if (sameLocation && href && !/^javascript:/i.test(href) && !/^#/.test(href)) {
+          let target = href;
+          if (target.startsWith('/')) {
+            try {
+              const u = new URL(currentUrl);
+              target = u.origin + target;
+            } catch (_) {}
+          } else if (!/^https?:\/\//i.test(target)) {
+            // Relative path — resolve against currentUrl
+            try { target = new URL(href, currentUrl).toString(); } catch (_) {}
+          }
+          if (/^https?:\/\//i.test(target) && target !== currentUrl) {
+            console.log(`    ↪️  click stayed on same URL — following href directly: ${target.slice(0, 80)}`);
+            try {
+              await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 10000 });
+              await new Promise((r) => setTimeout(r, 1500));
+            } catch (e) {
+              console.log(`    ⚠️  href-fallback nav failed: ${(e.message || '').slice(0, 80)}`);
+            }
+          }
+        }
+      } catch (_) { /* best-effort */ }
     } else if (clickInfo.sample && clickInfo.sample.length) {
       // Only log when we couldn't find a match — helps diagnose silent
       // failures like "no password field" without indicating a click.
@@ -1240,6 +1291,171 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
 // daugiakalbius raktažodžius (EN/SV/NO/DA/FI/DE/FR/NL/ES/PT/IT) ir grąžina
 // objektą. Netrikdo pagrindinio `page` konteksto.
 // =====================================================================
+
+// =====================================================================
+// resolveMarchesPublicsDeepLink
+// ---------------------------------------------------------------------
+// Mercell's "Go to source" target for marches-publics.gouv.fr is almost
+// always the bare root URL ("https://www.marches-publics.gouv.fr/") or
+// the advanced-search index — NOT the actual tender detail page. After
+// we successfully login (via attemptPortalLogin), we still can't read
+// the tender content because we don't know its real URL.
+//
+// This helper takes the `fileReferenceNumber` field that Mercell DOES
+// give us (e.g. "B26-01823-MP", "A2026-018"), opens the logged-in
+// advanced-search page, fills the reference field, submits, and parses
+// the result list looking for an anchor whose row text contains the
+// reference. Returns that anchor's URL (resolved to absolute) or null
+// if any step fails.
+//
+// The browser context is shared with the post-login session, so the
+// cookies set by attemptPortalLogin authenticate this navigation.
+// Best-effort + heavy diagnostic logging so we can iterate on selectors
+// across portal-platform versions without re-deploying blind.
+// =====================================================================
+async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel) {
+  if (!referenceNumber || typeof referenceNumber !== 'string') return null;
+  const ref = referenceNumber.trim();
+  if (ref.length < 3 || ref.length > 60) return null;
+  const searchPage = `https://www.marches-publics.gouv.fr/?page=Entreprise.EntrepriseAdvancedSearch&AllCons`;
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(15000);
+    await page.goto(searchPage, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await new Promise((r) => setTimeout(r, 1500));
+    // Step 1: find an input that looks like a reference/numéro de
+    // consultation field. marches-publics uses ASP.NET-style ids
+    // (`ctl0_CONTENU_PAGE_AdvancedSearch_reference`) so we match by
+    // id/name/placeholder/label-text substrings.
+    const filled = await page.evaluate((refVal) => {
+      const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
+      const visible = inputs.filter((i) => i.offsetParent !== null);
+      // Score each visible input — higher = more likely the reference field.
+      const score = (el) => {
+        const id = (el.id || '').toLowerCase();
+        const name = (el.name || '').toLowerCase();
+        const ph = (el.placeholder || '').toLowerCase();
+        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+        const blob = `${id} ${name} ${ph} ${aria}`;
+        let s = 0;
+        if (/\breference\b|\bréférence\b|\bref$|numero(_)?cons|num(_)?cons|numéro\s*de\s*consultation/i.test(blob)) s += 10;
+        if (/intitul[eé]|object|libell[eé]/i.test(blob)) s += 1; // weaker — title-by-keyword field
+        // Adjacent <label> text gives strong evidence
+        try {
+          const lbl = (el.labels && el.labels[0]) || document.querySelector(`label[for="${el.id}"]`);
+          if (lbl) {
+            const lt = (lbl.innerText || '').toLowerCase();
+            if (/référence|reference|numéro\s*de\s*consultation|consultation/.test(lt)) s += 8;
+          }
+        } catch (_) {}
+        return s;
+      };
+      const scored = visible.map((el) => ({ el, s: score(el) })).filter((x) => x.s > 0);
+      if (scored.length === 0) {
+        // Fallback: return diagnostic listing so we can refine selectors.
+        const sample = visible.slice(0, 8).map((el) => ({
+          id: el.id || '',
+          name: el.name || '',
+          placeholder: el.placeholder || '',
+        }));
+        return { ok: false, sample };
+      }
+      scored.sort((a, b) => b.s - a.s);
+      const target = scored[0].el;
+      try {
+        target.focus();
+        target.value = refVal;
+        target.dispatchEvent(new Event('input', { bubbles: true }));
+        target.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, used: target.id || target.name || target.placeholder, score: scored[0].s };
+      } catch (e) {
+        return { ok: false, error: String(e && e.message || e) };
+      }
+    }, ref).catch((e) => ({ ok: false, error: String(e && e.message || e) }));
+    if (!filled || !filled.ok) {
+      const sampleStr = filled && filled.sample
+        ? ` (visible inputs: ${JSON.stringify(filled.sample.slice(0, 6))})`
+        : '';
+      console.log(`    ⚠️  marches-publics search: no reference field matched${sampleStr}`);
+      return null;
+    }
+    console.log(`    ↪️  marches-publics search: filled "${filled.used}" (score=${filled.score}) with reference "${ref}"`);
+    // Step 2: submit the form. Prefer the actual reference field's
+    // parent form's submit button to avoid hitting the global header
+    // search bar.
+    const submitted = await page.evaluate((refVal) => {
+      const inputs = Array.from(document.querySelectorAll('input'));
+      const refInput = inputs.find((i) => i.value === refVal && i.offsetParent !== null);
+      const form = refInput ? refInput.closest('form') : null;
+      const candidates = form
+        ? Array.from(form.querySelectorAll('input[type="submit"], button[type="submit"], button:not([type])'))
+        : Array.from(document.querySelectorAll('input[type="submit"], button[type="submit"]'));
+      const visible = candidates.filter((b) => b.offsetParent !== null);
+      // Prefer button with "rechercher" / "search" text
+      const byText = visible.find((b) => {
+        const t = (b.innerText || b.value || '').trim().toLowerCase();
+        return /rechercher|search|valider|lancer\s*la\s*recherche/.test(t);
+      });
+      const target = byText || visible[0];
+      if (!target) return null;
+      try { target.click(); return (target.innerText || target.value || target.id || 'submit').toString().slice(0, 30); }
+      catch (_) { return null; }
+    }, ref).catch(() => null);
+    if (!submitted) {
+      console.log(`    ⚠️  marches-publics search: no submit button found`);
+      return null;
+    }
+    console.log(`    ↪️  marches-publics search: submitted ("${submitted}")`);
+    // Step 3: wait for navigation OR network idle (the page may post
+    // and re-render in-place without changing URL).
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => null),
+      new Promise((r) => setTimeout(r, 4000)),
+    ]);
+    await new Promise((r) => setTimeout(r, 1500));
+    // Step 4: find a link in the results matching the reference.
+    const tenderUrl = await page.evaluate((refVal) => {
+      const refLow = refVal.toLowerCase();
+      // Most marches-publics result rows are <tr> with the reference in
+      // one cell and a link in another. Look for any <tr> containing the
+      // reference text, then return the first <a href> inside.
+      const rows = Array.from(document.querySelectorAll('tr, .ligne, .consultation, .resultat'));
+      for (const row of rows) {
+        const text = (row.innerText || '').toLowerCase();
+        if (text.includes(refLow)) {
+          const link = row.querySelector('a[href]:not([href*="mailto"])');
+          if (link && link.href) return link.href;
+        }
+      }
+      // Fallback 1: anchor whose own text includes the reference
+      const allLinks = Array.from(document.querySelectorAll('a[href]'));
+      const byTextLink = allLinks.find((a) => {
+        const t = (a.innerText || '').toLowerCase();
+        return t.includes(refLow);
+      });
+      if (byTextLink && byTextLink.href) return byTextLink.href;
+      // Fallback 2: anchor whose href includes the reference (some
+      // portals encode the reference into the URL).
+      const byHrefLink = allLinks.find((a) => {
+        const h = (a.href || '').toLowerCase();
+        return h.includes(refLow);
+      });
+      return byHrefLink ? byHrefLink.href : null;
+    }, ref).catch(() => null);
+    if (!tenderUrl) {
+      console.log(`    ⚠️  marches-publics search: no result link matched reference "${ref}"`);
+      return null;
+    }
+    console.log(`    ✅ marches-publics search → tender URL: ${tenderUrl.slice(0, 100)}`);
+    return tenderUrl;
+  } catch (e) {
+    console.log(`    ⚠️  marches-publics search error: ${(e.message || String(e)).slice(0, 120)}`);
+    return null;
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
 
 async function fetchSourcePageDetails(browser, sourceUrl) {
   // URL scheme normalisation — Mercell sometimes returns sourceUrl
@@ -4335,8 +4551,28 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
             browser, details.sourceUrl, creds, src.sourceHost
           );
           if (ok) {
+            // marches-publics deep-link resolution — Mercell almost
+            // always gives us the root URL ("/" or "?page=Entreprise
+            // .EntrepriseAdvancedSearch&AllCons") for this portal, so
+            // even when logged in we land on the user dashboard, not
+            // the tender page. Use the fileReferenceNumber to search
+            // the now-authenticated portal and find the real tender
+            // URL. Falls through to the default refetch if anything
+            // fails. Real-world: this is the difference between 4%
+            // and ~40% marches-publics qualification rate.
+            let refetchUrl = details.sourceUrl;
+            if (/(^|\.)marches-publics\.gouv\.fr$/i.test(src.sourceHost || '')
+                && details.referenceNumber) {
+              const deepLink = await resolveMarchesPublicsDeepLink(
+                browser, details.referenceNumber, src.sourceHost
+              );
+              if (deepLink) {
+                refetchUrl = deepLink;
+                console.log(`    ↪️  marches-publics: using deep-link for post-login fetch instead of root URL`);
+              }
+            }
             const t1 = Date.now();
-            postLoginSrc = await fetchSourcePageDetails(browser, details.sourceUrl);
+            postLoginSrc = await fetchSourcePageDetails(browser, refetchUrl);
             console.log(
               `    🔁 post-login source fetch: ${Date.now() - t1}ms ` +
               `(gated=${!!postLoginSrc?.loginGated}, err=${postLoginSrc?.error || 'none'})`
