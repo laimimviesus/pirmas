@@ -960,6 +960,28 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     // Allow client-side redirects / SPA login forms to settle.
     await new Promise((r) => setTimeout(r, 1500));
 
+    // SPA RENDER POLL — Cloudia (login.cloudia.net) and a handful of
+    // other login pages are JS-rendered: the password input doesn't
+    // exist in the initial HTML and only appears after React/Angular
+    // mounts. The 1.5s settle above isn't enough; the pre-check below
+    // misses the form, the trigger scorer doesn't find a Login button
+    // either, and we fail with "no password field". Poll up to 6s
+    // looking for a visible password input or a logged-in marker
+    // before falling through. Returns fast (~50ms) for portals whose
+    // form is already there, so it doesn't penalize the common path.
+    // 2026-05-11 fix for tarjouspalvelu.fi/cloudia regression.
+    try {
+      await page.waitForFunction(() => {
+        try {
+          for (const el of document.querySelectorAll('input[type="password"]:not([disabled]):not([aria-hidden="true"])')) {
+            if (el && el.offsetParent !== null && el.offsetWidth > 0 && el.offsetHeight > 0) return true;
+          }
+          const RX_LOGGED = /\b(?:log\s*out|log\s*off|logout|logga\s*ut|sign\s*out|d[eé]connexion|abmelden|cerrar\s*sesi[oó]n|kirjaudu\s*ulos|wyloguj|my\s*pages|my\s*account|min(?:a)?\s*(?:profil|sidor|side)|mein\s*konto|mon\s*compte|mitt\s*konto)\b/i;
+          return RX_LOGGED.test(((document.body && document.body.innerText) || '').slice(0, 4000));
+        } catch (_) { return false; }
+      }, { timeout: 6000, polling: 250 }).catch(() => null);
+    } catch (_) { /* best-effort */ }
+
     // ALREADY-LOGGED-IN CHECK — when a prior tender's login left cookies
     // in this browser context, navigating to /login.aspx (or equivalent)
     // typically renders the logged-in shell instead of a login form:
