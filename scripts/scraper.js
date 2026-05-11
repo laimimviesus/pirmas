@@ -2288,8 +2288,93 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       console.log(`    simap interest-button handler error: ${e.message}`);
     }
 
-    const result = await srcPage.evaluate((simapInterestClicked) => {
-      const bodyText = (document.body?.innerText || '').trim();
+    // --- EXTRA SETTLE for ALWAYS_LOGIN_HOSTS post-auth pages ------------
+    //
+    // 2026-05-11 e-avrop diagnostic: after a successful login, the
+    // Announcement.aspx page loads its main render in TWO phases. The
+    // first paint settles around domcontentloaded + 1.2s — that's just
+    // the masterpage nav chrome ("My pages / Log off / ANNOUNCEMENTS /
+    // Language SV EN"). The actual tender body comes in via XHR roughly
+    // 4-8s later, often inside an <iframe> the ASPX renderer injects
+    // dynamically. The existing waitForFunction(>800ch) timed out at
+    // 12s with only ~200ch of chrome, so we shipped to the eval with
+    // an empty body.
+    //
+    // Workaround in two parts:
+    //   1. Networkidle settle (5s) so deferred XHRs land.
+    //   2. The main eval below walks same-origin <iframe>s and merges
+    //      their innerText into bodyText so all qualification/regex
+    //      extractors see the actual tender content.
+    let postAuthHostMatch = false;
+    try {
+      const currentHost = new URL(srcPage.url()).hostname.toLowerCase();
+      postAuthHostMatch = hostRequiresLogin(currentHost);
+    } catch (_) { /* keep false */ }
+    if (postAuthHostMatch) {
+      try {
+        await srcPage.waitForNetworkIdle({ idleTime: 800, timeout: 6000 }).catch(() => {});
+        // Belt-and-braces: short additional settle for slow ASPX iframes
+        // that hydrate after the network goes idle.
+        await new Promise(r => setTimeout(r, 1500));
+      } catch (_) { /* best-effort */ }
+      // Quick diagnostic so we can iterate on the extraction strategy
+      // without re-deploying blind. Logs iframe count + same-origin
+      // accessible iframe content lengths.
+      try {
+        const diag = await srcPage.evaluate(() => {
+          const iframes = Array.from(document.querySelectorAll('iframe'));
+          const summary = iframes.slice(0, 6).map((f) => {
+            const src = f.getAttribute('src') || '(no src)';
+            let accessible = false;
+            let textLen = 0;
+            try {
+              const doc = f.contentDocument;
+              if (doc && doc.body) {
+                accessible = true;
+                textLen = (doc.body.innerText || '').length;
+              }
+            } catch (_) { /* cross-origin — leave inaccessible */ }
+            return { src: src.slice(0, 120), accessible, textLen };
+          });
+          return {
+            count: iframes.length,
+            url: location.href,
+            bodyLen: (document.body?.innerText || '').length,
+            iframes: summary,
+          };
+        });
+        console.log(
+          `    🔎 post-auth diag: bodyLen=${diag.bodyLen}, iframes=${diag.count}` +
+          (diag.iframes.length ? ` (${diag.iframes.map(f => `${f.accessible ? '✓' : '✗'}${f.textLen ? ' '+f.textLen+'ch' : ''} ${f.src.slice(0, 60)}`).join('; ')})` : '')
+        );
+      } catch (_) { /* diag is best-effort */ }
+    }
+
+    const result = await srcPage.evaluate((simapInterestClicked, mergeIframes) => {
+      // Walk same-origin iframes and concatenate their innerText into
+      // a combined body string. Falls back to just document.body
+      // when no iframes are present or all are cross-origin. Enabled
+      // only for ALWAYS_LOGIN_HOSTS so we don't slow down hosts that
+      // don't need it. 2026-05-11 e-avrop fix: Announcement.aspx
+      // wraps the tender content inside <iframe id="ctl00_..."> after
+      // login, and document.body alone returns only header/footer.
+      let bodyText = (document.body?.innerText || '').trim();
+      if (mergeIframes) {
+        try {
+          const iframes = Array.from(document.querySelectorAll('iframe'));
+          for (const f of iframes) {
+            try {
+              const doc = f.contentDocument;
+              if (doc && doc.body) {
+                const t = (doc.body.innerText || '').trim();
+                if (t && t.length > 50) {
+                  bodyText += '\n\n[iframe:' + (f.getAttribute('src') || '').slice(0, 80) + ']\n' + t;
+                }
+              }
+            } catch (_) { /* cross-origin — skip */ }
+          }
+        } catch (_) { /* keep document.body fallback */ }
+      }
 
       // --- LOGIN-WALL DETEKTORIUS -----------------------------------
       //
@@ -2780,7 +2865,7 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
         placspStats: placspResult.stats,
         simapInterestClicked: !!simapInterestClicked,
       };
-    }, simapInterestClicked);
+    }, simapInterestClicked, postAuthHostMatch);
 
     // Defense-in-depth: if the early PLACSP snapshot found docs but the
     // main eval didn't (page state changed in between), use the
@@ -5182,8 +5267,8 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           console.log(`    source fields (post-login):`, JSON.stringify(srcFieldSummary));
           if (postLoginSrc.bodyTextPreview) {
             console.log(
-              `    source body preview (first 300ch): ` +
-              postLoginSrc.bodyTextPreview.slice(0, 300).replace(/\s+/g, ' ')
+              `    source body preview (first 600ch): ` +
+              postLoginSrc.bodyTextPreview.slice(0, 600).replace(/\s+/g, ' ')
             );
           }
           if (!details.referenceNumber && postLoginSrc.referenceNumberSource) {
