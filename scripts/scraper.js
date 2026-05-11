@@ -17,9 +17,48 @@ const TEST_MODE = process.env.TEST_MODE === 'true';
 // tenders whose country doesn't match. Useful for one-off debug runs
 // against a specific procurement portal (e.g. Spain → PLACSP /
 // contrataciondelestado.es).
-const COUNTRY_FILTER = (process.env.COUNTRY_FILTER || '')
+// Country variants — Mercell tender cards expose `country` as a plain
+// English string ("Netherlands"/"United Kingdom"/etc.). Users typing
+// COUNTRY_FILTER often write the colloquial / lowercased form ("uk",
+// "netherlands", "the netherlands"). To avoid silent zero-match runs
+// (2026-05-12 Netherlands run: 420 tenders all filtered out), every
+// filter token is normalised to lowercase AND expanded to a small set
+// of equivalent aliases before comparison.
+const COUNTRY_ALIASES = {
+  'netherlands':       ['netherlands', 'the netherlands', 'holland', 'nl'],
+  'the netherlands':   ['netherlands', 'the netherlands', 'holland', 'nl'],
+  'holland':           ['netherlands', 'the netherlands', 'holland', 'nl'],
+  'united kingdom':    ['united kingdom', 'uk', 'great britain', 'britain', 'england'],
+  'uk':                ['united kingdom', 'uk', 'great britain', 'britain', 'england'],
+  'great britain':     ['united kingdom', 'uk', 'great britain', 'britain', 'england'],
+  'czech republic':    ['czech republic', 'czechia'],
+  'czechia':           ['czech republic', 'czechia'],
+  'germany':           ['germany', 'deutschland'],
+  'deutschland':       ['germany', 'deutschland'],
+  'spain':             ['spain', 'españa', 'espana'],
+  'sweden':            ['sweden', 'sverige'],
+  'finland':           ['finland', 'suomi'],
+  'norway':            ['norway', 'norge'],
+  'denmark':           ['denmark', 'danmark'],
+  'france':            ['france'],
+  'belgium':           ['belgium', 'belgique', 'belgië', 'belgie'],
+  'estonia':           ['estonia', 'eesti'],
+  'lithuania':         ['lithuania', 'lietuva'],
+  'latvia':            ['latvia', 'latvija'],
+  'austria':           ['austria', 'österreich', 'osterreich'],
+  'switzerland':       ['switzerland', 'schweiz', 'suisse', 'svizzera'],
+  'portugal':          ['portugal'],
+  'ireland':           ['ireland', 'éire', 'eire'],
+};
+const COUNTRY_FILTER_RAW = (process.env.COUNTRY_FILTER || '')
   .split(',').map(s => s.trim()).filter(Boolean);
-const COUNTRY_FILTER_ACTIVE = COUNTRY_FILTER.length > 0;
+const COUNTRY_FILTER = new Set();
+for (const token of COUNTRY_FILTER_RAW) {
+  const lower = token.toLowerCase();
+  const variants = COUNTRY_ALIASES[lower] || [lower];
+  for (const v of variants) COUNTRY_FILTER.add(v);
+}
+const COUNTRY_FILTER_ACTIVE = COUNTRY_FILTER.size > 0;
 // When a filter is active, allow many more listing pages than usual —
 // matching tenders may be sparse (e.g. Spanish IT tenders are <2% of
 // the global feed), so a 1-page cap in TEST_MODE would never find any.
@@ -36,7 +75,7 @@ const FLUSH_BATCH = TEST_MODE ? 1 : Number(process.env.FLUSH_BATCH || 5);
 const SOURCE_NAV_TIMEOUT = 25000;
 
 if (COUNTRY_FILTER_ACTIVE) {
-  console.log(`🔎 COUNTRY_FILTER active: only collecting tenders from ${COUNTRY_FILTER.join(', ')} (max pages: ${MAX_PAGES})`);
+  console.log(`🔎 COUNTRY_FILTER active: only collecting tenders from ${Array.from(COUNTRY_FILTER).join(', ')} (max pages: ${MAX_PAGES})`);
 }
 
 // --- Anthropic Claude API ---------------------------------------------
@@ -5945,7 +5984,8 @@ async function runScraper() {
         // filteredOnThisPage so the page-emptiness heuristic still
         // triggers correctly when no matches exist.
         if (COUNTRY_FILTER_ACTIVE) {
-          if (!t.country || !COUNTRY_FILTER.includes(t.country)) {
+          const cLower = String(t.country || '').trim().toLowerCase();
+          if (!cLower || !COUNTRY_FILTER.has(cLower)) {
             filteredOnThisPage++;
             continue;
           }
