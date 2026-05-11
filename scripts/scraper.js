@@ -2079,21 +2079,74 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
   let page = null;
   try {
     page = await browser.newPage();
-    page.setDefaultNavigationTimeout(20000);
-    page.setDefaultTimeout(20000);
+    page.setDefaultNavigationTimeout(30000);
+    page.setDefaultTimeout(30000);
+
+    // Anti-headless stealth. TenderNed Angular bundle (confirmed via
+    // user incognito test 2026-05-12: 4 tabs visible WITHOUT login)
+    // appears to gate render on absence of webdriver flag — our
+    // previous handlers found 0 tab elements and 0 h4 filenames in
+    // DOM. Spoofing the standard headless-detection vectors before
+    // the page loads its scripts is the cleanest fix.
+    try {
+      await page.evaluateOnNewDocument(() => {
+        // navigator.webdriver — primary headless tell
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        // navigator.plugins — real browsers have ≥1
+        Object.defineProperty(navigator, 'plugins', {
+          get: () => [1, 2, 3, 4, 5],
+        });
+        // navigator.languages — real browsers have a populated list
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['nl-NL', 'nl', 'en-US', 'en'],
+        });
+        // window.chrome — real Chrome has it, headless usually does too
+        // but some bundles check explicit shape.
+        // eslint-disable-next-line no-undef
+        if (!window.chrome) window.chrome = { runtime: {} };
+      });
+    } catch (_) {}
+    // Use a realistic Chrome user-agent (Puppeteer's default ends in
+    // "HeadlessChrome/..." which some bot detectors regex against).
+    try {
+      const ua = await page.browser().userAgent();
+      const realUa = ua.replace(/HeadlessChrome/i, 'Chrome');
+      await page.setUserAgent(realUa);
+    } catch (_) {}
 
     try {
-      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e) {
       console.log(`    🇳🇱 tenderned: nav warn: ${(e.message || '').slice(0, 80)}`);
     }
-    // TenderNed is a Next.js SPA — documents render after data fetch.
-    // Wait for network to settle then for an extra second to let the
-    // Documenten panel populate. First v1 used only 2s settle and the
-    // anchor scan found nothing; this gives time for React hydration.
-    try { await page.waitForNetworkIdle({ idleTime: 800, timeout: 6000 }); }
+    // TenderNed is an Angular SPA — Documenten tab content needs
+    // Angular Material hydration + initial REST fetch to populate.
+    // 6s timeout was too tight; bump to 12s networkidle + 2.5s extra
+    // settle for slow CI runners.
+    try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 12000 }); }
     catch (_) { /* timeout ok */ }
-    await new Promise((r) => setTimeout(r, 1500));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    // Diagnostic: count tabs and report aria-selected state so we can
+    // verify Angular Material rendered before our click attempt.
+    try {
+      const tabDiag = await page.evaluate(() => {
+        const tabs = Array.from(document.querySelectorAll('[role="tab"], .mat-mdc-tab, .mdc-tab'));
+        return {
+          count: tabs.length,
+          tabs: tabs.slice(0, 8).map((t) => ({
+            text: ((t.textContent || '') + '').trim().slice(0, 40),
+            selected: t.getAttribute('aria-selected') === 'true',
+            tag: t.tagName,
+            id: t.id || '',
+          })),
+        };
+      }).catch(() => ({ count: 0, tabs: [] }));
+      console.log(
+        `    🇳🇱 tenderned: pre-click tab diag — ` +
+        `${tabDiag.count} tab(s) found. ${tabDiag.tabs.map(t => `[${t.text}${t.selected ? '*' : ''}]`).join(' ')}`
+      );
+    } catch (_) {}
 
     // TenderNed uses Angular Material mat-tab — Documents is a tab in
     // the same URL. Clicking it reveals the document list (XHR loads
@@ -2143,9 +2196,23 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
       console.log(`    🇳🇱 tenderned: clicked Documenten tab — waiting for content`);
       // Tab activation triggers XHR (api/documenten/...) — wait for it
       // to settle, then a bit more for Angular to render the list.
-      try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); }
+      try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); }
       catch (_) {}
-      await new Promise((r) => setTimeout(r, 1500));
+      await new Promise((r) => setTimeout(r, 2500));
+      // Post-click verify: did the active tab actually change?
+      try {
+        const post = await page.evaluate(() => {
+          const tabs = Array.from(document.querySelectorAll('[role="tab"], .mat-mdc-tab, .mdc-tab'));
+          const active = tabs.find((t) => t.getAttribute('aria-selected') === 'true');
+          return {
+            activeText: active ? ((active.textContent || '').trim().slice(0, 40)) : null,
+            h4Count: document.querySelectorAll('h4').length,
+          };
+        }).catch(() => ({}));
+        console.log(`    🇳🇱 tenderned: post-click — active tab: "${post.activeText || 'none'}", h4 count: ${post.h4Count}`);
+      } catch (_) {}
+    } else {
+      console.log(`    🇳🇱 tenderned: ⚠️ Documenten tab not found (will scan current DOM as-is)`);
     }
 
     // TenderNed's Documenten panel renders filenames as plain <h4>
