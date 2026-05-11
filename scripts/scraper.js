@@ -911,9 +911,15 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       const RX_ATTR = /(login|signin|sign-in|logon|auth(?!or)|connexion|connect-entreprise|entreprise-auth|identification|s-identifier|iniciar-sesion|kirjaudu|loggainn|prisijungti)/i;
       // Skip-list for common navigation buttons whose attributes
       // sometimes accidentally match (e.g. a help link containing
-      // "auth-help" in its href). We only apply this when the visible
+      // "auth-help" in its href). We apply this when the visible
       // text clearly indicates the element is NOT a login trigger.
-      const SKIP_TEXT = /\b(aller\s*au|skip\s*to|menu|contenu|content|contact|accueil|home|search|recherche|lancer|toggle\s*navigation|kontakt|footer|impressum|datenschutz)\b/i;
+      // CRITICAL: includes "register"/"sign up" because portals
+      // (publicprocurement.be) commonly group a "Login" container
+      // and a "Register" sibling under the same parent with
+      // login-related ids/classes — without this guard we'd click
+      // Register and end up on the wrong page. Also covers EN/FR/
+      // DE/NL/ES/SE/FI register synonyms.
+      const SKIP_TEXT = /\b(aller\s*au|skip\s*to|menu|contenu|content|contact|accueil|home|search|recherche|lancer|toggle\s*navigation|kontakt|footer|impressum|datenschutz|register|sign[\s-]?up|create\s*account|s'enregistrer|s'inscrire|inscription|registrieren|neu\s*registrieren|konto\s*erstellen|registreren|nieuw\s*account|aanmelden\s*als\s*nieuw|crear\s*cuenta|registrar(?:se)?|registrera(?:\s*dig)?|rekister[öo]ity[ää]?|forgot\s*password|mot\s*de\s*passe\s*oublié|passwort\s*vergessen)\b/i;
       const candidates = Array.from(document.querySelectorAll(
         'button, a, [role="button"], input[type="button"], input[type="submit"]'
       ));
@@ -1040,12 +1046,33 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     }).catch(() => ({ userSel: null, passSel: null, currentHost: hostLabel, currentUrl: '' }));
 
     // MULTI-STEP LOGIN — when a username field is visible but password
-    // isn't, the page is using the email-first / username-first pattern
-    // (Microsoft Entra, modern AspNet, e-avrop's /login.aspx). Type the
-    // username, click the submit/Next/Continue button, wait for the
-    // password field to materialise, then re-query selectors.
-    if (sels.userSel && !sels.passSel && creds.username) {
-      console.log(`    ↪️  multi-step login detected (username field present, password hidden) — typing username + advancing`);
+    // isn't, the page MIGHT be using the email-first / username-first
+    // pattern (Microsoft Entra, modern AspNet). But the same shape is
+    // also produced by newsletter signup, search bars, and "request
+    // demo" forms — which is exactly what bit us on e-avrop.com (the
+    // detected userSel turned out to be a search/newsletter field,
+    // and submitting it sent us to info.e-avrop.com). To distinguish,
+    // require that the userSel's parent form ALSO has a password
+    // input somewhere (visible OR hidden via display:none — that's
+    // the autofill hint pattern real login forms use, but newsletter
+    // forms never do). Skip the multi-step branch otherwise.
+    let userInLoginForm = false;
+    if (sels.userSel) {
+      userInLoginForm = await page.evaluate((sel) => {
+        try {
+          const el = document.querySelector(sel);
+          if (!el) return false;
+          const f = el.closest('form');
+          if (!f) return false; // not in a form at all → likely a search box
+          return !!f.querySelector('input[type="password"]');
+        } catch (_) { return false; }
+      }, sels.userSel).catch(() => false);
+    }
+    if (sels.userSel && !sels.passSel && creds.username && !userInLoginForm) {
+      console.log(`    ⚠️  userSel is NOT inside a form containing a password input — skipping multi-step (likely a search/newsletter field, would mis-submit credentials)`);
+    }
+    if (sels.userSel && !sels.passSel && creds.username && userInLoginForm) {
+      console.log(`    ↪️  multi-step login detected (username field present, password hidden, form has password input) — typing username + advancing`);
       try { await page.click(sels.userSel, { clickCount: 3 }); } catch (_) {}
       try { await page.type(sels.userSel, String(creds.username), { delay: 25 }); }
       catch (e) { console.log(`    ⚠️ multi-step username type failed: ${(e.message || '').slice(0, 80)}`); }
