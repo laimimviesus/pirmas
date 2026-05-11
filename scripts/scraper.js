@@ -2071,8 +2071,10 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
   // Optional libs — same lazy-load pattern as fetchEuSupplyDocuments.
   let pdfParseLib = null;
   let mammothLib = null;
+  let admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
   try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
 
   let page = null;
   try {
@@ -2085,46 +2087,272 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     } catch (e) {
       console.log(`    🇳🇱 tenderned: nav warn: ${(e.message || '').slice(0, 80)}`);
     }
-    await new Promise((r) => setTimeout(r, 2000));
+    // TenderNed is a Next.js SPA — documents render after data fetch.
+    // Wait for network to settle then for an extra second to let the
+    // Documenten panel populate. First v1 used only 2s settle and the
+    // anchor scan found nothing; this gives time for React hydration.
+    try { await page.waitForNetworkIdle({ idleTime: 800, timeout: 6000 }); }
+    catch (_) { /* timeout ok */ }
+    await new Promise((r) => setTimeout(r, 1500));
 
-    // Harvest in-page document anchors. TenderNed renders document
-    // links inline on the announcement page (Documenten section).
-    // Typical hrefs are absolute paths like /papi/tenderned-rs-tns/...
-    // /publicaties/<noticeId>/documenten/<docId> with PDF/DOCX content.
-    // We capture ANY href on tenderned.nl that looks document-y plus
-    // the anchor's visible text (used for priority scoring).
-    const docs = await page.evaluate(() => {
-      const RX_DOC_EXT = /\.(pdf|docx?|xlsx?|zip|rtf|odt|ods)(?:[?#]|$)/i;
-      const RX_DOC_PATH = /\/(?:document(?:en)?|bestand(?:en)?|attachment|download|papi\/.*?\/documenten)\b/i;
+    // TenderNed uses Angular Material mat-tab — Documents is a tab in
+    // the same URL. Clicking it reveals the document list (XHR loads
+    // shortly after). Must click reliably AND wait for the post-click
+    // network to settle. User-confirmed DOM (2026-05-12):
+    //   <div role="tab" id="mat-tab-group-0-label-2" aria-controls=
+    //        "mat-tab-group-0-content-2" ...>
+    //     <span class="mdc-tab__text-label">Documenten</span>
+    //   </div>
+    let tabClicked = false;
+    try {
+      tabClicked = await page.evaluate(() => {
+        const RX_TAB = /^\s*(documenten|bijlagen|bestanden|documents|attachments)\s*$/i;
+        const cands = Array.from(document.querySelectorAll(
+          'button, a, [role="tab"], [role="button"], summary, h2, h3, .mat-mdc-tab, .mdc-tab'
+        ));
+        for (const el of cands) {
+          // Use textContent (not innerText) — Angular Material wraps
+          // labels in nested <span class="mdc-tab__text-label"> which
+          // sometimes returns empty innerText if the tab is not in
+          // viewport. textContent works either way.
+          const t = ((el.textContent || '') + ' ' + (el.innerText || ''))
+            .trim().replace(/\s+/g, ' ').slice(0, 60);
+          if (RX_TAB.test(t)) {
+            try {
+              el.scrollIntoView?.({ block: 'center' });
+              // Dispatch click via MouseEvent — Angular Material's
+              // ripple/tab handler subscribes to mousedown+mouseup
+              // events, so plain el.click() sometimes no-ops on
+              // <div role="tab"> in headless Chromium.
+              const rect = el.getBoundingClientRect();
+              const x = rect.left + rect.width / 2;
+              const y = rect.top + rect.height / 2;
+              for (const type of ['mousedown', 'mouseup', 'click']) {
+                el.dispatchEvent(new MouseEvent(type, {
+                  bubbles: true, cancelable: true, view: window, clientX: x, clientY: y,
+                }));
+              }
+              return true;
+            } catch (_) {}
+          }
+        }
+        return false;
+      }).catch(() => false);
+    } catch (_) {}
+    if (tabClicked) {
+      console.log(`    🇳🇱 tenderned: clicked Documenten tab — waiting for content`);
+      // Tab activation triggers XHR (api/documenten/...) — wait for it
+      // to settle, then a bit more for Angular to render the list.
+      try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); }
+      catch (_) {}
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    // TenderNed's Documenten panel renders filenames as plain <h4>
+    // elements (Angular click handler downloads via XHR — no <a href>).
+    // First pass: scan h4 text for diagnostic (lets us verify the tab
+    // click actually revealed content). Second pass: try the "Download
+    // alle documenten" / "Download all documents" button, which
+    // returns a ZIP containing every document. We intercept the
+    // network response and parse the ZIP — much simpler than fetching
+    // each doc individually and avoids needing to reverse-engineer
+    // per-doc URL patterns. User-confirmed DOM 2026-05-12.
+    const filenamesProbe = await page.evaluate(() => {
+      const RX_FILE = /\.(pdf|docx?|xlsx?|zip|rtf|odt|ods)\b/i;
+      const h4s = Array.from(document.querySelectorAll('h4'));
+      const names = [];
+      for (const h of h4s) {
+        const t = (h.textContent || '').trim();
+        if (t && RX_FILE.test(t) && t.length <= 250) names.push(t);
+        if (names.length >= 50) break;
+      }
+      return { filenames: names, totalH4: h4s.length };
+    }).catch(() => ({ filenames: [], totalH4: 0 }));
+    console.log(
+      `    🇳🇱 tenderned: notice ${noticeId} — ` +
+      `${filenamesProbe.filenames.length}/${filenamesProbe.totalH4} h4 filename(s) detected on tab. ` +
+      `Top: ${filenamesProbe.filenames.slice(0, 4).map(n => n.slice(0, 60)).join(' | ')}`
+    );
+
+    // Try the "Download alle documenten" / "Download all documents"
+    // button. Set up a response interceptor BEFORE the click so we
+    // catch the ZIP whatever URL it comes from. The button text comes
+    // verbatim from the user's DOM: <span class="text-nowrap">
+    // Download alle documenten </span>.
+    const texts = [];
+    if (admZipLib && filenamesProbe.filenames.length > 0) {
+      const zipResponsePromise = new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(null), 20000);
+        const handler = async (resp) => {
+          try {
+            const ct = (resp.headers()['content-type'] || '').toLowerCase();
+            const cd = (resp.headers()['content-disposition'] || '').toLowerCase();
+            const looksZip = ct.includes('application/zip')
+              || ct.includes('application/x-zip')
+              || ct.includes('application/octet-stream')
+              || /\.zip\b/i.test(cd)
+              || /attachment/i.test(cd);
+            if (!looksZip) return;
+            if (resp.request().resourceType() === 'document') return; // page nav
+            const buf = await resp.buffer().catch(() => null);
+            if (!buf || buf.length < 1024) return;
+            // ZIP magic: PK\003\004
+            if (buf[0] !== 0x50 || buf[1] !== 0x4b) return;
+            clearTimeout(timer);
+            page.off('response', handler);
+            resolve({ buf, url: resp.url(), ct });
+          } catch (_) {}
+        };
+        page.on('response', handler);
+      });
+
+      const downloadClicked = await page.evaluate(() => {
+        const RX_BTN = /Download\s*(?:alle\s*documenten|all\s*documents)/i;
+        // Search across all clickable-ish elements + walk up to find
+        // the actual <button>/<a> ancestor. User confirmed the label
+        // span lives inside a wrapping button.
+        const all = Array.from(document.querySelectorAll('span, button, a, [role="button"]'));
+        for (const el of all) {
+          const t = ((el.textContent || '') + ' ' + (el.innerText || ''))
+            .trim().replace(/\s+/g, ' ');
+          if (!RX_BTN.test(t) || t.length > 80) continue;
+          // Climb to <button> or <a> ancestor if our hit was on a span.
+          let target = el;
+          for (let i = 0; i < 4; i++) {
+            if (target.tagName === 'BUTTON' || target.tagName === 'A') break;
+            if (target.parentElement) target = target.parentElement;
+            else break;
+          }
+          try {
+            target.scrollIntoView?.({ block: 'center' });
+            const rect = target.getBoundingClientRect();
+            const x = rect.left + rect.width / 2;
+            const y = rect.top + rect.height / 2;
+            for (const type of ['mousedown', 'mouseup', 'click']) {
+              target.dispatchEvent(new MouseEvent(type, {
+                bubbles: true, cancelable: true, view: window, clientX: x, clientY: y,
+              }));
+            }
+            return target.tagName + ' "' + t.slice(0, 40) + '"';
+          } catch (_) {}
+        }
+        return null;
+      }).catch(() => null);
+
+      if (downloadClicked) {
+        console.log(`    🇳🇱 tenderned: clicked Download-all (${downloadClicked}) — waiting for ZIP`);
+        const zipResp = await zipResponsePromise;
+        if (zipResp && zipResp.buf) {
+          console.log(`    🇳🇱 tenderned: ZIP captured (${zipResp.buf.length}B) from ${zipResp.url.slice(0, 100)}`);
+          try {
+            const zip = new admZipLib(zipResp.buf);
+            const entries = zip.getEntries();
+            // Priority entries first — Selectieleidraad / Programma van
+            // Eisen / Aanbestedingsleidraad / UEA, then fall through.
+            const SCORE_RULES = [
+              { rx: /selectie\s*leidraad|selectiecriteri|selectie[-\s]?eisen|selection\s*criteria/i, score: 25 },
+              { rx: /aanbestedings?\s*leidraad|procurement\s*guide|request\s*for\s*quotation/i, score: 18 },
+              { rx: /programma\s*van\s*eisen|statement\s*of\s*requirements/i, score: 12 },
+              { rx: /uea|espd|uniform\s*europees|uniform\s*european\s*procurement/i, score: 8 },
+              { rx: /aankondiging|contract\s*notice|EF\d+/i, score: 5 },
+            ];
+            const scoreOf = (n) => {
+              let s = 0;
+              for (const r of SCORE_RULES) if (r.rx.test(n)) s = Math.max(s, r.score);
+              return s;
+            };
+            const docEntries = entries
+              .filter((e) => !e.isDirectory && /\.(pdf|docx?)$/i.test(e.entryName))
+              .map((e) => ({ entry: e, score: scoreOf(e.entryName) }))
+              .sort((a, b) => b.score - a.score)
+              .slice(0, 6);
+            console.log(`    🇳🇱 tenderned: ZIP has ${entries.length} entries, parsing top ${docEntries.length} (PDFs/DOCXs)`);
+            for (const item of docEntries) {
+              const entry = item.entry;
+              const name = entry.entryName.slice(-100);
+              try {
+                const data = entry.getData();
+                let text = '';
+                const isPdf = data[0] === 0x25 && data[1] === 0x50 && data[2] === 0x44 && data[3] === 0x46;
+                const isDocx = /\.docx$/i.test(name);
+                if (isPdf && pdfParseLib) {
+                  const parsed = await pdfParseLib(data);
+                  text = ((parsed && parsed.text) || '').trim();
+                } else if (isDocx && mammothLib) {
+                  const out = await mammothLib.extractRawText({ buffer: data });
+                  text = ((out && out.value) || '').trim();
+                }
+                if (text.length > 200) {
+                  const clipped = text.slice(0, 80000);
+                  texts.push(`--- (tenderned) ${name} ---\n${clipped}`);
+                  console.log(`    🇳🇱 tenderned: parsed "${name}" (${data.length}B → ${clipped.length}ch, score=${item.score})`);
+                } else {
+                  console.log(`    ⚠️  tenderned: "${name}" extracted text too short (${text.length}ch)`);
+                }
+              } catch (e) {
+                console.log(`    ⚠️  tenderned: parse failed for "${name}": ${(e.message || '').slice(0, 80)}`);
+              }
+            }
+          } catch (e) {
+            console.log(`    ⚠️  tenderned: ZIP parse error: ${(e.message || '').slice(0, 100)}`);
+          }
+        } else {
+          console.log(`    ⚠️  tenderned: Download-all click fired but no ZIP response captured`);
+        }
+      } else {
+        console.log(`    ⚠️  tenderned: Download-all button not found on page`);
+      }
+    }
+
+    // If ZIP path returned content, we're done. Otherwise (no ZIP lib,
+    // no button, no docs detected), fall back to the original anchor-
+    // based scan for tenders that DO expose direct download links.
+    if (texts.length > 0) return texts;
+
+    const probe = await page.evaluate(() => {
+      const RX_DOC_EXT  = /\.(pdf|docx?|xlsx?|zip|rtf|odt|ods)(?:[?#]|$)/i;
+      const RX_DOC_PATH = /\/(?:document(?:en)?|bestand(?:en)?|attachment|download|papi\/.*?\/documenten|bijlag|stuk)\b/i;
+      const RX_DOC_TXT  = /\b(?:Bijlage|Aanbestedings(?:leidraad|document)|Selectie(?:leidraad|criteri)|Programma\s*van\s*Eisen|UEA|ESPD|TN\d{4,}|EF\d+\s*Aankondiging)\b/i;
+      const RX_FILE_TXT = /\.(?:pdf|docx?|xlsx?|zip|rtf|odt|ods)\b/i;
       const seen = new Set();
       const out = [];
-      const anchors = Array.from(document.querySelectorAll('a[href]'));
-      for (const a of anchors) {
+      const sampleHrefs = [];
+      const allAnchors = Array.from(document.querySelectorAll('a[href]'));
+      for (const a of allAnchors) {
         const hrefRaw = a.getAttribute('href') || '';
         if (!hrefRaw || hrefRaw.startsWith('#') || /^javascript:/i.test(hrefRaw)) continue;
-        let abs;
-        try { abs = new URL(hrefRaw, location.href).toString(); }
-        catch (_) { continue; }
-        // Same-domain only — skip cross-host like Mercell S3.
-        let absHost;
-        try { absHost = new URL(abs).hostname.toLowerCase(); }
-        catch (_) { continue; }
+        let abs, absHost;
+        try {
+          abs = new URL(hrefRaw, location.href).toString();
+          absHost = new URL(abs).hostname.toLowerCase();
+        } catch (_) { continue; }
         if (!/(^|\.)tenderned\.nl$/i.test(absHost)) continue;
-        // Must look document-y (extension or path keyword).
-        const path = (new URL(abs)).pathname;
-        const search = (new URL(abs)).search;
-        if (!RX_DOC_EXT.test(path) && !RX_DOC_EXT.test(search) && !RX_DOC_PATH.test(path)) continue;
         if (seen.has(abs)) continue;
         seen.add(abs);
+        const path = (new URL(abs)).pathname;
+        const search = (new URL(abs)).search;
         const text = ((a.innerText || a.textContent || '') + ' ' + (a.getAttribute('title') || ''))
           .trim().replace(/\s+/g, ' ').slice(0, 200);
-        out.push({ url: abs, name: text || abs.slice(-80) });
+        const isDocByPath = RX_DOC_EXT.test(path) || RX_DOC_EXT.test(search) || RX_DOC_PATH.test(path);
+        const isDocByText = RX_DOC_TXT.test(text) || RX_FILE_TXT.test(text);
+        if (isDocByPath || isDocByText) {
+          out.push({ url: abs, name: text || abs.slice(-80), reason: isDocByPath ? 'path' : 'text' });
+        }
+        if (sampleHrefs.length < 12) {
+          sampleHrefs.push({ url: abs.slice(0, 140), text: text.slice(0, 80) });
+        }
+        if (out.length >= 50) break;
       }
-      return out;
-    }).catch(() => []);
+      return { docs: out, totalAnchors: allAnchors.length, sampleHrefs };
+    }).catch(() => ({ docs: [], totalAnchors: 0, sampleHrefs: [] }));
 
+    const docs = probe.docs;
     if (!docs.length) {
-      console.log(`    🇳🇱 tenderned: notice ${noticeId} — no document anchors found on page`);
+      console.log(
+        `    🇳🇱 tenderned: notice ${noticeId} — no document anchors found ` +
+        `(scanned ${probe.totalAnchors} same-domain links). Sample: ` +
+        JSON.stringify(probe.sampleHrefs.slice(0, 6))
+      );
       return [];
     }
     console.log(`    🇳🇱 tenderned: notice ${noticeId} — ${docs.length} document anchor(s) found`);
@@ -2149,7 +2377,8 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     const topDocs = docs.slice(0, 6);
     console.log(`    🇳🇱 tenderned: priority docs: ${topDocs.map(d => `${d.name.slice(0, 40)}[s=${d.score}]`).join(' | ')}`);
 
-    const texts = [];
+    // Reuse outer `texts` (declared above before the ZIP path) — the
+    // anchor fallback runs only if ZIP capture returned nothing.
     for (const doc of topDocs) {
       const labelName = doc.name.slice(0, 100);
       // Fetch via page.evaluate so we keep the same session cookies.
