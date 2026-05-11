@@ -1483,6 +1483,196 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
   }
 }
 
+// =====================================================================
+// fetchEuSupplyDocuments
+// ---------------------------------------------------------------------
+// eu.eu-supply.com (CTM platform — Norwegian Doffin tenders, EU-Supply
+// hosted) shows tender info on `rwlentrance_s.asp` but hides the actual
+// procurement documents behind a separate `publicpurchase_docs.asp`
+// page. The documents themselves are downloaded via a JavaScript call:
+//   <a onclick="DownloadPublicDocument('11603409','sDoc_11603409','322375');">
+// There's no static href — the JS function builds a download URL at
+// runtime. We reverse-engineer this by trying multiple URL patterns
+// observed across CTM deployments and saving the first response that
+// returns a real PDF (matches %PDF- magic bytes).
+//
+// Public-purchase pages don't require login, so a fresh browser context
+// page works fine — we use a side page to avoid disturbing the entrance
+// page's body-text capture in the main extractor.
+// Real-world: this unlocks the "DYNAMISK INNKJØPSORDNING ...
+// KVALIFIKASJONSKRAV" content for Norwegian DPS tenders that were
+// previously empty in the spreadsheet.
+// =====================================================================
+async function fetchEuSupplyDocuments(browser, sourceUrl) {
+  // Detect eu-supply public-purchase URL.
+  let pid = null;
+  let entranceHost = null;
+  try {
+    const u = new URL(sourceUrl);
+    if (!/(^|\.)eu-supply\.com$/i.test(u.hostname)) return [];
+    if (!/rwlentrance_s\.asp|PublicPurchase/i.test(u.pathname + u.search)) return [];
+    pid = u.searchParams.get('PID');
+    if (!pid || !/^\d+$/.test(pid)) return [];
+    entranceHost = u.hostname;
+  } catch (_) { return []; }
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(20000);
+    page.setDefaultTimeout(20000);
+
+    // Step 1 — load the entrance page and look for any href that points
+    // to publicpurchase_docs.asp, extract LID (list/lot ID).
+    try {
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    } catch (e) {
+      console.log(`    🇳🇴 eu-supply: entrance nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+    const lid = await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a[href]'));
+      for (const a of links) {
+        const href = a.getAttribute('href') || '';
+        const m = href.match(/[?&]LID=(\d+)/i);
+        if (m) return m[1];
+      }
+      // Fallback — scan whole HTML for LID=xxx
+      const html = document.documentElement.outerHTML;
+      const m2 = html.match(/LID=(\d+)/i);
+      return m2 ? m2[1] : null;
+    }).catch(() => null);
+    if (!lid) {
+      console.log(`    🇳🇴 eu-supply: PID=${pid} but no LID found on entrance page`);
+      return [];
+    }
+    console.log(`    🇳🇴 eu-supply: PID=${pid}, LID=${lid} — navigating to docs page`);
+
+    // Step 2 — navigate to the documents page.
+    const docsUrl = `https://${entranceHost}/app/rfq/publicpurchase_docs.asp?PID=${pid}&LID=${lid}&AllowPrint=1`;
+    try {
+      await page.goto(docsUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    } catch (e) {
+      console.log(`    🇳🇴 eu-supply: docs page nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // Step 3 — parse DownloadPublicDocument JS calls + document names.
+    const found = await page.evaluate(() => {
+      const RX = /DownloadPublicDocument\(\s*['"]?(\d+)['"]?\s*,\s*['"]?([^'"]+)['"]?\s*,\s*['"]?(\d+)['"]?\s*\)/g;
+      const html = document.documentElement.outerHTML;
+      const seen = new Map();
+      // Walk DOM rows first — gives us doc NAMES alongside doc IDs.
+      const rows = document.querySelectorAll('tr, .doc-row, [data-doc-id], li');
+      for (const row of rows) {
+        const links = row.querySelectorAll('a[href], [onclick]');
+        for (const link of links) {
+          const handler = (link.getAttribute('onclick') || link.getAttribute('href') || '');
+          const m = handler.match(/DownloadPublicDocument\(\s*['"]?(\d+)['"]?\s*,\s*['"]?([^'"]+)['"]?\s*,\s*['"]?(\d+)['"]?\s*\)/);
+          if (!m) continue;
+          const docId = m[1];
+          if (seen.has(docId)) continue;
+          const name = (link.innerText || link.textContent || row.innerText || '')
+            .trim().replace(/\s+/g, ' ').slice(0, 200);
+          seen.set(docId, { docId, elemId: m[2], lid: m[3], name });
+        }
+      }
+      // Fallback — pull from raw HTML if we missed any in DOM walk.
+      let m;
+      while ((m = RX.exec(html)) !== null) {
+        if (!seen.has(m[1])) {
+          seen.set(m[1], { docId: m[1], elemId: m[2], lid: m[3], name: '' });
+        }
+      }
+      return Array.from(seen.values());
+    }).catch(() => []);
+
+    if (!found.length) {
+      console.log(`    🇳🇴 eu-supply: no DownloadPublicDocument calls found on docs page`);
+      return [];
+    }
+    console.log(`    🇳🇴 eu-supply: ${found.length} document(s) detected on docs page`);
+
+    // Step 4 — try multiple URL patterns to download each PDF.
+    // Different CTM deployments expose the actual download endpoint at
+    // slightly different paths. We try the most-common variants in order
+    // and keep the first response whose body has the %PDF- magic.
+    let pdfParseLib = null;
+    try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+    const texts = [];
+    const MAX_DOCS = 6;
+    for (const doc of found.slice(0, MAX_DOCS)) {
+      const eLid = doc.lid || lid;
+      const candidates = [
+        `https://${entranceHost}/app/rfq/downloadpublicdocument.asp?DID=${doc.docId}&LID=${eLid}&AllowPrint=1`,
+        `https://${entranceHost}/app/rfq/DownloadPublicDocument.asp?DID=${doc.docId}&LID=${eLid}`,
+        `https://${entranceHost}/app/rfq/dwnldpubdoc.asp?DID=${doc.docId}&LID=${eLid}`,
+        `https://${entranceHost}/app/rfq/Download.asp?DID=${doc.docId}&LID=${eLid}`,
+        `https://${entranceHost}/app/rfq/publicpurchase_docs.asp?PID=${pid}&LID=${eLid}&AllowPrint=1&DID=${doc.docId}&Action=Download`,
+      ];
+      let bytes = null;
+      let okUrl = null;
+      let lastStatus = null;
+      let lastCt = null;
+      for (const url of candidates) {
+        try {
+          const data = await page.evaluate(async (u) => {
+            try {
+              const r = await fetch(u, { credentials: 'include', redirect: 'follow' });
+              const ct = r.headers.get('content-type') || '';
+              if (!r.ok) return { ok: false, status: r.status, ct };
+              const buf = await r.arrayBuffer();
+              const arr = Array.from(new Uint8Array(buf));
+              return { ok: true, status: r.status, ct, data: arr };
+            } catch (e) { return { ok: false, error: String(e) }; }
+          }, url).catch(() => null);
+          if (data) {
+            lastStatus = data.status;
+            lastCt = data.ct;
+          }
+          if (data && data.ok && data.data && data.data.length > 1000) {
+            const buf = Buffer.from(data.data);
+            // PDF magic: %PDF (25 50 44 46)
+            if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) {
+              bytes = buf;
+              okUrl = url;
+              break;
+            }
+          }
+        } catch (_) {}
+      }
+      const labelName = (doc.name || `Document ${doc.docId}`).slice(0, 80);
+      if (!bytes) {
+        console.log(`    ⚠️  eu-supply: could not download "${labelName}" (id=${doc.docId}, last status=${lastStatus || '?'}, ct=${(lastCt || '').slice(0, 40)})`);
+        continue;
+      }
+      if (!pdfParseLib) {
+        console.log(`    ⚠️  eu-supply: pdf-parse unavailable, can't extract "${labelName}"`);
+        continue;
+      }
+      try {
+        const parsed = await pdfParseLib(bytes);
+        const text = ((parsed && parsed.text) || '').trim();
+        if (text.length > 100) {
+          const clipped = text.slice(0, 80000);
+          texts.push(`--- (eu-supply) ${labelName} ---\n${clipped}`);
+          console.log(`    🇳🇴 eu-supply: parsed PDF "${labelName}" (${bytes.length}B → ${clipped.length}ch from ${okUrl.slice(0, 80)})`);
+        } else {
+          console.log(`    ⚠️  eu-supply: PDF "${labelName}" extracted text too short (${text.length}ch)`);
+        }
+      } catch (e) {
+        console.log(`    ⚠️  eu-supply: PDF parse failed for "${labelName}": ${(e.message || '').slice(0, 80)}`);
+      }
+    }
+    return texts;
+  } catch (e) {
+    console.log(`    ⚠️  eu-supply handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
 async function fetchSourcePageDetails(browser, sourceUrl) {
   // URL scheme normalisation — Mercell sometimes returns sourceUrl
   // values like "www.conselleriadefacenda.es/silex" without an
@@ -2559,6 +2749,26 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     } catch (e) {
       console.log(`    source-file prefetch error: ${e.message}`);
+    }
+
+    // eu-supply.com Documents handler — fires only on CTM's
+    // rwlentrance_s.asp / PublicPurchase URLs. The entrance page hides
+    // the actual procurement docs behind a separate page reached via
+    // a JavaScript DownloadPublicDocument() call. We open a side page
+    // to navigate + extract those, then append the parsed text to
+    // result.sourceFilesText. No-op for any non-eu-supply tender.
+    try {
+      const euSupplyTexts = await fetchEuSupplyDocuments(browser, sourceUrl);
+      if (euSupplyTexts && euSupplyTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + euSupplyTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇳🇴 eu-supply: appended ${euSupplyTexts.length} doc(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ eu-supply handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     srcPage.off('request', blockHandler);
