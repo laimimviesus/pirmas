@@ -222,29 +222,12 @@ function getDedicatedLoginUrl(host, sourceUrl) {
     } catch (_) { /* fall through */ }
     return LOGIN_URLS['kommersannons.se'] || null;
   }
-  // e-avrop.com — also multi-tenant: source URLs look like
-  // /<tenant>/e-Upphandling/Announcement.aspx (Pensionsmyndigheten,
-  // vob, linkoping, ...). 2026-05-11 log showed that going to bare
-  // /login.aspx + clicking the header LoginControl link redirects to
-  // info.e-avrop.com (marketing site). Try tenant-scoped login URL
-  // first; falls back to /login.aspx if no tenant prefix found.
-  if (h === 'e-avrop.com' || h.endsWith('.e-avrop.com')) {
-    try {
-      if (sourceUrl) {
-        const u = new URL(sourceUrl);
-        const segs = u.pathname.split('/').filter(Boolean);
-        const first = segs[0] || '';
-        const RESERVED = new Set([
-          'login.aspx', 'login', 'e-upphandling', 'default.aspx',
-          'admin', 'app', 'info',
-        ]);
-        if (first && /^[a-z0-9_-]{2,40}$/i.test(first) && !RESERVED.has(first.toLowerCase())) {
-          return `https://www.e-avrop.com/${first}/login.aspx`;
-        }
-      }
-    } catch (_) { /* fall through */ }
-    return LOGIN_URLS['e-avrop.com'] || null;
-  }
+  // e-avrop.com — earlier attempt at /<tenant>/login.aspx revealed
+  // those URLs don't exist (server 302s to bare root). Stick with
+  // bare /login.aspx — the marketing-redirect failure mode
+  // (`Header1_LoginControl1_blogLink → info.e-avrop.com`) is now
+  // blocked by the cross-host marketing-href filter in the trigger
+  // scoring step below, so the bare URL is safe again.
   if (LOGIN_URLS[h]) return LOGIN_URLS[h];
   // suffix match
   for (const key of Object.keys(LOGIN_URLS)) {
@@ -1062,9 +1045,45 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         } catch (_) {}
         return false;
       };
+      // Cross-host marketing-redirect filter — some portals' "Login"
+      // header links point to a separate marketing/info subdomain
+      // (e-avrop.com's Header1_LoginControl1_blogLink → info.e-avrop.com)
+      // instead of staying on the same host. Clicking those navigates
+      // us away from the login form and into a marketing landing page.
+      // We resolve each candidate's href against current location and
+      // reject when the resolved hostname is on a different "info-ish"
+      // subdomain of the same registrable domain (or differs entirely
+      // and looks like marketing). 2026-05-11 e-avrop fix.
+      const currentHost = (location.host || '').toLowerCase().replace(/^www\./, '');
+      const MARKETING_HOST_PREFIX = /^(info|marketing|help|support|docs|kb|status|blog|community|forum|learn|news)\b/i;
+      const isMarketingHref = (rawHref) => {
+        if (!rawHref) return false;
+        const s = String(rawHref).trim();
+        if (!s || s.startsWith('#') || /^javascript:/i.test(s)) return false;
+        try {
+          const u = new URL(s, location.href);
+          const h2 = (u.host || '').toLowerCase().replace(/^www\./, '');
+          if (!h2 || h2 === currentHost) return false;
+          // Same registrable domain but different subdomain: only
+          // marketing-prefixed subdomains are blocked (avoids killing
+          // legit cross-subdomain SSO like login.cloudia.net).
+          if (currentHost && h2.endsWith('.' + currentHost.replace(/^[^.]+\./, ''))) {
+            const sub = h2.replace(/\.[^.]+\.[^.]+$/, '');
+            return MARKETING_HOST_PREFIX.test(sub);
+          }
+          // Different domain entirely: only block if hostname
+          // itself starts with a marketing prefix.
+          return MARKETING_HOST_PREFIX.test(h2);
+        } catch (_) { return false; }
+      };
       const scoreEl = (el) => {
         if (!el || el.offsetParent === null) return -1;
         if (insideOpenForm(el)) return -1;
+        // Marketing-href filter — only on <a> elements (buttons don't
+        // navigate by href, so the check is irrelevant).
+        if (el.tagName === 'A' && isMarketingHref(el.getAttribute('href'))) {
+          return -1;
+        }
         const innerText = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
         // Primary: visible text matches (HIGH confidence, score 3)
         if (innerText && innerText.length <= 40 && RX_TEXT.test(innerText)) {
@@ -1396,8 +1415,28 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
             const t = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
             return t.length > 0 && t.length <= 20 && TXT_SUBMIT.test(t);
           });
+          // Helper: when the element is an <a href="javascript:...">
+          // (ASP.NET LoginControl's typical render for its submit
+          // button — `<a href="javascript:__doPostBack('...$LoginButton','')">`),
+          // .click() doesn't always fire the JS handler reliably in
+          // Puppeteer. Evaluate the javascript: payload directly so
+          // the postback fires deterministically.
+          const fireClick = (el) => {
+            try {
+              if (el.tagName === 'A') {
+                const href = el.getAttribute('href') || '';
+                const m = /^\s*javascript:\s*(.*)$/i.exec(href);
+                if (m && m[1]) {
+                  // eslint-disable-next-line no-eval
+                  (function () { eval(m[1]); }).call(window);
+                  return true;
+                }
+              }
+            } catch (_) { /* fall through to .click() */ }
+            try { el.click(); return true; } catch (_) { return false; }
+          };
           if (byText) {
-            try { byText.click(); return 'in-form-text:' + (byText.innerText || byText.value || '').trim().slice(0, 20); } catch (_) {}
+            if (fireClick(byText)) return 'in-form-text:' + (byText.innerText || byText.value || '').trim().slice(0, 20);
           }
           // Attribute fallback within the same form — ASP.NET ids like
           // `Header1_LoginControl1_LoginButton` are common.
@@ -1414,21 +1453,27 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
             return ATTR_SUBMIT.test(blob);
           });
           if (byAttr) {
-            try { byAttr.click(); return 'in-form-attr:' + (byAttr.id || byAttr.className || '').slice(0, 30); } catch (_) {}
+            if (fireClick(byAttr)) return 'in-form-attr:' + (byAttr.id || byAttr.className || '').slice(0, 30);
           }
         }
       } catch (_) { /* fall through to Enter-key path */ }
       return null;
     }, sels.passSel).catch(() => null);
     if (!submitSel) {
+      console.log(`    ↪️  no submit element matched on ${hostLabel} — falling back to Enter key`);
       try { await page.keyboard.press('Enter'); } catch (_) {}
+    } else {
+      console.log(`    ↪️  clicked submit (${submitSel}) on ${hostLabel}`);
     }
 
     // Wait for either navigation or a settled network. Don't throw if
     // neither happens — some SPAs just swap the DOM client-side.
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 })
+    // Window bumped from 20s → 30s for slow ASP.NET LoginControl
+    // postbacks (kommersannons.se Roslagsvatten run on 2026-05-11
+    // showed >20s round-trips with no nav event firing).
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 })
       .catch(() => null);
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 2500));
 
     const stillLogin = await page.evaluate(() => {
       try {
