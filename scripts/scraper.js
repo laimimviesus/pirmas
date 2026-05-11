@@ -1593,57 +1593,110 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
     }
     console.log(`    🇳🇴 eu-supply: ${found.length} document(s) detected on docs page`);
 
-    // Step 4 — try multiple URL patterns to download each PDF.
-    // Different CTM deployments expose the actual download endpoint at
-    // slightly different paths. We try the most-common variants in order
-    // and keep the first response whose body has the %PDF- magic.
+    // Step 4 — call the real DownloadPublicDocument() JS function and
+    // intercept the PDF response. The earlier approach (guess URL
+    // patterns and GET them) failed because the function uses an
+    // unguessable endpoint with POST + cookies. Response interception
+    // sidesteps the guessing entirely — we register a response listener,
+    // execute the page's own download function, and capture the bytes
+    // from whatever request it triggers. Falls back to JS-source
+    // diagnostic if response capture doesn't fire.
     let pdfParseLib = null;
     try { pdfParseLib = require('pdf-parse'); } catch (_) {}
     const texts = [];
     const MAX_DOCS = 6;
+
+    // Optional one-time diagnostic: dump the JS function source so we
+    // can see what URL it builds. Helps if response interception fails.
+    try {
+      const fnSrc = await page.evaluate(() => {
+        try {
+          if (typeof DownloadPublicDocument === 'function') {
+            return DownloadPublicDocument.toString().slice(0, 600);
+          }
+        } catch (_) {}
+        return null;
+      });
+      if (fnSrc) {
+        console.log(`    🇳🇴 eu-supply: DownloadPublicDocument source: ${fnSrc.replace(/\s+/g, ' ').slice(0, 280)}`);
+      }
+    } catch (_) {}
+
     for (const doc of found.slice(0, MAX_DOCS)) {
       const eLid = doc.lid || lid;
-      const candidates = [
-        `https://${entranceHost}/app/rfq/downloadpublicdocument.asp?DID=${doc.docId}&LID=${eLid}&AllowPrint=1`,
-        `https://${entranceHost}/app/rfq/DownloadPublicDocument.asp?DID=${doc.docId}&LID=${eLid}`,
-        `https://${entranceHost}/app/rfq/dwnldpubdoc.asp?DID=${doc.docId}&LID=${eLid}`,
-        `https://${entranceHost}/app/rfq/Download.asp?DID=${doc.docId}&LID=${eLid}`,
-        `https://${entranceHost}/app/rfq/publicpurchase_docs.asp?PID=${pid}&LID=${eLid}&AllowPrint=1&DID=${doc.docId}&Action=Download`,
-      ];
+      const labelName = (doc.name || `Document ${doc.docId}`).slice(0, 80);
       let bytes = null;
-      let okUrl = null;
-      let lastStatus = null;
-      let lastCt = null;
-      for (const url of candidates) {
+      let capturedUrl = null;
+      // Response listener — capture any response that looks like a PDF
+      // or binary attachment fired AFTER we trigger the JS download.
+      const responses = [];
+      const respHandler = async (resp) => {
         try {
-          const data = await page.evaluate(async (u) => {
-            try {
-              const r = await fetch(u, { credentials: 'include', redirect: 'follow' });
-              const ct = r.headers.get('content-type') || '';
-              if (!r.ok) return { ok: false, status: r.status, ct };
-              const buf = await r.arrayBuffer();
-              const arr = Array.from(new Uint8Array(buf));
-              return { ok: true, status: r.status, ct, data: arr };
-            } catch (e) { return { ok: false, error: String(e) }; }
-          }, url).catch(() => null);
-          if (data) {
-            lastStatus = data.status;
-            lastCt = data.ct;
-          }
-          if (data && data.ok && data.data && data.data.length > 1000) {
-            const buf = Buffer.from(data.data);
-            // PDF magic: %PDF (25 50 44 46)
-            if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) {
-              bytes = buf;
-              okUrl = url;
-              break;
+          const ct = (resp.headers()['content-type'] || '').toLowerCase();
+          const cd = (resp.headers()['content-disposition'] || '').toLowerCase();
+          // Skip the page itself + obvious non-binary
+          if (ct.includes('text/html') && !cd.includes('attachment')) return;
+          // Capture if PDF, octet-stream, or has attachment disposition
+          if (ct.includes('application/pdf')
+              || ct.includes('octet-stream')
+              || cd.includes('attachment')) {
+            const buf = await resp.buffer().catch(() => null);
+            if (buf && buf.length > 1000) {
+              responses.push({ url: resp.url(), ct, cd, buf });
             }
           }
         } catch (_) {}
+      };
+      page.on('response', respHandler);
+
+      try {
+        // Execute the page's actual download function with the captured
+        // doc/elem/lid args. If the function opens a popup window, the
+        // request still goes through this page's context.
+        await page.evaluate(async (docId, elemId, lidVal) => {
+          try {
+            if (typeof DownloadPublicDocument === 'function') {
+              DownloadPublicDocument(docId, elemId, lidVal);
+            } else {
+              // Some pages bind it onto window or define inline only.
+              // Try to find any onclick=DownloadPublicDocument(...)
+              // matching docId and click it directly.
+              const all = document.querySelectorAll('[onclick], a[href]');
+              for (const el of all) {
+                const h = (el.getAttribute('onclick') || el.getAttribute('href') || '');
+                if (h.includes(`DownloadPublicDocument(`) && h.includes(`'${docId}'`)) {
+                  el.click();
+                  return;
+                }
+              }
+            }
+          } catch (_) {}
+        }, doc.docId, doc.elemId, eLid).catch(() => null);
+
+        // Allow the network request to fire and be captured.
+        await new Promise((r) => setTimeout(r, 4500));
+      } finally {
+        page.off('response', respHandler);
       }
-      const labelName = (doc.name || `Document ${doc.docId}`).slice(0, 80);
+
+      // Pick the first response whose body is a real PDF.
+      for (const r of responses) {
+        const b = r.buf;
+        if (b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) {
+          bytes = b;
+          capturedUrl = r.url;
+          break;
+        }
+      }
+      // If no PDF-magic but octet-stream attachment came through, take
+      // it anyway and rely on the parser to figure out the format.
+      if (!bytes && responses.length) {
+        bytes = responses[0].buf;
+        capturedUrl = responses[0].url;
+      }
+
       if (!bytes) {
-        console.log(`    ⚠️  eu-supply: could not download "${labelName}" (id=${doc.docId}, last status=${lastStatus || '?'}, ct=${(lastCt || '').slice(0, 40)})`);
+        console.log(`    ⚠️  eu-supply: no PDF response captured for "${labelName}" (id=${doc.docId}, ${responses.length} non-html response(s) seen)`);
         continue;
       }
       if (!pdfParseLib) {
@@ -1656,7 +1709,7 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
         if (text.length > 100) {
           const clipped = text.slice(0, 80000);
           texts.push(`--- (eu-supply) ${labelName} ---\n${clipped}`);
-          console.log(`    🇳🇴 eu-supply: parsed PDF "${labelName}" (${bytes.length}B → ${clipped.length}ch from ${okUrl.slice(0, 80)})`);
+          console.log(`    🇳🇴 eu-supply: parsed PDF "${labelName}" (${bytes.length}B → ${clipped.length}ch from ${(capturedUrl || '').slice(0, 80)})`);
         } else {
           console.log(`    ⚠️  eu-supply: PDF "${labelName}" extracted text too short (${text.length}ch)`);
         }
@@ -4745,17 +4798,30 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         console.log(`    🇪🇸 PLACSP stats: anchors=${ps.totalAnchors}, textMatches=${ps.textMatches}, urlMatches=${ps.urlMatches}; sample=[${sample}]`);
       }
 
-      // FORCE-LOGIN coercion — if host is in ALWAYS_LOGIN_HOSTS and the
-      // loginGated heuristic didn't fire (typical for SPA portals that
-      // serve a thin shell page anonymously), upgrade the result to
-      // loginGated so the next branch tries the credentials we have.
-      // We only coerce when source DIDN'T error out and DOESN'T already
-      // have meaningful content (body short → likely shell).
+      // FORCE-LOGIN coercion — if host is in ALWAYS_LOGIN_HOSTS and we
+      // haven't yet authenticated, upgrade the result to loginGated so
+      // the next branch tries the credentials we have. We trigger on
+      // EITHER of two signals:
+      //   1) Thin shell (bodyLen < 600) — typical of SPA portals like
+      //      e-avrop, tarjouspalvelu (Cloudia front-end).
+      //   2) No "logged-in marker" in the body — covers portals like
+      //      kommersannons.se that render a full header/footer (1000+
+      //      chars) even for anonymous users, so the thin-shell check
+      //      misses them. We look for "Logout" / "Mon compte" / "Min
+      //      profil" / etc. — words only a logged-in user would see.
+      //      Without those markers we conclude we're still anonymous
+      //      and force login. Real-world: kommersannons.se Roslagsvatten
+      //      had bodyLen ≈ 1000 (header/footer text) so the thin-shell
+      //      check failed; this dual trigger now catches it.
       if (src && !src.error && !src.skipped && !src.loginGated) {
         const bodyLen = src.bodyTextPreview?.length || 0;
-        const looksThinShell = bodyLen < 600;  // preview is capped at 600
-        if (hostRequiresLogin(src.sourceHost) && looksThinShell) {
-          console.log(`    🔐 host ${src.sourceHost} in ALWAYS_LOGIN_HOSTS + thin shell (${bodyLen}ch preview) — forcing login`);
+        const looksThinShell = bodyLen < 600;
+        const preview = src.bodyTextPreview || '';
+        const LOGGED_IN_MARKER = /\b(?:log\s*out|logout|logga\s*ut|logg\s*ut|cerrar\s*sesi[oó]n|d[eé]connexion|abmelden|uitloggen|kirjaudu\s*ulos|wyloguj|sign\s*out|min(?:a)?\s*(?:profil|sidor|side)|mein\s*konto|mon\s*compte|my\s*account|mitt\s*konto|moja\s*strona)\b/i;
+        const hasLoggedInMarker = LOGGED_IN_MARKER.test(preview);
+        if (hostRequiresLogin(src.sourceHost) && (looksThinShell || !hasLoggedInMarker)) {
+          const trigger = looksThinShell ? 'thin-shell' : 'no-logged-in-marker';
+          console.log(`    🔐 host ${src.sourceHost} in ALWAYS_LOGIN_HOSTS (trigger=${trigger}, bodyLen=${bodyLen}) — forcing login`);
           src.loginGated = true;
           src.matchedMarkers = src.matchedMarkers || 0;
           src.hasPasswordField = false;
