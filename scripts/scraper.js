@@ -170,6 +170,17 @@ const LOGIN_URLS = {
   // e-avrop.com — confirmed direct login URL is /login.aspx (not the
   // earlier /e-User/Default.aspx which renders without a visible form).
   'e-avrop.com':              'https://www.e-avrop.com/login.aspx',
+  // kommersannons.se hosts MULTIPLE buyer tenants under the same root
+  // domain (/fmv/, /elite/, /roslagsvatten/, /goteborgshamn/, etc.) and
+  // each tenant has its OWN /<tenant>/Default.aspx login page. The
+  // ASP.NET session cookie set on /fmv/ does NOT carry over to /elite/
+  // because the form uses tenant-relative paths and ASP.NET path-
+  // scopes its auth cookie. We therefore derive the login URL from the
+  // source URL's first path segment at call time (see
+  // getDedicatedLoginUrl). The entry below is just a host-presence
+  // marker — the value is used as a fallback when source URL has no
+  // tenant prefix (i.e. it's the bare root). 2026-05-11 fix for Nacka
+  // kommun /elite/ tender failing because we logged in on /fmv/.
   'kommersannons.se':         'https://www.kommersannons.se/fmv/Default.aspx',
   // tarjouspalvelu.fi (Finnish national tender front-end) doesn't host
   // its own login form — the Cloudia SaaS platform serves authentication
@@ -186,9 +197,31 @@ const LOGIN_URLS = {
   // tendsign.com keeps its login form on the tender URL via redirect,
   // so the default flow works — no override needed.
 };
-function getDedicatedLoginUrl(host) {
+function getDedicatedLoginUrl(host, sourceUrl) {
   if (!host) return null;
   const h = String(host).trim().toLowerCase().replace(/^www\./, '');
+  // kommersannons.se — multi-tenant: extract /<tenant>/ from the source
+  // URL and build /<tenant>/Default.aspx so we log in on the SAME path
+  // scope as the tender page. Falls through to the static LOGIN_URLS
+  // entry if no tenant prefix is parseable.
+  if (h === 'kommersannons.se' || h.endsWith('.kommersannons.se')) {
+    try {
+      if (sourceUrl) {
+        const u = new URL(sourceUrl);
+        // Path looks like "/elite/Notice/NoticeOverview.aspx" — first
+        // non-empty segment is the tenant. Whitelist alphanumerics +
+        // hyphen to avoid stray segments like "Notice" (which would
+        // happen if the URL was already on /Notice/...).
+        const segs = u.pathname.split('/').filter(Boolean);
+        const first = segs[0] || '';
+        const RESERVED = new Set(['notice', 'login', 'default.aspx', 'admin', 'app']);
+        if (first && /^[a-z0-9_-]{2,40}$/i.test(first) && !RESERVED.has(first.toLowerCase())) {
+          return `https://www.kommersannons.se/${first}/Default.aspx`;
+        }
+      }
+    } catch (_) { /* fall through */ }
+    return LOGIN_URLS['kommersannons.se'] || null;
+  }
   if (LOGIN_URLS[h]) return LOGIN_URLS[h];
   // suffix match
   for (const key of Object.keys(LOGIN_URLS)) {
@@ -357,6 +390,23 @@ async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperat
         _claudeCallTimes.pop();
         const wait = e._retryAfter || (5000 * attempt);
         console.log(`    ⏳ Claude 429 (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${(wait/1000).toFixed(1)}s`);
+        await _sleep(wait);
+        continue;
+      }
+      // Transient network errors — request timeout, TCP reset, name
+      // resolution glitch, socket hangup. These hit req.on('error') /
+      // req.destroy() and bypass the 429 path above, so without an
+      // explicit retry the very first hiccup kills qualification
+      // extraction for a tender. We saw this on 2026-05-11: Nacka
+      // kommun tender on kommersannons → "Claude request timeout" →
+      // pdfText=53ch landed in sheet with no requirements/quals. Up
+      // to MAX_ATTEMPTS-1 retries with linear backoff.
+      const msg = String(e && e.message || '');
+      const isTransient = /request timeout|ECONN(RESET|REFUSED|ABORTED)|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang ?up|network/i.test(msg);
+      if (isTransient && attempt < MAX_ATTEMPTS) {
+        _claudeCallTimes.pop();
+        const wait = 3000 * attempt;
+        console.log(`    ⏳ Claude transient error (attempt ${attempt}/${MAX_ATTEMPTS}): ${msg.slice(0, 80)} — retrying in ${(wait/1000).toFixed(1)}s`);
         await _sleep(wait);
         continue;
       }
@@ -891,7 +941,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     // than redirecting from the tender page. In that case, navigate to
     // the dedicated URL first — the browser cookie jar persists, so a
     // post-login fetchSourcePageDetails(sourceUrl) will be authenticated.
-    const dedicatedLoginUrl = getDedicatedLoginUrl(hostLabel);
+    const dedicatedLoginUrl = getDedicatedLoginUrl(hostLabel, sourceUrl);
     const loginNavTarget = dedicatedLoginUrl || sourceUrl;
     if (dedicatedLoginUrl) {
       console.log(`    ↪️  using dedicated login URL: ${dedicatedLoginUrl}`);
