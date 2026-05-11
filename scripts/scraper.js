@@ -222,6 +222,29 @@ function getDedicatedLoginUrl(host, sourceUrl) {
     } catch (_) { /* fall through */ }
     return LOGIN_URLS['kommersannons.se'] || null;
   }
+  // e-avrop.com — also multi-tenant: source URLs look like
+  // /<tenant>/e-Upphandling/Announcement.aspx (Pensionsmyndigheten,
+  // vob, linkoping, ...). 2026-05-11 log showed that going to bare
+  // /login.aspx + clicking the header LoginControl link redirects to
+  // info.e-avrop.com (marketing site). Try tenant-scoped login URL
+  // first; falls back to /login.aspx if no tenant prefix found.
+  if (h === 'e-avrop.com' || h.endsWith('.e-avrop.com')) {
+    try {
+      if (sourceUrl) {
+        const u = new URL(sourceUrl);
+        const segs = u.pathname.split('/').filter(Boolean);
+        const first = segs[0] || '';
+        const RESERVED = new Set([
+          'login.aspx', 'login', 'e-upphandling', 'default.aspx',
+          'admin', 'app', 'info',
+        ]);
+        if (first && /^[a-z0-9_-]{2,40}$/i.test(first) && !RESERVED.has(first.toLowerCase())) {
+          return `https://www.e-avrop.com/${first}/login.aspx`;
+        }
+      }
+    } catch (_) { /* fall through */ }
+    return LOGIN_URLS['e-avrop.com'] || null;
+  }
   if (LOGIN_URLS[h]) return LOGIN_URLS[h];
   // suffix match
   for (const key of Object.keys(LOGIN_URLS)) {
@@ -970,6 +993,23 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     // empty fields). The `excludeSubmit` filter avoids clicking inside
     // a form's own submit input/button when a real form is open.
     const clickInfo = await page.evaluate(() => {
+      // PRE-CHECK: if a visible password input already exists somewhere
+      // on the page, we're already on a login form — clicking ANY
+      // "Login" trigger now would navigate AWAY (header link to a
+      // marketing/info subdomain, popup-opener that already opened the
+      // form we see, etc.). 2026-05-11 log showed e-avrop /login.aspx
+      // had the form visible AND a header `Header1_LoginControl1_blogLink`
+      // that, when clicked, redirected to info.e-avrop.com (marketing).
+      // Returning early here keeps us on the form so the direct fill
+      // path below works.
+      try {
+        const visiblePass = Array.from(document.querySelectorAll(
+          'input[type="password"]:not([disabled]):not([aria-hidden="true"])'
+        )).find((el) => el && el.offsetParent !== null && el.offsetWidth > 0 && el.offsetHeight > 0);
+        if (visiblePass) {
+          return { clicked: null, sample: [], passwordAlreadyVisible: true };
+        }
+      } catch (_) { /* fall through to normal trigger search */ }
       // STRICT regex for visible-text matching — requires word boundaries
       // on both sides so we don't pick up "Author" / "Authority" / nav
       // headings. Covers EN/SV/FR/DE/ES/PT/FI/NO/SI/SK/CZ/HU/RO/EL/LV/
@@ -1139,6 +1179,9 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
           }
         }
       } catch (_) { /* best-effort */ }
+    } else if (clickInfo.passwordAlreadyVisible) {
+      // Form is already on the page — direct fill path will handle it.
+      console.log(`    ↪️  password field already visible on ${hostLabel} — skipping popup-trigger click`);
     } else if (clickInfo.sample && clickInfo.sample.length) {
       // Only log when we couldn't find a match — helps diagnose silent
       // failures like "no password field" without indicating a click.
@@ -1310,7 +1353,10 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       return false;
     }
 
-    const submitSel = await page.evaluate(() => {
+    const submitSel = await page.evaluate((passSelStr) => {
+      // Tier 1: standard semantic submit selectors. Catches normal HTML
+      // forms and ASP.NET pages whose LoginButton renders as a real
+      // <input type="submit" id="...LoginButton">.
       const candidates = [
         'button[type="submit"]:not([disabled])',
         'input[type="submit"]:not([disabled])',
@@ -1327,8 +1373,53 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
           if (el && el.offsetParent !== null) { el.click(); return sel; }
         } catch (_) {}
       }
+      // Tier 2: ASP.NET LoginControl variants that render the submit as
+      // an <a href="javascript:__doPostBack('...$LoginButton','')">Login</a>
+      // — semantic selectors above miss those entirely. 2026-05-11 log
+      // showed kommersannons.se /<tenant>/Default.aspx in this state:
+      // password field filled, but clicking nothing because the "Login"
+      // element was an anchor. We now look INSIDE the form that owns
+      // the password input for any visible <a>/<button>/[role="button"]
+      // whose text matches login vocabulary, and click that.
+      const TXT_SUBMIT = /^\s*(login|log[\s-]?in|logga[\s-]?in|sign[\s-]?in|signin|connexion|se[\s-]?connecter|anmelden|kirjaudu|iniciar\s*sesi[oó]n|acceder|entrar|prisijungti|logg[\s-]?inn|prijava)\s*$/i;
+      try {
+        const passEl = passSelStr ? document.querySelector(passSelStr) : null;
+        const passForm = passEl ? passEl.closest('form') : null;
+        if (passForm) {
+          const inForm = Array.from(passForm.querySelectorAll(
+            'a, button, [role="button"], input[type="button"]'
+          ));
+          // Prefer text match within the same form.
+          const byText = inForm.find((el) => {
+            if (!el || el.offsetParent === null) return false;
+            if (el.hasAttribute('disabled')) return false;
+            const t = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+            return t.length > 0 && t.length <= 20 && TXT_SUBMIT.test(t);
+          });
+          if (byText) {
+            try { byText.click(); return 'in-form-text:' + (byText.innerText || byText.value || '').trim().slice(0, 20); } catch (_) {}
+          }
+          // Attribute fallback within the same form — ASP.NET ids like
+          // `Header1_LoginControl1_LoginButton` are common.
+          const ATTR_SUBMIT = /(loginbutton|signinbutton|btnlogin|btnsignin|btnsubmit|loginlink|logbtn)/i;
+          const byAttr = inForm.find((el) => {
+            if (!el || el.offsetParent === null) return false;
+            if (el.hasAttribute('disabled')) return false;
+            const blob = [
+              el.id || '',
+              el.className || '',
+              el.getAttribute('name') || '',
+              el.getAttribute('href') || '',
+            ].join(' ').toLowerCase();
+            return ATTR_SUBMIT.test(blob);
+          });
+          if (byAttr) {
+            try { byAttr.click(); return 'in-form-attr:' + (byAttr.id || byAttr.className || '').slice(0, 30); } catch (_) {}
+          }
+        }
+      } catch (_) { /* fall through to Enter-key path */ }
       return null;
-    }).catch(() => null);
+    }, sels.passSel).catch(() => null);
     if (!submitSel) {
       try { await page.keyboard.press('Enter'); } catch (_) {}
     }
