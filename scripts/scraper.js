@@ -2081,6 +2081,12 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     page = await browser.newPage();
     page.setDefaultNavigationTimeout(30000);
     page.setDefaultTimeout(30000);
+    // v6 fix: bigger viewport. Puppeteer default (800×600) was too
+    // small — Documenten tab rendered but scrollIntoView+mouse.click
+    // at (x,y) coordinates landed outside the actual hit area. With
+    // a desktop-sized viewport the tab bar fits in the visible
+    // window and selector-based page.click handles scroll itself.
+    try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
 
     // Anti-headless stealth. TenderNed Angular bundle (confirmed via
     // user incognito test 2026-05-12: 4 tabs visible WITHOUT login)
@@ -2166,6 +2172,9 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         const cands = Array.from(document.querySelectorAll(
           '[role="tab"], .mat-mdc-tab, .mdc-tab, button, a, [role="button"], summary'
         ));
+        // CSS.escape polyfill for older bundles — needed for ids with
+        // colons like "mat-tab-group-0:label-2" (rare, but harmless).
+        const esc = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
         for (const el of cands) {
           // Use textContent ONLY — innerText concatenation duplicated
           // the label ("Documenten Documenten") and broke the anchored
@@ -2177,10 +2186,20 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
               el.scrollIntoView({ block: 'center' });
               const rect = el.getBoundingClientRect();
               if (rect.width > 0 && rect.height > 0) {
+                // Build a stable selector — Puppeteer's page.click()
+                // auto-scrolls and clicks reliably (better than raw
+                // mouse.click(x,y) which misses tabs that aren't yet
+                // in viewport). Prefer id; fall back to a sibling-
+                // independent attribute selector.
+                let selector = null;
+                if (el.id) selector = '#' + esc(el.id);
+                else if (el.getAttribute('data-test-id')) selector = `[data-test-id="${el.getAttribute('data-test-id')}"]`;
                 return {
                   x: rect.left + rect.width / 2,
                   y: rect.top + rect.height / 2,
                   text: t,
+                  selector,
+                  id: el.id || null,
                 };
               }
             } catch (_) {}
@@ -2191,16 +2210,29 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     } catch (_) {}
 
     if (tabRect) {
-      try {
-        // CDP-level mouse click — most reliable for Angular Material
-        // gesture handlers. Hover first so the tab gets :hover state
-        // (some Material versions check for it before activating).
-        await page.mouse.move(tabRect.x, tabRect.y);
-        await new Promise((r) => setTimeout(r, 150));
-        await page.mouse.click(tabRect.x, tabRect.y, { delay: 50 });
-        tabClicked = true;
-      } catch (e) {
-        console.log(`    🇳🇱 tenderned: mouse.click failed: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇳🇱 tenderned: tab match — text="${tabRect.text}", id="${tabRect.id || '(none)'}", coords=(${Math.round(tabRect.x)},${Math.round(tabRect.y)})`);
+      // Prefer selector-based click (auto-scrolls, fires proper
+      // synthesized event). Fall back to raw mouse.click only if no
+      // stable selector is available.
+      if (tabRect.selector) {
+        try {
+          await page.click(tabRect.selector, { delay: 50 });
+          tabClicked = true;
+        } catch (e) {
+          console.log(`    🇳🇱 tenderned: page.click(${tabRect.selector}) failed: ${(e.message || '').slice(0, 80)} — falling back to mouse.click`);
+        }
+      }
+      if (!tabClicked) {
+        try {
+          // CDP-level mouse click fallback for Angular Material
+          // gesture handlers. Hover first so the tab gets :hover state.
+          await page.mouse.move(tabRect.x, tabRect.y);
+          await new Promise((r) => setTimeout(r, 150));
+          await page.mouse.click(tabRect.x, tabRect.y, { delay: 50 });
+          tabClicked = true;
+        } catch (e) {
+          console.log(`    🇳🇱 tenderned: mouse.click failed: ${(e.message || '').slice(0, 80)}`);
+        }
       }
     }
     if (tabClicked) {
@@ -2286,6 +2318,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
 
       const downloadRect = await page.evaluate(() => {
         const RX_BTN = /Download\s*(?:alle\s*documenten|all\s*documents)/i;
+        const esc = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
         // Search across all clickable-ish elements + walk up to find
         // the actual <button>/<a> ancestor. User confirmed the label
         // span lives inside a wrapping button (DOM 2026-05-12:
@@ -2304,11 +2337,16 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
             target.scrollIntoView({ block: 'center' });
             const rect = target.getBoundingClientRect();
             if (rect.width > 0 && rect.height > 0) {
+              let selector = null;
+              if (target.id) selector = '#' + esc(target.id);
+              else if (target.getAttribute('data-test-id')) selector = `[data-test-id="${target.getAttribute('data-test-id')}"]`;
               return {
                 x: rect.left + rect.width / 2,
                 y: rect.top + rect.height / 2,
                 tag: target.tagName,
                 text: t.slice(0, 40),
+                selector,
+                id: target.id || null,
               };
             }
           } catch (_) {}
@@ -2318,13 +2356,23 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
 
       let downloadClicked = null;
       if (downloadRect) {
-        try {
-          await page.mouse.move(downloadRect.x, downloadRect.y);
-          await new Promise((r) => setTimeout(r, 150));
-          await page.mouse.click(downloadRect.x, downloadRect.y, { delay: 50 });
-          downloadClicked = `${downloadRect.tag} "${downloadRect.text}"`;
-        } catch (e) {
-          console.log(`    🇳🇱 tenderned: Download-all mouse.click failed: ${(e.message || '').slice(0, 80)}`);
+        if (downloadRect.selector) {
+          try {
+            await page.click(downloadRect.selector, { delay: 50 });
+            downloadClicked = `${downloadRect.tag} "${downloadRect.text}" via ${downloadRect.selector}`;
+          } catch (e) {
+            console.log(`    🇳🇱 tenderned: Download-all page.click(${downloadRect.selector}) failed: ${(e.message || '').slice(0, 80)} — falling back to mouse.click`);
+          }
+        }
+        if (!downloadClicked) {
+          try {
+            await page.mouse.move(downloadRect.x, downloadRect.y);
+            await new Promise((r) => setTimeout(r, 150));
+            await page.mouse.click(downloadRect.x, downloadRect.y, { delay: 50 });
+            downloadClicked = `${downloadRect.tag} "${downloadRect.text}" via mouse coords`;
+          } catch (e) {
+            console.log(`    🇳🇱 tenderned: Download-all mouse.click failed: ${(e.message || '').slice(0, 80)}`);
+          }
         }
       }
 
@@ -2530,6 +2578,173 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     return texts;
   } catch (e) {
     console.log(`    ⚠️  tenderned handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
+// =====================================================================
+// fetchTarjouspalveluDocuments
+// ---------------------------------------------------------------------
+// Mercell tenders sourced from tarjouspalvelu.fi (Finnish national
+// tender front-end on Cloudia SaaS) expose a direct ZIP download URL
+// at /Zip/TarjousPyynnonLiitteet/<noticeId> after authentication.
+// User-confirmed DOM 2026-05-12:
+//   <a href="/Zip/TarjousPyynnonLiitteet/611615" target="_blank">
+//     Download all documents (ZIP)
+//   </a>
+//
+// The noticeId is the `id` query parameter on the source URL, e.g.
+//   https://tarjouspalvelu.fi/keuda?id=611615&tpk=...
+// → ZIP: https://tarjouspalvelu.fi/Zip/TarjousPyynnonLiitteet/611615
+//
+// We open a new tab with the SAME browser context so the Cloudia
+// session cookies set by attemptPortalLogin are available, navigate
+// to the source URL once to anchor location, then page.evaluate(fetch)
+// the ZIP URL. Parse with adm-zip, prioritise Finnish keyword docs:
+//   Tarjouspyyntö (Request for Quotation) — top
+//   Soveltuvuusvaatimukset (Suitability requirements)
+//   Valintaperusteet (Selection criteria)
+//   UEA / ESPD
+// =====================================================================
+async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
+  let noticeId = null;
+  let tenant = null;
+  try {
+    const u = new URL(sourceUrl);
+    if (!/(^|\.)tarjouspalvelu\.fi$/i.test(u.hostname)) return [];
+    const idParam = u.searchParams.get('id');
+    if (!idParam || !/^\d+$/.test(idParam)) return [];
+    noticeId = idParam;
+    const segs = u.pathname.split('/').filter(Boolean);
+    tenant = segs[0] || ''; // e.g. "keuda"
+  } catch (_) { return []; }
+
+  let pdfParseLib = null;
+  let mammothLib = null;
+  let admZipLib = null;
+  try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
+  if (!admZipLib || !pdfParseLib) {
+    console.log(`    🇫🇮 tarjouspalvelu: pdf-parse or adm-zip unavailable — skipping`);
+    return [];
+  }
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(25000);
+    page.setDefaultTimeout(25000);
+
+    // Anchor location at the source URL so the fetch() runs with the
+    // correct origin/cookies. This also ensures we have an authenticated
+    // session — attemptPortalLogin sets cookies on the browser context,
+    // so this fresh page inherits them.
+    try {
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    } catch (e) {
+      console.log(`    🇫🇮 tarjouspalvelu: nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // Build the ZIP URL — tenant-relative.
+    const zipUrl = `https://tarjouspalvelu.fi/Zip/TarjousPyynnonLiitteet/${noticeId}`;
+    console.log(`    🇫🇮 tarjouspalvelu: tender ${noticeId} (tenant=${tenant || 'n/a'}) — fetching ZIP from ${zipUrl}`);
+
+    const result = await page.evaluate(async (url) => {
+      try {
+        const resp = await fetch(url, {
+          credentials: 'include',
+          redirect: 'follow',
+        });
+        if (!resp.ok) return { ok: false, status: resp.status };
+        const ct = resp.headers.get('content-type') || '';
+        const cd = resp.headers.get('content-disposition') || '';
+        const ab = await resp.arrayBuffer();
+        return {
+          ok: true,
+          status: resp.status,
+          ct,
+          cd,
+          url: resp.url || url,
+          data: Array.from(new Uint8Array(ab)),
+        };
+      } catch (e) {
+        return { ok: false, error: String(e).slice(0, 200) };
+      }
+    }, zipUrl).catch((e) => ({ ok: false, error: e.message }));
+
+    if (!result || !result.ok || !result.data || result.data.length < 1024) {
+      const status = result?.status || result?.error || '?';
+      console.log(`    ⚠️  tarjouspalvelu: ZIP fetch failed (status=${status}, len=${result?.data?.length || 0})`);
+      return [];
+    }
+    const buf = Buffer.from(result.data);
+    // Verify ZIP magic — sometimes auth wall returns HTML with 200.
+    if (buf[0] !== 0x50 || buf[1] !== 0x4b) {
+      const sniff = buf.slice(0, 80).toString('utf8').replace(/\s+/g, ' ').slice(0, 80);
+      console.log(`    ⚠️  tarjouspalvelu: response is not a ZIP (ct=${result.ct}, sniff="${sniff}"). Likely auth wall — login session may be invalid.`);
+      return [];
+    }
+    console.log(`    🇫🇮 tarjouspalvelu: ZIP captured (${buf.length}B, ct=${result.ct})`);
+
+    const texts = [];
+    try {
+      const zip = new admZipLib(buf);
+      const entries = zip.getEntries();
+      const SCORE_RULES = [
+        { rx: /tarjouspyynt[öo]|request\s*for\s*quotation/i, score: 30 },
+        { rx: /soveltuvuus\s*vaatimuks|soveltuvuuden|valintaperusteet|selection\s*criteria/i, score: 25 },
+        { rx: /tekninen\s*(ja\s*ammatillinen)?\s*p[äa]tevyys|technical\s*capability/i, score: 18 },
+        { rx: /taloudellinen|economic.*financial/i, score: 12 },
+        { rx: /uea|espd|yhteinen\s*eurooppalainen/i, score: 10 },
+        { rx: /vertailuperusteet|award\s*criteria/i, score: 8 },
+      ];
+      const scoreOf = (n) => {
+        let s = 0;
+        for (const r of SCORE_RULES) if (r.rx.test(n)) s = Math.max(s, r.score);
+        return s;
+      };
+      const docEntries = entries
+        .filter((e) => !e.isDirectory && /\.(pdf|docx?)$/i.test(e.entryName))
+        .map((e) => ({ entry: e, score: scoreOf(e.entryName) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 6);
+      console.log(`    🇫🇮 tarjouspalvelu: ZIP has ${entries.length} entries, parsing top ${docEntries.length} (PDFs/DOCXs)`);
+      for (const item of docEntries) {
+        const entry = item.entry;
+        const name = entry.entryName.slice(-100);
+        try {
+          const data = entry.getData();
+          let text = '';
+          const isPdf = data[0] === 0x25 && data[1] === 0x50 && data[2] === 0x44 && data[3] === 0x46;
+          const isDocx = /\.docx$/i.test(name);
+          if (isPdf && pdfParseLib) {
+            const parsed = await pdfParseLib(data);
+            text = ((parsed && parsed.text) || '').trim();
+          } else if (isDocx && mammothLib) {
+            const out = await mammothLib.extractRawText({ buffer: data });
+            text = ((out && out.value) || '').trim();
+          }
+          if (text.length > 200) {
+            const clipped = text.slice(0, 80000);
+            texts.push(`--- (tarjouspalvelu) ${name} ---\n${clipped}`);
+            console.log(`    🇫🇮 tarjouspalvelu: parsed "${name}" (${data.length}B → ${clipped.length}ch, score=${item.score})`);
+          } else {
+            console.log(`    ⚠️  tarjouspalvelu: "${name}" extracted text too short (${text.length}ch)`);
+          }
+        } catch (e) {
+          console.log(`    ⚠️  tarjouspalvelu: parse failed for "${name}": ${(e.message || '').slice(0, 80)}`);
+        }
+      }
+    } catch (e) {
+      console.log(`    ⚠️  tarjouspalvelu: ZIP parse error: ${(e.message || '').slice(0, 100)}`);
+    }
+    return texts;
+  } catch (e) {
+    console.log(`    ⚠️  tarjouspalvelu handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
   } finally {
     try { if (page) await page.close(); } catch (_) {}
@@ -3737,6 +3952,23 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     } catch (e) {
       console.log(`    ⚠️ tenderned handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // tarjouspalvelu.fi (Finnish Cloudia-fronted) Documents handler —
+    // direct ZIP at /Zip/TarjousPyynnonLiitteet/<id> after login. No-op
+    // for non-tarjouspalvelu sources.
+    try {
+      const tpTexts = await fetchTarjouspalveluDocuments(browser, sourceUrl);
+      if (tpTexts && tpTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + tpTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇫🇮 tarjouspalvelu: appended ${tpTexts.length} doc(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ tarjouspalvelu handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     srcPage.off('request', blockHandler);
