@@ -1492,12 +1492,21 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       const candidates = [
         'button[type="submit"]:not([disabled])',
         'input[type="submit"]:not([disabled])',
+        // Vaadin / Cloudia SSO: <button type="button" id="continue">Log in</button>
+        // (user-confirmed DOM 2026-05-12). Vaadin uses non-form layouts so
+        // Tier 2 form-scoped search misses; match by stable id directly.
+        'button#continue:not([disabled])',
+        'button[id="continue"]:not([disabled])',
         'button[name*="login" i]:not([disabled])',
         'button[id*="login" i]:not([disabled])',
         'button[class*="login" i]:not([disabled])',
         'button[name*="signin" i]:not([disabled])',
         'button[id*="signin" i]:not([disabled])',
         'button[id*="submit" i]:not([disabled])',
+        // Vaadin "button--positive" pattern (Cloudia uses this class for
+        // primary action buttons; non-disabled positive button after
+        // password field is the submit).
+        'button.button--positive:not([disabled])',
       ];
       for (const sel of candidates) {
         try {
@@ -1517,8 +1526,14 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       try {
         const passEl = passSelStr ? document.querySelector(passSelStr) : null;
         const passForm = passEl ? passEl.closest('form') : null;
-        if (passForm) {
-          const inForm = Array.from(passForm.querySelectorAll(
+        // When the page uses a non-form layout (Vaadin / Cloudia SSO,
+        // some Angular SPAs), passForm is null. Fall back to scanning
+        // the entire document — limited risk because TXT_SUBMIT is
+        // strict ("login", "log in", localized variants) and only
+        // visible elements pass `offsetParent !== null`.
+        const scopeRoot = passForm || document;
+        {
+          const inForm = Array.from(scopeRoot.querySelectorAll(
             'a, button, [role="button"], input[type="button"]'
           ));
           // Prefer text match within the same form.
@@ -2211,9 +2226,13 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
 
     if (tabRect) {
       console.log(`    🇳🇱 tenderned: tab match — text="${tabRect.text}", id="${tabRect.id || '(none)'}", coords=(${Math.round(tabRect.x)},${Math.round(tabRect.y)})`);
-      // Prefer selector-based click (auto-scrolls, fires proper
-      // synthesized event). Fall back to raw mouse.click only if no
-      // stable selector is available.
+      // v7 fix: Angular Material 14+ MDC tabs don't reliably activate
+      // from Puppeteer's CDP-level synthetic mouse events (v6 ran
+      // page.click without error but post-click tab stayed "Details").
+      // Strategy: fire page.click() for native pointer-event coverage
+      // AND el.click() in evaluate (DOM-level fallback). Material's
+      // click handler is attached to role="tab"; el.click() directly
+      // invokes it bypassing all pointer-event chain. Idempotent.
       if (tabRect.selector) {
         try {
           await page.click(tabRect.selector, { delay: 50 });
@@ -2221,6 +2240,17 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         } catch (e) {
           console.log(`    🇳🇱 tenderned: page.click(${tabRect.selector}) failed: ${(e.message || '').slice(0, 80)} — falling back to mouse.click`);
         }
+        // ALSO call el.click() in DOM context — this is the only thing
+        // that reliably fires Material's tab-activation handler.
+        try {
+          await page.evaluate((sel) => {
+            const el = document.querySelector(sel);
+            if (el) {
+              try { el.focus(); } catch (_) {}
+              el.click();
+            }
+          }, tabRect.selector);
+        } catch (_) {}
       }
       if (!tabClicked) {
         try {
@@ -2363,6 +2393,16 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
           } catch (e) {
             console.log(`    🇳🇱 tenderned: Download-all page.click(${downloadRect.selector}) failed: ${(e.message || '').slice(0, 80)} — falling back to mouse.click`);
           }
+          // v7: also DOM-click for Material event chain (idempotent).
+          try {
+            await page.evaluate((sel) => {
+              const el = document.querySelector(sel);
+              if (el) {
+                try { el.focus(); } catch (_) {}
+                el.click();
+              }
+            }, downloadRect.selector);
+          } catch (_) {}
         }
         if (!downloadClicked) {
           try {
