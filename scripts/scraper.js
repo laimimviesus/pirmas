@@ -960,6 +960,42 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     // Allow client-side redirects / SPA login forms to settle.
     await new Promise((r) => setTimeout(r, 1500));
 
+    // ALREADY-LOGGED-IN CHECK — when a prior tender's login left cookies
+    // in this browser context, navigating to /login.aspx (or equivalent)
+    // typically renders the logged-in shell instead of a login form:
+    // "My pages", "Log off", "Mina sidor", etc. visible, no password
+    // input. If we fall through to the click scorer in that state, the
+    // matcher picks an account-dropdown anchor ("My pages") that has
+    // login-ish attributes and navigates us into an account page. Early
+    // return saves the round-trip and avoids polluting the session.
+    // 2026-05-11 e-avrop fix: tenders #2/#6 failed with "clicked login
+    // trigger 'My pages'" after tender #1 logged in successfully.
+    try {
+      const sessionState = await page.evaluate(() => {
+        // Same vocabulary as outer LOGGED_IN_MARKER, kept in-sync with
+        // additions like "log\s*off" and "my\s*pages" that the e-avrop
+        // template uses verbatim.
+        const RX_LOGGED = /\b(?:log\s*out|log\s*off|logout|logga\s*ut|logg\s*ut|cerrar\s*sesi[oó]n|d[eé]connexion|abmelden|uitloggen|kirjaudu\s*ulos|wyloguj|sign\s*out|min(?:a)?\s*(?:profil|sidor|side)|mein\s*konto|mon\s*compte|my\s*account|my\s*pages|mitt\s*konto|moja\s*strona)\b/i;
+        const text = (document.body && document.body.innerText || '').slice(0, 4000);
+        const hasMarker = RX_LOGGED.test(text);
+        // visible password input present? (mirrors findVisible logic)
+        let hasVisiblePass = false;
+        try {
+          for (const el of document.querySelectorAll('input[type="password"]:not([disabled]):not([aria-hidden="true"])')) {
+            if (el && el.offsetParent !== null && el.offsetWidth > 0 && el.offsetHeight > 0) {
+              hasVisiblePass = true;
+              break;
+            }
+          }
+        } catch (_) {}
+        return { hasMarker, hasVisiblePass };
+      }).catch(() => ({ hasMarker: false, hasVisiblePass: false }));
+      if (sessionState.hasMarker && !sessionState.hasVisiblePass) {
+        console.log(`    ✅ already authenticated on ${hostLabel} (logged-in marker present, no password form) — skipping login flow`);
+        return true;
+      }
+    } catch (_) { /* fall through to normal login flow */ }
+
     // Some portals (e-avrop.com, marches-publics.gouv.fr, certain
     // TendSign / Cloudia variants) land on a page whose login form is
     // either inside a popup that opens after a "Logga in" / "Login" /
@@ -1076,6 +1112,17 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
           return MARKETING_HOST_PREFIX.test(h2);
         } catch (_) { return false; }
       };
+      // Logged-in nav-element filter — when the session is already
+      // authenticated (cookies from a prior tender's login), the page
+      // shows account-dropdown links like "My pages", "Mina sidor",
+      // "Mon compte", "Log off". Those sometimes carry login-ish
+      // attributes (legacy class names, container ids) and score on
+      // the attribute branch — clicking them takes us to an account
+      // page where no password form exists. The early-return check
+      // above usually catches this state, but in case it doesn't fire
+      // (subset of markers present, body too short, etc.), this guard
+      // rejects per-element. 2026-05-11 e-avrop tenders #2/#6 fix.
+      const RX_LOGGED_IN_NAV = /^\s*(?:log\s*off|log\s*out|logout|logga\s*ut|sign\s*out|d[eé]connexion|abmelden|cerrar\s*sesi[oó]n|kirjaudu\s*ulos|wyloguj|atsijungti|min(?:a)?\s*(?:profil|sidor|side)|my\s*pages|my\s*account|mon\s*compte|mein\s*konto|mitt\s*konto|moja\s*strona)\s*$/i;
       const scoreEl = (el) => {
         if (!el || el.offsetParent === null) return -1;
         if (insideOpenForm(el)) return -1;
@@ -1085,6 +1132,11 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
           return -1;
         }
         const innerText = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+        // Logged-in nav filter: short, exactly-matching account-link
+        // text (anchored on both sides) gets rejected outright.
+        if (innerText && innerText.length <= 30 && RX_LOGGED_IN_NAV.test(innerText)) {
+          return -1;
+        }
         // Primary: visible text matches (HIGH confidence, score 3)
         if (innerText && innerText.length <= 40 && RX_TEXT.test(innerText)) {
           if (SKIP_TEXT.test(innerText)) return -1;
@@ -5016,7 +5068,7 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         const bodyLen = src.bodyTextPreview?.length || 0;
         const looksThinShell = bodyLen < 600;
         const preview = src.bodyTextPreview || '';
-        const LOGGED_IN_MARKER = /\b(?:log\s*out|logout|logga\s*ut|logg\s*ut|cerrar\s*sesi[oó]n|d[eé]connexion|abmelden|uitloggen|kirjaudu\s*ulos|wyloguj|sign\s*out|min(?:a)?\s*(?:profil|sidor|side)|mein\s*konto|mon\s*compte|my\s*account|mitt\s*konto|moja\s*strona)\b/i;
+        const LOGGED_IN_MARKER = /\b(?:log\s*out|log\s*off|logout|logga\s*ut|logg\s*ut|cerrar\s*sesi[oó]n|d[eé]connexion|abmelden|uitloggen|kirjaudu\s*ulos|wyloguj|sign\s*out|min(?:a)?\s*(?:profil|sidor|side)|mein\s*konto|mon\s*compte|my\s*account|my\s*pages|mitt\s*konto|moja\s*strona)\b/i;
         const hasLoggedInMarker = LOGGED_IN_MARKER.test(preview);
         if (hostRequiresLogin(src.sourceHost) && (looksThinShell || !hasLoggedInMarker)) {
           const trigger = looksThinShell ? 'thin-shell' : 'no-logged-in-marker';
