@@ -1593,110 +1593,123 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
     }
     console.log(`    🇳🇴 eu-supply: ${found.length} document(s) detected on docs page`);
 
-    // Step 4 — call the real DownloadPublicDocument() JS function and
-    // intercept the PDF response. The earlier approach (guess URL
-    // patterns and GET them) failed because the function uses an
-    // unguessable endpoint with POST + cookies. Response interception
-    // sidesteps the guessing entirely — we register a response listener,
-    // execute the page's own download function, and capture the bytes
-    // from whatever request it triggers. Falls back to JS-source
-    // diagnostic if response capture doesn't fire.
+    // Step 4 — build the real download URL using the JS function's own
+    // formula. The JS source (revealed by diagnostic in earlier run) is:
+    //   var strURL = strDownloadPublicDocumentURL
+    //              + '?FMT=5&AT=' + strArchiveType
+    //              + '&LID=' + strLotID
+    //              + '&DVID=' + strFileID;
+    // Two key facts the earlier guess-and-fetch approach missed:
+    //   • The query param is `DVID` (not `DID`) — server rejected our
+    //     `DID=...` requests and returned a generic HTML error page.
+    //   • The base path comes from the global `strDownloadPublicDocumentURL`
+    //     which we now read at runtime. Across CTM deployments it tends
+    //     to be `/app/rfq/downloadpublicdocument.asp` but we don't have
+    //     to hard-code it.
+    // Response interception (the previous attempt) failed because the
+    // function falls through to `window.open(strURL)` when ActiveX
+    // FileMgr isn't loaded — that opens a popup whose responses aren't
+    // visible on this page's response stream.
     let pdfParseLib = null;
     try { pdfParseLib = require('pdf-parse'); } catch (_) {}
     const texts = [];
     const MAX_DOCS = 6;
 
-    // Optional one-time diagnostic: dump the JS function source so we
-    // can see what URL it builds. Helps if response interception fails.
+    // Read the JS globals the page's DownloadPublicDocument uses.
+    const ctmGlobals = await page.evaluate(() => {
+      // Helpers — these vars are defined as plain `var` in the page,
+      // so they live on `window`. Provide safe defaults.
+      const out = {
+        basePath: null,
+        archiveType: '',
+        fmt: '5',
+        rawFnSnippet: null,
+      };
+      try {
+        if (typeof strDownloadPublicDocumentURL === 'string' && strDownloadPublicDocumentURL.length) {
+          out.basePath = strDownloadPublicDocumentURL;
+        } else if (typeof window.strDownloadPublicDocumentURL === 'string') {
+          out.basePath = window.strDownloadPublicDocumentURL;
+        }
+      } catch (_) {}
+      try {
+        if (typeof strArchiveType !== 'undefined' && strArchiveType !== null) {
+          out.archiveType = String(strArchiveType);
+        } else if (typeof window.strArchiveType !== 'undefined') {
+          out.archiveType = String(window.strArchiveType);
+        }
+      } catch (_) {}
+      try {
+        if (typeof DownloadPublicDocument === 'function') {
+          out.rawFnSnippet = DownloadPublicDocument.toString().slice(0, 400);
+        }
+      } catch (_) {}
+      return out;
+    }).catch(() => ({ basePath: null, archiveType: '', fmt: '5', rawFnSnippet: null }));
+
+    if (ctmGlobals.rawFnSnippet) {
+      console.log(`    🇳🇴 eu-supply: DownloadPublicDocument source: ${ctmGlobals.rawFnSnippet.replace(/\s+/g, ' ').slice(0, 260)}`);
+    }
+    if (!ctmGlobals.basePath) {
+      console.log(`    ⚠️  eu-supply: strDownloadPublicDocumentURL global not found — cannot build download URL`);
+      return [];
+    }
+    // Resolve to absolute URL — basePath may be relative ("/app/rfq/...")
+    // or absolute. Use the docs page as base for relative resolution.
+    let downloadEndpoint = ctmGlobals.basePath;
     try {
-      const fnSrc = await page.evaluate(() => {
-        try {
-          if (typeof DownloadPublicDocument === 'function') {
-            return DownloadPublicDocument.toString().slice(0, 600);
-          }
-        } catch (_) {}
-        return null;
-      });
-      if (fnSrc) {
-        console.log(`    🇳🇴 eu-supply: DownloadPublicDocument source: ${fnSrc.replace(/\s+/g, ' ').slice(0, 280)}`);
-      }
+      const u = new URL(downloadEndpoint, page.url());
+      downloadEndpoint = u.toString();
     } catch (_) {}
+    console.log(`    🇳🇴 eu-supply: download endpoint resolved to ${downloadEndpoint.slice(0, 100)} (AT="${ctmGlobals.archiveType}")`);
 
     for (const doc of found.slice(0, MAX_DOCS)) {
       const eLid = doc.lid || lid;
       const labelName = (doc.name || `Document ${doc.docId}`).slice(0, 80);
+      // Build the URL exactly like the JS function does.
+      const downloadUrl = `${downloadEndpoint}?FMT=${encodeURIComponent(ctmGlobals.fmt)}&AT=${encodeURIComponent(ctmGlobals.archiveType)}&LID=${encodeURIComponent(eLid)}&DVID=${encodeURIComponent(doc.docId)}`;
+      // Fetch with browser cookies + follow redirects. CTM sometimes
+      // returns a 302 to a presigned S3-like URL; the browser handles
+      // that for us.
+      const result = await page.evaluate(async (u) => {
+        try {
+          const r = await fetch(u, { credentials: 'include', redirect: 'follow' });
+          const ct = r.headers.get('content-type') || '';
+          const cd = r.headers.get('content-disposition') || '';
+          if (!r.ok) return { ok: false, status: r.status, ct, cd };
+          const buf = await r.arrayBuffer();
+          return {
+            ok: true,
+            status: r.status,
+            ct,
+            cd,
+            url: r.url,
+            data: Array.from(new Uint8Array(buf)),
+          };
+        } catch (e) { return { ok: false, error: String(e) }; }
+      }, downloadUrl).catch(() => null);
       let bytes = null;
       let capturedUrl = null;
-      // Response listener — capture any response that looks like a PDF
-      // or binary attachment fired AFTER we trigger the JS download.
-      const responses = [];
-      const respHandler = async (resp) => {
-        try {
-          const ct = (resp.headers()['content-type'] || '').toLowerCase();
-          const cd = (resp.headers()['content-disposition'] || '').toLowerCase();
-          // Skip the page itself + obvious non-binary
-          if (ct.includes('text/html') && !cd.includes('attachment')) return;
-          // Capture if PDF, octet-stream, or has attachment disposition
-          if (ct.includes('application/pdf')
-              || ct.includes('octet-stream')
-              || cd.includes('attachment')) {
-            const buf = await resp.buffer().catch(() => null);
-            if (buf && buf.length > 1000) {
-              responses.push({ url: resp.url(), ct, cd, buf });
-            }
-          }
-        } catch (_) {}
-      };
-      page.on('response', respHandler);
-
-      try {
-        // Execute the page's actual download function with the captured
-        // doc/elem/lid args. If the function opens a popup window, the
-        // request still goes through this page's context.
-        await page.evaluate(async (docId, elemId, lidVal) => {
-          try {
-            if (typeof DownloadPublicDocument === 'function') {
-              DownloadPublicDocument(docId, elemId, lidVal);
-            } else {
-              // Some pages bind it onto window or define inline only.
-              // Try to find any onclick=DownloadPublicDocument(...)
-              // matching docId and click it directly.
-              const all = document.querySelectorAll('[onclick], a[href]');
-              for (const el of all) {
-                const h = (el.getAttribute('onclick') || el.getAttribute('href') || '');
-                if (h.includes(`DownloadPublicDocument(`) && h.includes(`'${docId}'`)) {
-                  el.click();
-                  return;
-                }
-              }
-            }
-          } catch (_) {}
-        }, doc.docId, doc.elemId, eLid).catch(() => null);
-
-        // Allow the network request to fire and be captured.
-        await new Promise((r) => setTimeout(r, 4500));
-      } finally {
-        page.off('response', respHandler);
-      }
-
-      // Pick the first response whose body is a real PDF.
-      for (const r of responses) {
-        const b = r.buf;
-        if (b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) {
-          bytes = b;
-          capturedUrl = r.url;
-          break;
+      if (result && result.ok && result.data && result.data.length > 1000) {
+        const buf = Buffer.from(result.data);
+        // Accept PDF magic OR generic octet-stream/attachment.
+        const isPdf = buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
+        const ctL = (result.ct || '').toLowerCase();
+        const cdL = (result.cd || '').toLowerCase();
+        const looksBinary = isPdf
+          || ctL.includes('application/pdf')
+          || ctL.includes('octet-stream')
+          || cdL.includes('attachment');
+        if (looksBinary) {
+          bytes = buf;
+          capturedUrl = result.url || downloadUrl;
         }
-      }
-      // If no PDF-magic but octet-stream attachment came through, take
-      // it anyway and rely on the parser to figure out the format.
-      if (!bytes && responses.length) {
-        bytes = responses[0].buf;
-        capturedUrl = responses[0].url;
       }
 
       if (!bytes) {
-        console.log(`    ⚠️  eu-supply: no PDF response captured for "${labelName}" (id=${doc.docId}, ${responses.length} non-html response(s) seen)`);
+        const status = result?.status || '?';
+        const ct = (result?.ct || '').slice(0, 40);
+        console.log(`    ⚠️  eu-supply: download failed for "${labelName}" (id=${doc.docId}, status=${status}, ct=${ct})`);
         continue;
       }
       if (!pdfParseLib) {
