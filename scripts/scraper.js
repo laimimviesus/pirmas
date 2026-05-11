@@ -2149,49 +2149,60 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     } catch (_) {}
 
     // TenderNed uses Angular Material mat-tab — Documents is a tab in
-    // the same URL. Clicking it reveals the document list (XHR loads
-    // shortly after). Must click reliably AND wait for the post-click
-    // network to settle. User-confirmed DOM (2026-05-12):
-    //   <div role="tab" id="mat-tab-group-0-label-2" aria-controls=
-    //        "mat-tab-group-0-content-2" ...>
-    //     <span class="mdc-tab__text-label">Documenten</span>
-    //   </div>
+    // the same URL. Click activation in headless Chromium needs a
+    // real OS-level mouse event (page.mouse.click), not just
+    // element.dispatchEvent — Angular Material's gesture detector
+    // requires CDP-level pointer events to fire all ripple/state
+    // handlers correctly. We find the tab in evaluate, scroll into
+    // view, return its centre rect, then click via page.mouse.
+    // 2026-05-12 fix: v4 dispatchEvent caused "Documenten tab not
+    // found" even when diag showed it; root cause was textContent +
+    // innerText concatenation breaking the anchored regex.
     let tabClicked = false;
+    let tabRect = null;
     try {
-      tabClicked = await page.evaluate(() => {
+      tabRect = await page.evaluate(() => {
         const RX_TAB = /^\s*(documenten|bijlagen|bestanden|documents|attachments)\s*$/i;
         const cands = Array.from(document.querySelectorAll(
-          'button, a, [role="tab"], [role="button"], summary, h2, h3, .mat-mdc-tab, .mdc-tab'
+          '[role="tab"], .mat-mdc-tab, .mdc-tab, button, a, [role="button"], summary'
         ));
         for (const el of cands) {
-          // Use textContent (not innerText) — Angular Material wraps
-          // labels in nested <span class="mdc-tab__text-label"> which
-          // sometimes returns empty innerText if the tab is not in
-          // viewport. textContent works either way.
-          const t = ((el.textContent || '') + ' ' + (el.innerText || ''))
-            .trim().replace(/\s+/g, ' ').slice(0, 60);
+          // Use textContent ONLY — innerText concatenation duplicated
+          // the label ("Documenten Documenten") and broke the anchored
+          // regex. textContent reliably returns "Documenten" for the
+          // mat-tab DOM structure (nested mdc-tab__text-label span).
+          const t = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60);
           if (RX_TAB.test(t)) {
             try {
-              el.scrollIntoView?.({ block: 'center' });
-              // Dispatch click via MouseEvent — Angular Material's
-              // ripple/tab handler subscribes to mousedown+mouseup
-              // events, so plain el.click() sometimes no-ops on
-              // <div role="tab"> in headless Chromium.
+              el.scrollIntoView({ block: 'center' });
               const rect = el.getBoundingClientRect();
-              const x = rect.left + rect.width / 2;
-              const y = rect.top + rect.height / 2;
-              for (const type of ['mousedown', 'mouseup', 'click']) {
-                el.dispatchEvent(new MouseEvent(type, {
-                  bubbles: true, cancelable: true, view: window, clientX: x, clientY: y,
-                }));
+              if (rect.width > 0 && rect.height > 0) {
+                return {
+                  x: rect.left + rect.width / 2,
+                  y: rect.top + rect.height / 2,
+                  text: t,
+                };
               }
-              return true;
             } catch (_) {}
           }
         }
-        return false;
-      }).catch(() => false);
+        return null;
+      }).catch(() => null);
     } catch (_) {}
+
+    if (tabRect) {
+      try {
+        // CDP-level mouse click — most reliable for Angular Material
+        // gesture handlers. Hover first so the tab gets :hover state
+        // (some Material versions check for it before activating).
+        await page.mouse.move(tabRect.x, tabRect.y);
+        await new Promise((r) => setTimeout(r, 150));
+        await page.mouse.click(tabRect.x, tabRect.y, { delay: 50 });
+        tabClicked = true;
+      } catch (e) {
+        console.log(`    🇳🇱 tenderned: mouse.click failed: ${(e.message || '').slice(0, 80)}`);
+      }
+    }
     if (tabClicked) {
       console.log(`    🇳🇱 tenderned: clicked Documenten tab — waiting for content`);
       // Tab activation triggers XHR (api/documenten/...) — wait for it
@@ -2273,17 +2284,16 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         page.on('response', handler);
       });
 
-      const downloadClicked = await page.evaluate(() => {
+      const downloadRect = await page.evaluate(() => {
         const RX_BTN = /Download\s*(?:alle\s*documenten|all\s*documents)/i;
         // Search across all clickable-ish elements + walk up to find
         // the actual <button>/<a> ancestor. User confirmed the label
-        // span lives inside a wrapping button.
+        // span lives inside a wrapping button (DOM 2026-05-12:
+        // <span class="text-nowrap"> Download alle documenten </span>).
         const all = Array.from(document.querySelectorAll('span, button, a, [role="button"]'));
         for (const el of all) {
-          const t = ((el.textContent || '') + ' ' + (el.innerText || ''))
-            .trim().replace(/\s+/g, ' ');
+          const t = (el.textContent || '').trim().replace(/\s+/g, ' ');
           if (!RX_BTN.test(t) || t.length > 80) continue;
-          // Climb to <button> or <a> ancestor if our hit was on a span.
           let target = el;
           for (let i = 0; i < 4; i++) {
             if (target.tagName === 'BUTTON' || target.tagName === 'A') break;
@@ -2291,20 +2301,32 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
             else break;
           }
           try {
-            target.scrollIntoView?.({ block: 'center' });
+            target.scrollIntoView({ block: 'center' });
             const rect = target.getBoundingClientRect();
-            const x = rect.left + rect.width / 2;
-            const y = rect.top + rect.height / 2;
-            for (const type of ['mousedown', 'mouseup', 'click']) {
-              target.dispatchEvent(new MouseEvent(type, {
-                bubbles: true, cancelable: true, view: window, clientX: x, clientY: y,
-              }));
+            if (rect.width > 0 && rect.height > 0) {
+              return {
+                x: rect.left + rect.width / 2,
+                y: rect.top + rect.height / 2,
+                tag: target.tagName,
+                text: t.slice(0, 40),
+              };
             }
-            return target.tagName + ' "' + t.slice(0, 40) + '"';
           } catch (_) {}
         }
         return null;
       }).catch(() => null);
+
+      let downloadClicked = null;
+      if (downloadRect) {
+        try {
+          await page.mouse.move(downloadRect.x, downloadRect.y);
+          await new Promise((r) => setTimeout(r, 150));
+          await page.mouse.click(downloadRect.x, downloadRect.y, { delay: 50 });
+          downloadClicked = `${downloadRect.tag} "${downloadRect.text}"`;
+        } catch (e) {
+          console.log(`    🇳🇱 tenderned: Download-all mouse.click failed: ${(e.message || '').slice(0, 80)}`);
+        }
+      }
 
       if (downloadClicked) {
         console.log(`    🇳🇱 tenderned: clicked Download-all (${downloadClicked}) — waiting for ZIP`);
