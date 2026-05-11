@@ -99,6 +99,17 @@ try {
 } catch (e) {
   console.log(`⚠️ PORTAL_CREDS_JSON parse failed: ${e.message}`);
 }
+// Cross-host SSO mapping — portals that don't have their own auth and
+// instead federate to a central login service. The MAP value is a host
+// whose entry in PORTAL_CREDS_JSON should be reused. Example:
+// tarjouspalvelu.fi (Finnish national tender front-end) doesn't accept
+// direct logins; users authenticate at https://login.cloudia.net/...
+// and the session cookies are then accepted by tarjouspalvelu.fi.
+// When a tender's source host appears here, getPortalCreds() resolves
+// credentials via the aliased host instead.
+const PORTAL_HOST_ALIASES = {
+  'tarjouspalvelu.fi': 'cloudia.net',
+};
 function getPortalCreds(hostOrUrl) {
   if (!hostOrUrl || !_portalCreds || !Object.keys(_portalCreds).length) return null;
   let host = String(hostOrUrl).trim().toLowerCase();
@@ -113,6 +124,13 @@ function getPortalCreds(hostOrUrl) {
   for (const key of Object.keys(_portalCreds)) {
     const k = String(key).toLowerCase().replace(/^www\./, '');
     if (host === k || host.endsWith('.' + k)) return _portalCreds[key];
+  }
+  // SSO alias — recursively look up the aliased host. Allows the
+  // creds JSON to keep a single entry (e.g. "cloudia.net") that
+  // covers every fronted portal (tarjouspalvelu.fi, etc.).
+  if (PORTAL_HOST_ALIASES[host]) {
+    const aliasCreds = getPortalCreds(PORTAL_HOST_ALIASES[host]);
+    if (aliasCreds) return aliasCreds;
   }
   return null;
 }
@@ -131,6 +149,7 @@ const ALWAYS_LOGIN_HOSTS = [
   'e-avrop.com',          // Swedish — Antirio platform shell
   'tendsign.com',          // Swedish/Norwegian — TendSign platform
   'kommersannons.se',      // Swedish FMV — Kommers Annons shell
+  'tarjouspalvelu.fi',     // Finnish — Cloudia-fronted (SSO via login.cloudia.net)
 ];
 function hostRequiresLogin(host) {
   if (!host) return false;
@@ -152,6 +171,13 @@ const LOGIN_URLS = {
   // earlier /e-User/Default.aspx which renders without a visible form).
   'e-avrop.com':              'https://www.e-avrop.com/login.aspx',
   'kommersannons.se':         'https://www.kommersannons.se/fmv/Default.aspx',
+  // tarjouspalvelu.fi (Finnish national tender front-end) doesn't host
+  // its own login form — the Cloudia SaaS platform serves authentication
+  // at login.cloudia.net. After login there, session cookies are valid
+  // for tarjouspalvelu.fi via shared backend (Cloudia SSO).
+  // Credentials look up via PORTAL_HOST_ALIASES (tarjouspalvelu.fi
+  // → cloudia.net).
+  'tarjouspalvelu.fi':        'https://login.cloudia.net/user/login',
   // marches-publics.gouv.fr — the source URL itself has a "Login" button
   // in the corner; clicking it pops up a form whose fields are
   // form[_username] / form[_password] (action=/entreprise/login). The
