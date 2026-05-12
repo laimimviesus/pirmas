@@ -4214,7 +4214,11 @@ async function fetchEavropDocuments(browser, sourceUrl) {
           // Match the supplier-side procurement.aspx path. The exact
           // tenant prefix varies (RegionHalland, linkoping, karolinska,
           // vob, etc.), so we match by suffix.
-          if (/\/leverantor\/annons\/procurement\.aspx\?/i.test(src)) {
+          // 2026-05-14 fix v2: iframe src is RELATIVE
+          // ("leverantor/annons/procurement.aspx?...") with NO leading
+          // slash — the previous regex required a leading slash and
+          // therefore never matched. Drop the leading-slash anchor.
+          if (/leverantor\/annons\/procurement\.aspx\?/i.test(src)) {
             try { return new URL(src, location.href).toString(); }
             catch (_) {}
           }
@@ -4251,21 +4255,44 @@ async function fetchEavropDocuments(browser, sourceUrl) {
       }).catch(() => false);
       if (hasSubscribeBtn) {
         console.log(`    🇸🇪 e-avrop: createZip still not found — firing SubscribeBtn __doPostBack as fallback`);
-        const fired = await page.evaluate(() => {
+        // 2026-05-14 fix v2: the earlier `typeof __doPostBack === 'function'`
+        // check inside page.evaluate triggered a strict-mode TypeError
+        // ("'caller', 'callee', 'arguments' properties may not be accessed").
+        // Antirio's __doPostBack implementation introspects `arguments.callee`
+        // and breaks under V8's strict-mode evaluation context. Solution:
+        // skip the typeof check entirely. Two safer paths:
+        //   1. Use `page.click(selector)` — Puppeteer's click navigates the
+        //      page's own document, which is non-strict; the anchor's
+        //      href="javascript:__doPostBack(...)" runs in page scope.
+        //   2. As a backup, run the javascript: payload via indirect eval
+        //      `(0, eval)(payload)` which executes in global non-strict
+        //      scope.
+        let fired = 'no-attempt';
+        try {
+          await page.click('#navigationContent_SubscribeBtn');
+          fired = 'page.click';
+        } catch (_) {
+          // Fallback: indirect eval of the href's javascript: payload.
           try {
-            if (typeof __doPostBack === 'function') {
-              // eslint-disable-next-line no-undef
-              __doPostBack('ctl00$navigationContent$SubscribeBtn', '');
-              return 'postback';
-            }
-            const el = document.querySelector('#navigationContent_SubscribeBtn');
-            if (!el) return 'no-element';
-            el.click();
-            return 'click';
-          } catch (e) {
-            return 'error:' + String(e).slice(0, 60);
-          }
-        }).catch(() => 'evaluate-error');
+            fired = await page.evaluate(() => {
+              const el = document.querySelector('#navigationContent_SubscribeBtn');
+              if (!el) return 'no-element';
+              const href = el.getAttribute('href') || '';
+              const m = /^\s*javascript:\s*(.*)$/i.exec(href);
+              if (m && m[1]) {
+                try {
+                  // Indirect eval — runs in global scope, non-strict by
+                  // default, bypasses arguments.callee restriction.
+                  (0, eval)(m[1]);
+                  return 'eval-href';
+                } catch (e) {
+                  return 'eval-error:' + String(e).slice(0, 50);
+                }
+              }
+              return 'no-href';
+            }).catch((e) => 'evaluate-error:' + (e.message || '').slice(0, 50));
+          } catch (e) { fired = 'click-error:' + (e.message || '').slice(0, 50); }
+        }
         console.log(`    🇸🇪 e-avrop: SubscribeBtn trigger result = ${fired}`);
         try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
         await new Promise((r) => setTimeout(r, 1500));
@@ -4308,34 +4335,35 @@ async function fetchEavropDocuments(browser, sourceUrl) {
     const before = new Set();
     try { for (const n of fs.readdirSync(downloadDir)) before.add(n); } catch (_) {}
 
-    // Fire the postback. We use page.evaluate so the call runs in the
-    // page's own JS context with __doPostBack already defined. This is
-    // more reliable than .click() — Puppeteer's .click() on an anchor
-    // with href="javascript:..." sometimes doesn't fire the handler
-    // (page navigates to literal "javascript:..." URL instead).
-    const fired = await page.evaluate(() => {
+    // Fire the postback. 2026-05-14 fix v2 — avoid the strict-mode
+    // pitfall (Antirio's __doPostBack uses `arguments.callee` which
+    // V8 rejects when called from page.evaluate strict scope). Prefer
+    // page.click() which navigates via the page's non-strict context;
+    // fall back to indirect-eval `(0, eval)(payload)` of the href's
+    // javascript: payload.
+    let fired = 'no-attempt';
+    try {
+      await page.click('#mainContent_createZip');
+      fired = 'page.click';
+    } catch (_) {
       try {
-        if (typeof __doPostBack === 'function') {
-          // eslint-disable-next-line no-undef
-          __doPostBack('ctl00$mainContent$createZip', '');
-          return 'postback';
-        }
-        // Fallback — evaluate the href.
-        const el = document.querySelector('#mainContent_createZip');
-        if (!el) return 'no-element';
-        const href = el.getAttribute('href') || '';
-        const m = /^\s*javascript:\s*(.*)$/i.exec(href);
-        if (m && m[1]) {
-          // eslint-disable-next-line no-eval
-          (function () { eval(m[1]); }).call(window);
-          return 'eval-href';
-        }
-        el.click();
-        return 'click';
-      } catch (e) {
-        return 'error:' + String(e).slice(0, 60);
-      }
-    }).catch((e) => 'evaluate-error:' + (e.message || '').slice(0, 60));
+        fired = await page.evaluate(() => {
+          const el = document.querySelector('#mainContent_createZip');
+          if (!el) return 'no-element';
+          const href = el.getAttribute('href') || '';
+          const m = /^\s*javascript:\s*(.*)$/i.exec(href);
+          if (m && m[1]) {
+            try {
+              (0, eval)(m[1]);
+              return 'eval-href';
+            } catch (e) {
+              return 'eval-error:' + String(e).slice(0, 50);
+            }
+          }
+          return 'no-href';
+        }).catch((e) => 'evaluate-error:' + (e.message || '').slice(0, 50));
+      } catch (e) { fired = 'click-error:' + (e.message || '').slice(0, 50); }
+    }
     console.log(`    🇸🇪 e-avrop: postback trigger result = ${fired}`);
 
     // Poll the download dir for a fresh .zip — bulk ZIP can take a few
@@ -4610,12 +4638,13 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           const eventTarget = tab.url.slice('postback:'.length);
           if (!eventTarget) continue;
           console.log(`    🇸🇪 kommersannons: firing __doPostBack('${eventTarget}') for ${tab.label}`);
+          // 2026-05-14 fix v2: avoid strict-mode TypeError (some
+          // ASP.NET __doPostBack variants use arguments.callee).
+          // Use indirect-eval which runs in global non-strict scope.
           await page.evaluate((et) => {
             try {
-              if (typeof __doPostBack === 'function') {
-                // eslint-disable-next-line no-undef
-                __doPostBack(et, '');
-              }
+              // eslint-disable-next-line no-eval
+              (0, eval)(`__doPostBack('${et.replace(/'/g, "\\'")}', '')`);
             } catch (_) {}
           }, eventTarget).catch(() => null);
           try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
