@@ -186,7 +186,10 @@ function getPortalCreds(hostOrUrl) {
 // login. We force login here.
 const ALWAYS_LOGIN_HOSTS = [
   'e-avrop.com',          // Swedish — Antirio platform shell
-  'tendsign.com',          // Swedish/Norwegian — TendSign platform
+  // 'tendsign.com' removed 2026-05-13 — source URLs are now rewritten
+  // to the anonymous public-view variant (/public/p_meformsnotice.aspx)
+  // which doesn't need auth. Login attempts on the buyer-restricted
+  // doc.aspx variant succeed but session doesn't unlock content.
   'kommersannons.se',      // Swedish FMV — Kommers Annons shell
   'tarjouspalvelu.fi',     // Finnish — Cloudia-fronted (SSO via login.cloudia.net)
 ];
@@ -3077,6 +3080,15 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
   try {
     const u = new URL(sourceUrl);
     if (!/(^|\.)tendsign\.com$/i.test(u.hostname)) return [];
+    // Defense in depth — if the source URL is still the gated doc.aspx
+    // variant (e.g. handler entered through a code path that bypassed
+    // the rewriter in fetchSourcePageDetails), rewrite it now.
+    if (/\/doc\.aspx/i.test(u.pathname)) {
+      const noticeId = u.searchParams.get('MeFormsNoticeId') || u.searchParams.get('UnikID');
+      if (noticeId && /^\d+$/.test(noticeId)) {
+        sourceUrl = `https://tendsign.com/public/p_meformsnotice.aspx?MeFormsNoticeId=${noticeId}`;
+      }
+    }
   } catch (_) { return []; }
 
   let pdfParseLib = null, mammothLib = null, admZipLib = null;
@@ -3110,105 +3122,173 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
       console.log(`    🇸🇪 tendsign: nav warn: ${(e.message || '').slice(0, 80)}`);
     }
     try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
-    await new Promise((r) => setTimeout(r, 1500));
+    await new Promise((r) => setTimeout(r, 1200));
 
-    // Diagnostic: gather all anchors so we can refine heuristics if
-    // they miss. TendSign has multiple page templates per buyer tenant
-    // (UnikID URLs vs Mercell-redirected variants), and the first run
-    // on a new buyer will reveal the actual download URL pattern.
+    // STEP 1 — find the Documents tab anchor on the Advertisement
+    // (p_meformsnotice.aspx) page. User-confirmed DOM 2026-05-13:
+    //   <a class="topmenulinkhighlight"
+    //      href="p_documents.aspx?UniqueId=&MeFormsNoticeId=91596&DocumentID=&BuyerProjectID=<opaque>">
+    //     Document
+    //   </a>
+    // BuyerProjectID is an opaque session token we can't construct —
+    // must scrape it from the rendered page.
+    if (/\/p_meformsnotice\.aspx/i.test(new URL(page.url()).pathname)) {
+      const docsTabUrl = await page.evaluate(() => {
+        const anchors = Array.from(document.querySelectorAll('a[href]'));
+        for (const a of anchors) {
+          const href = a.getAttribute('href') || '';
+          if (!/p_documents\.aspx/i.test(href)) continue;
+          if (!/BuyerProjectID=/i.test(href)) continue;
+          try { return new URL(href, location.href).toString(); }
+          catch (_) {}
+        }
+        return null;
+      }).catch(() => null);
+
+      if (docsTabUrl) {
+        console.log(`    🇸🇪 tendsign: Documents tab → ${docsTabUrl.slice(0, 110)}`);
+        try {
+          await page.goto(docsTabUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+          await new Promise((r) => setTimeout(r, 1200));
+        } catch (e) {
+          console.log(`    ⚠️  tendsign: Documents tab nav failed: ${(e.message || '').slice(0, 80)}`);
+        }
+      } else {
+        console.log(`    ⚠️  tendsign: no Documents tab anchor on p_meformsnotice.aspx — staying on Advertisement view`);
+      }
+    }
+
+    // STEP 2 — scan for download URLs. Per user-confirmed DOM
+    // 2026-05-13, each document is a <a href="javascript:void(0);"
+    // onclick="javascript:window.open('../tools/download.aspx?Filename=
+    //   X&ObjectType=1&ObjectID=<opaque>&PathType=1&Report=1', ...);">
+    // <text>Document name</text></a>. The href is meaningless —
+    // the real URL is inside the onclick string. Extract it with a
+    // regex, resolve relative to the current page (which is on
+    // /public/p_documents.aspx so ../tools/download.aspx →
+    // /tools/download.aspx).
     const probe = await page.evaluate(() => {
-      // Broad download-link heuristics:
-      // — file extension in URL (path or query)
-      // — TendSign-typical endpoint names
-      // — text matching procurement-doc vocabulary
-      const RX_DOC_EXT  = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:[?#]|$)/i;
-      const RX_DOC_PATH = /\/(?:DownloadAttachment|DownloadDocument|DownloadFile|GetFile|GetDocument|Attachment(?:s)?|Document(?:s)?|Bilag(?:a|or)|Files?)\b/i;
-      const RX_DOC_QS   = /[?&](?:attachmentId|documentId|docId|fileId|attId|id)=/i;
-      const RX_DOC_TXT  = /\b(?:F[öo]rfr[åa]gningsunderlag|Kvalificering(?:skrav)?|Anbudsformul[äa]r|Administrativa\s+f[öo]reskrifter|AUC\b|Bilaga|Bilagor|Tilbudsformularer|Krav\s+(?:p[åa]\s+leverant[öo]r|specifikationer)|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdokument)/i;
-      const RX_FILE_TXT = /\.(?:pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)\b/i;
-
+      const RX_WINDOW_OPEN = /window\.open\(\s*['"]([^'"]+)['"]/i;
+      const RX_DOC_PATH    = /\/(?:tools\/download|DownloadAttachment|DownloadDocument|DownloadFile|GetFile|GetDocument|Attachment(?:s)?|Document(?:s)?)\.aspx/i;
+      const RX_DOC_EXT     = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:[?&]|$)/i;
       const seen = new Set();
-      const out = [];
+      const docs = [];
       const sampleHrefs = [];
-      const anchors = Array.from(document.querySelectorAll('a[href]'));
+
+      // Scan ALL anchors. TendSign mixes onclick-based JS download
+      // anchors (the common case for downloadable files) with regular
+      // href links (rare here but covered for safety).
+      const anchors = Array.from(document.querySelectorAll('a'));
       for (const a of anchors) {
+        const onclick = a.getAttribute('onclick') || '';
         const hrefRaw = a.getAttribute('href') || '';
-        if (!hrefRaw || hrefRaw === '#' || hrefRaw.startsWith('#')) continue;
+        let candidate = null;
+
+        // Case A — onclick contains window.open('<url>', ...)
+        if (onclick) {
+          const m = RX_WINDOW_OPEN.exec(onclick);
+          if (m && m[1]) candidate = m[1];
+        }
+        // Case B — plain href to download.aspx or similar
+        if (!candidate && hrefRaw && hrefRaw !== '#' && !/^javascript:/i.test(hrefRaw)
+            && (RX_DOC_PATH.test(hrefRaw) || RX_DOC_EXT.test(hrefRaw))) {
+          candidate = hrefRaw;
+        }
+        if (!candidate) continue;
+
         let abs, absHost;
         try {
-          abs = new URL(hrefRaw, location.href).toString();
+          abs = new URL(candidate, location.href).toString();
           absHost = new URL(abs).hostname.toLowerCase();
         } catch (_) { continue; }
-        // Same-host only — block cross-domain marketing/help links and
-        // S3 references that would 403 (mirrors TenderNed handler).
         if (!/(^|\.)tendsign\.com$/i.test(absHost)) continue;
         if (seen.has(abs)) continue;
         seen.add(abs);
-        const path = (new URL(abs)).pathname;
-        const search = (new URL(abs)).search;
+
         const text = ((a.innerText || a.textContent || '') + ' ' + (a.getAttribute('title') || ''))
           .trim().replace(/\s+/g, ' ').slice(0, 200);
-        const isDocByPath = RX_DOC_EXT.test(path) || RX_DOC_EXT.test(search)
-                          || RX_DOC_PATH.test(path) || RX_DOC_QS.test(search);
-        const isDocByText = RX_DOC_TXT.test(text) || RX_FILE_TXT.test(text);
-        if (isDocByPath || isDocByText) {
-          out.push({ url: abs, name: text || abs.slice(-80), reason: isDocByPath ? 'path' : 'text' });
+        // Filter: must look like a doc download — either path is a
+        // known download endpoint or URL has a file extension query.
+        const url = new URL(abs);
+        const isDownload = RX_DOC_PATH.test(url.pathname)
+          || RX_DOC_EXT.test(url.pathname)
+          || RX_DOC_EXT.test(url.search);
+        if (!isDownload) continue;
+
+        // Filename hint — TendSign passes the original filename in the
+        // ?Filename= query. Use it for both display and scoring.
+        const filenameParam = url.searchParams.get('Filename')
+                            || url.searchParams.get('filename')
+                            || '';
+        const filename = filenameParam ? decodeURIComponent(filenameParam.replace(/\+/g, ' ')) : '';
+        docs.push({
+          url: abs,
+          name: text || filename || abs.slice(-80),
+          filename,
+          source: onclick ? 'onclick' : 'href',
+        });
+        if (sampleHrefs.length < 12) {
+          sampleHrefs.push({ url: abs.slice(0, 140), text: text.slice(0, 80), filename });
         }
-        if (sampleHrefs.length < 15) {
-          sampleHrefs.push({ url: abs.slice(0, 140), text: text.slice(0, 80) });
-        }
-        if (out.length >= 60) break;
+        if (docs.length >= 60) break;
       }
-      // Also capture button texts so we can see if downloads hide behind
-      // JS-only buttons (which we'd need to click instead of GET).
-      const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"]'))
-        .map((b) => ((b.innerText || b.value || '') + '').trim().replace(/\s+/g, ' ').slice(0, 50))
-        .filter((t) => t.length > 0 && t.length <= 50)
-        .slice(0, 10);
-      return { docs: out, totalAnchors: anchors.length, sampleHrefs, buttons };
-    }).catch(() => ({ docs: [], totalAnchors: 0, sampleHrefs: [], buttons: [] }));
+      return { docs, totalAnchors: anchors.length, sampleHrefs };
+    }).catch(() => ({ docs: [], totalAnchors: 0, sampleHrefs: [] }));
 
     console.log(
-      `    🇸🇪 tendsign: ${probe.totalAnchors} anchor(s), ${probe.docs.length} doc candidate(s), ` +
-      `${probe.buttons.length} button(s)`
+      `    🇸🇪 tendsign: page=${(new URL(page.url())).pathname.slice(-32)}, ${probe.totalAnchors} anchor(s), ` +
+      `${probe.docs.length} doc candidate(s)`
     );
-    if (probe.buttons.length) {
-      console.log(`    🇸🇪 tendsign: buttons: ${probe.buttons.map((b) => `"${b}"`).join(', ')}`);
-    }
     if (!probe.docs.length) {
       console.log(
-        `    🇸🇪 tendsign: no document anchors matched — sample hrefs: ` +
-        JSON.stringify(probe.sampleHrefs.slice(0, 8))
+        `    🇸🇪 tendsign: no download anchors matched — sample hrefs: ` +
+        JSON.stringify(probe.sampleHrefs.slice(0, 6))
       );
       return [];
     }
 
     // Score by Swedish/Norwegian qualification-doc vocabulary. Highest:
-    // Kvalificeringskrav (qualification requirements) — the document
-    // class that the user explicitly cares about for this scraper.
+    // Kvalificeringskrav / Krav på anbudsgivaren / Skakrav (must-haves)
+    // — the document classes the user explicitly cares about. Vocab
+    // refined per user-confirmed DOM 2026-05-13 (Administrativa krav,
+    // Generella krav, Krav på anbudsgivaren are recurring section
+    // names on TendSign-hosted Swedish tenders).
     const SCORE_RULES = [
-      { rx: /Kvalificering(?:skrav)?|Krav\s+p[åa]\s+leverant[öo]r|Lev(?:erant[öo]r)?krav|qualification\s*criteria/i, score: 30 },
-      { rx: /F[öo]rfr[åa]gningsunderlag|FFU|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdokument|RFT|RFP|tender\s*document/i, score: 18 },
+      { rx: /Kvalificering(?:skrav)?|Krav\s+p[åa]\s+(?:anbudsgivare|leverant[öo]r|leverand[øo]r)|Lev(?:erant[öo]r)?krav|Skakrav|qualification\s*criteria|tender(?:er)?\s+requirements/i, score: 30 },
+      { rx: /Administrativa\s+krav|Generella\s+krav|Krav\s+p[åa]\s+(?:tj[äa]nsten|varan|leveransen)|Uteslutningsgrund/i, score: 25 },
+      { rx: /F[öo]rfr[åa]gningsunderlag|FFU|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdokument|RFT|RFP|tender\s*document|Upphandlingsf[öo]reskrifter/i, score: 18 },
       { rx: /AUC\b|Administrativa\s+f[öo]reskrifter|administrative\s*provisions/i, score: 12 },
-      { rx: /Anbudsformul[äa]r|Tilbudsformular|tender\s*form|bid\s*form|Egenf[öo]rs[äa]kran|ESPD|UEA|Uniform\s*European/i, score: 10 },
-      { rx: /Bilaga|Bilagor|Attachment|Vedlegg|appendix/i, score: 5 },
+      { rx: /Anbudsformul[äa]r|Tilbudsformular|tender\s*form|bid\s*form|Egenf[öo]rs[äa]kran|ESPD|UEA|Uniform\s*European|Anbudsinbjudan/i, score: 10 },
+      { rx: /Utv[äa]rderingskriterier|Grund\s+f[öo]r\s+tilldelning|tilldelningskriterier|award\s*criteria|evaluation\s*criteria/i, score: 8 },
+      { rx: /Bilaga|Bilagor|Attachment|Vedlegg|appendix|H[åa]llbarhet|Sanningsf[öo]rs[äa]kran/i, score: 5 },
     ];
     for (const d of probe.docs) {
       d.score = 0;
+      // Score against the human-readable anchor text, the URL, AND
+      // the decoded filename (often the most specific signal — e.g.
+      // "2.Administrativa+krav-1.pdf" → "Administrativa krav").
+      const targets = [d.name || '', d.url || '', d.filename || ''];
       for (const r of SCORE_RULES) {
-        if (r.rx.test(d.name) || r.rx.test(d.url)) { d.score = Math.max(d.score, r.score); }
+        for (const t of targets) {
+          if (r.rx.test(t)) { d.score = Math.max(d.score, r.score); break; }
+        }
       }
     }
     probe.docs.sort((a, b) => b.score - a.score);
     const topDocs = probe.docs.slice(0, 6);
     console.log(
       `    🇸🇪 tendsign: priority docs: ` +
-      topDocs.map((d) => `${d.name.slice(0, 40)}[s=${d.score}]`).join(' | ')
+      topDocs.map((d) => `${(d.filename || d.name).slice(0, 40)}[s=${d.score}]`).join(' | ')
     );
 
     const texts = [];
     for (const doc of topDocs) {
-      const labelName = doc.name.slice(0, 100);
+      // Prefer filename (e.g. "2.Administrativa krav-1.pdf") over the
+      // anchor text (e.g. "Administrative requirements") — filename
+      // disambiguates Bilaga 1 vs Bilaga 2 and matches what a human
+      // reviewer would see when downloading.
+      const labelName = (doc.filename || doc.name).slice(0, 100);
       // Fetch via page.evaluate so the auth cookie travels with the
       // request. credentials:'include' is required for same-origin
       // session cookies set with SameSite=Lax.
@@ -3238,11 +3318,18 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
       }
       const buf = Buffer.from(result.data);
       const ctL = (result.ct || '').toLowerCase();
-      const isPdf = buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
+      // Filename hint check — TendSign's download.aspx wraps every
+      // file with the same path so we can't rely on URL path extension;
+      // the original filename comes through doc.filename (decoded from
+      // ?Filename= query). Combine ext detection across path + query +
+      // filename hint + content-type.
+      const filenameHint = (doc.filename || '').toLowerCase();
+      const isPdf = (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46);
       const isDocx = ctL.includes('officedocument.wordprocessingml')
+        || /\.docx?$/i.test(filenameHint)
         || (buf[0] === 0x50 && buf[1] === 0x4b && /\.docx(?:[?#]|$)/i.test(doc.url));
       const isZip = !isDocx && buf[0] === 0x50 && buf[1] === 0x4b
-        && (ctL.includes('zip') || /\.zip(?:[?#]|$)/i.test(doc.url));
+        && (ctL.includes('zip') || /\.zip(?:[?#]|$)/i.test(doc.url) || /\.zip$/i.test(filenameHint));
       try {
         let text = '';
         if (isPdf && pdfParseLib) {
@@ -3330,6 +3417,28 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       };
     }
   } catch (_) { /* invalid URL → tęsiame, fetchas pats pašalins klaidą */ }
+
+  // tendsign.com URL rewrite — doc.aspx?MeFormsNoticeId=X is the
+  // login-walled buyer-restricted view; our login succeeds but the
+  // page stays gated (sample run 2026-05-13: bodyLen=487 post-login,
+  // gated=true). The user-confirmed anonymous public view is at
+  // /public/p_meformsnotice.aspx?MeFormsNoticeId=<same-id> (visible
+  // in the doc.aspx page as the link "Klicka här för att se annonsen
+  // anonymt"). The anonymous view exposes the announcement summary
+  // and any non-restricted document links without requiring auth, so
+  // we get further content out of TendSign tenders by bypassing the
+  // login wall entirely.
+  try {
+    const u = new URL(sourceUrl);
+    if (/(^|\.)tendsign\.com$/i.test(u.hostname) && /\/doc\.aspx/i.test(u.pathname)) {
+      const noticeId = u.searchParams.get('MeFormsNoticeId') || u.searchParams.get('UnikID');
+      if (noticeId && /^\d+$/.test(noticeId)) {
+        const publicUrl = `https://tendsign.com/public/p_meformsnotice.aspx?MeFormsNoticeId=${noticeId}`;
+        console.log(`    🇸🇪 tendsign: rewriting login-gated doc.aspx → public anonymous view (${publicUrl.slice(0, 80)})`);
+        sourceUrl = publicUrl;
+      }
+    }
+  } catch (_) {}
 
   let srcPage = null;
   try {
