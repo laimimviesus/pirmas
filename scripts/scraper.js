@@ -5430,11 +5430,27 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
         ...iframeDocs.filter((d) => !seen.has(d.url)),
       ];
       merged.sort((a, b) => a.rank - b.rank);
+      // 2026-05-15 diagnostic: when zero matches found, sample anchors
+      // so we can see WHAT IS on the page and iterate URL_RE/ROW_TYPE_RE.
+      let anchorSample = [];
+      if (!merged.length) {
+        const allAnchors = Array.from(document.querySelectorAll('a[href]'));
+        anchorSample = allAnchors.slice(0, 30)
+          .map((a) => {
+            const href = (a.getAttribute('href') || '').slice(0, 70);
+            const text = ((a.textContent || a.getAttribute('title') || '').trim() || '').slice(0, 50);
+            const rowText = (a.closest('tr')?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+            return { href, text, rowText };
+          })
+          .filter((a) => a.href && !/^javascript:|^#/.test(a.href));
+      }
       return {
         docs: merged,
         totalIframes: iframes.length,
         mainCount: mainDocs.length,
         iframeCount: iframeDocs.length,
+        anchorSample,
+        totalAnchors: document.querySelectorAll('a[href]').length,
       };
     }).catch(() => ({ docs: [], totalIframes: 0, mainCount: 0, iframeCount: 0 }));
 
@@ -5443,6 +5459,15 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
       `(main=${probe.mainCount}, iframes=${probe.iframeCount}/${probe.totalIframes})`
     );
     if (!probe.docs.length) {
+      // Log diagnostic so we can identify new anchor patterns to add to
+      // URL_RE / ROW_TYPE_RE. Real-world value: 2026-05-15 ES run had
+      // "Servicio de análisis..." tender that returned 0 docs despite
+      // being a normal PLACSP tender — the body presumably uses a
+      // different anchor structure (or PCAP is behind a tab/click).
+      console.log(
+        `    ⚠️  PLACSP: zero doc anchors matched out of ${probe.totalAnchors || 0} total. ` +
+        `Sample: ${JSON.stringify((probe.anchorSample || []).slice(0, 10))}`
+      );
       return [];
     }
     // Log priority list — first 6.
@@ -5583,6 +5608,28 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       sourceUrl = fixed;
     }
   }
+
+  // marchespublics.gouv.fr typo fix — Mercell occasionally returns the
+  // domain WITHOUT the hyphen (`www.marchespublics.gouv.fr`), but the
+  // real hostname is `www.marches-publics.gouv.fr` (with hyphen). The
+  // no-hyphen variant doesn't resolve → net::ERR_NAME_NOT_RESOLVED.
+  // Real-world impact (FR run 2026-05-15): tender 607617143
+  // (Prestations de Tierce Maintenance Applicative des Logiciels)
+  // failed with the DNS error and we lost the source. Rewrite the
+  // typo'd domain upfront. We use a strict literal match so we don't
+  // accidentally hyphenate other domains.
+  try {
+    const u = new URL(sourceUrl);
+    if (u.hostname === 'www.marchespublics.gouv.fr' || u.hostname === 'marchespublics.gouv.fr') {
+      u.hostname = 'www.marches-publics.gouv.fr';
+      // Also force HTTPS — Mercell's typo'd URL was http:// which is
+      // a 301→https on the real domain anyway.
+      u.protocol = 'https:';
+      const fixed = u.toString();
+      console.log(`    ↪️  marchespublics: rewriting Mercell typo → ${fixed.slice(0, 80)}`);
+      sourceUrl = fixed;
+    }
+  } catch (_) {}
 
   // Mercell-internų permalink'ų atpažinimas — jei "Go to source" veda į
   // patį Mercell (permalink.mercell.com ar mercell.com/*), šaltinio
