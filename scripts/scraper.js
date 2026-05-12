@@ -4038,6 +4038,13 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
                     })).catch(() => null);
                     if (afterLogin && !afterLogin.hasPass) {
                       console.log(`    ✅ tendsign: inline login OK — on ${(afterLogin.url || '').slice(-60)}, bodyLen=${afterLogin.bodyLen}`);
+                      // 2026-05-15 fix v2: when bodyLen is suspiciously
+                      // small (e.g. 0) RIGHT after login, page might not
+                      // have rendered yet — give it 3 more seconds.
+                      if (afterLogin.bodyLen < 500) {
+                        console.log(`    🇸🇪 tendsign: bodyLen=${afterLogin.bodyLen} suspicious — waiting extra 3s for render`);
+                        await new Promise((r) => setTimeout(r, 3000));
+                      }
                       // Now scan for Flow A/B anchor on this buyer view.
                       resolvedDocsTabUrl = await page.evaluate(() => {
                         const anchors = Array.from(document.querySelectorAll('a[href]'));
@@ -4053,10 +4060,78 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
                       if (resolvedDocsTabUrl) {
                         console.log(`    🇸🇪 tendsign: inline-login → Flow A/B URL with BuyerProjectID resolved`);
                       } else {
-                        console.log(`    ⚠️  tendsign: inline login OK but no Flow A/B anchor in DOM`);
+                        // 2026-05-15 fix v2: when inline login lands on
+                        // /supplier/start.aspx (dashboard, not tender),
+                        // navigate explicitly to the supplier-side
+                        // tender URL — Tendsign serves a supplier view
+                        // of each tender at /supplier/s_meformsnotice.aspx
+                        // which includes the Documents tab anchor.
+                        const onSupplierStart = /\/supplier\/start\.aspx/i.test(afterLogin.url || '');
+                        if (onSupplierStart && noticeIdProbe) {
+                          const supplierTenderUrl = `https://tendsign.com/supplier/s_meformsnotice.aspx?MeFormsNoticeId=${noticeIdProbe}`;
+                          console.log(`    🇸🇪 tendsign: landed on /supplier/start.aspx — navigating to specific tender URL ${supplierTenderUrl}`);
+                          try {
+                            await page.goto(supplierTenderUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+                            try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
+                            await new Promise((r) => setTimeout(r, 1500));
+                            const supplierState = await page.evaluate(() => ({
+                              url: location.href,
+                              hasPass: !!document.querySelector('input[type="password"]:not([disabled]):not([aria-hidden="true"])'),
+                              bodyLen: (document.body?.innerText || '').length,
+                            })).catch(() => null);
+                            console.log(`    🇸🇪 tendsign: supplier-tender page state: url=${(supplierState?.url || '').slice(-60)}, bodyLen=${supplierState?.bodyLen || 0}, hasPass=${supplierState?.hasPass || false}`);
+                            // Re-scan for Flow A/B anchor on supplier view.
+                            resolvedDocsTabUrl = await page.evaluate(() => {
+                              const anchors = Array.from(document.querySelectorAll('a[href]'));
+                              for (const a of anchors) {
+                                const href = a.getAttribute('href') || '';
+                                if (!/(?:p_documents|s_view_advertfiles)\.aspx/i.test(href)) continue;
+                                if (!/BuyerProjectID=/i.test(href)) continue;
+                                try { return new URL(href, location.href).toString(); }
+                                catch (_) {}
+                              }
+                              return null;
+                            }).catch(() => null);
+                            if (resolvedDocsTabUrl) {
+                              console.log(`    ✅ tendsign: supplier-tender nav → Flow A/B URL resolved`);
+                            } else {
+                              console.log(`    ⚠️  tendsign: supplier-tender page has no Flow A/B anchor — likely buyer hasn't approved our account for this tender`);
+                            }
+                          } catch (e) {
+                            console.log(`    ⚠️  tendsign: supplier-tender nav failed: ${(e.message || '').slice(0, 80)}`);
+                          }
+                        } else {
+                          console.log(`    ⚠️  tendsign: inline login OK but no Flow A/B anchor in DOM`);
+                        }
                       }
                     } else {
-                      console.log(`    ⚠️  tendsign: inline login didn't clear password field (creds wrong? URL=${(afterLogin?.url || '').slice(-60)})`);
+                      // 2026-05-15 diagnostic: capture error messages /
+                      // validation hints on the login page so we know
+                      // WHY submit didn't clear password. Look for
+                      // common Swedish/English login-fail signals
+                      // (Invalid / Felaktig / Captcha / Account locked).
+                      const failDiag = await page.evaluate(() => {
+                        const body = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+                        // Heuristic — extract error-looking sentences.
+                        const RX_ERR = /(invalid|incorrect|fel(aktig)?|wrong|locked|sp[äa]rrad|too\s*many|captcha|verifie?r|verify|s[äa]kerhets|tunnu(spa|spalv|sluo)|kontot)/i;
+                        const sentences = body.split(/[.!?]\s+/).filter((s) => RX_ERR.test(s)).slice(0, 5);
+                        return {
+                          url: location.href,
+                          bodyLen: body.length,
+                          bodyHead: body.slice(0, 300),
+                          errorHints: sentences,
+                          // Look for elements with error-style class names.
+                          errorElements: Array.from(document.querySelectorAll('[class*="error" i], [class*="alert" i], [class*="invalid" i], [class*="warning" i], .text-danger, .has-error, [role="alert"]'))
+                            .slice(0, 5)
+                            .map((el) => (el.innerText || '').trim().slice(0, 120))
+                            .filter((t) => t.length > 0),
+                        };
+                      }).catch(() => null);
+                      console.log(`    ⚠️  tendsign: inline login didn't clear password field — url=${(afterLogin?.url || '').slice(-60)}`);
+                      if (failDiag) {
+                        console.log(`    🔍 tendsign post-fail diag: bodyLen=${failDiag.bodyLen}, errorHints=${JSON.stringify(failDiag.errorHints)}, errorElements=${JSON.stringify(failDiag.errorElements)}`);
+                        if (failDiag.bodyHead) console.log(`    🔍 tendsign post-fail body head: "${failDiag.bodyHead.slice(0, 250)}"`);
+                      }
                     }
                   } else {
                     console.log(`    ⚠️  tendsign: inline login submit failed (no button matched)`);
