@@ -2890,6 +2890,253 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
   }
 }
 
+// =====================================================================
+// fetchTendSignDocuments
+// ---------------------------------------------------------------------
+// TendSign (Visma Commerce) is a Swedish/Norwegian e-procurement
+// platform used by many public buyers. Tender URLs are typically
+// tendsign.com/Notice.aspx?UnikID=... — the announcement page itself
+// is mostly metadata; the actual procurement-document attachments
+// (Förfrågningsunderlag, Kvalificeringskrav, Bilagor) sit on the same
+// domain under DownloadAttachment.aspx / DownloadDocument.aspx /
+// GetFile.aspx routes that require a logged-in session. The portal is
+// already in ALWAYS_LOGIN_HOSTS so by the time this handler runs the
+// session cookie should be valid.
+//
+// Strategy (mirrors TenderNed handler):
+//   1. Stealth + 1280×900 viewport (TendSign uses Vue/jQuery — not as
+//      aggressive about headless detection as TenderNed's Angular but
+//      doesn't hurt).
+//   2. Navigate to source URL, settle DOM.
+//   3. Diagnostic anchor probe so we can iterate if the heuristic
+//      misses a tenant variant (TendSign has multiple skins).
+//   4. Scan anchors for download patterns + score by Swedish/Norwegian
+//      qualification vocabulary.
+//   5. Top 6 docs fetched via in-page fetch() (carries auth cookie).
+// =====================================================================
+async function fetchTendSignDocuments(browser, sourceUrl) {
+  try {
+    const u = new URL(sourceUrl);
+    if (!/(^|\.)tendsign\.com$/i.test(u.hostname)) return [];
+  } catch (_) { return []; }
+
+  let pdfParseLib = null, mammothLib = null, admZipLib = null;
+  try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(30000);
+    page.setDefaultTimeout(30000);
+    try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
+
+    // Light stealth — TendSign mostly doesn't fingerprint, but some
+    // Visma microservices reject the default HeadlessChrome UA.
+    try {
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['sv-SE', 'sv', 'en-US', 'en'],
+        });
+      });
+      const ua = await page.browser().userAgent();
+      await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+    } catch (_) {}
+
+    try {
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (e) {
+      console.log(`    🇸🇪 tendsign: nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // Diagnostic: gather all anchors so we can refine heuristics if
+    // they miss. TendSign has multiple page templates per buyer tenant
+    // (UnikID URLs vs Mercell-redirected variants), and the first run
+    // on a new buyer will reveal the actual download URL pattern.
+    const probe = await page.evaluate(() => {
+      // Broad download-link heuristics:
+      // — file extension in URL (path or query)
+      // — TendSign-typical endpoint names
+      // — text matching procurement-doc vocabulary
+      const RX_DOC_EXT  = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:[?#]|$)/i;
+      const RX_DOC_PATH = /\/(?:DownloadAttachment|DownloadDocument|DownloadFile|GetFile|GetDocument|Attachment(?:s)?|Document(?:s)?|Bilag(?:a|or)|Files?)\b/i;
+      const RX_DOC_QS   = /[?&](?:attachmentId|documentId|docId|fileId|attId|id)=/i;
+      const RX_DOC_TXT  = /\b(?:F[öo]rfr[åa]gningsunderlag|Kvalificering(?:skrav)?|Anbudsformul[äa]r|Administrativa\s+f[öo]reskrifter|AUC\b|Bilaga|Bilagor|Tilbudsformularer|Krav\s+(?:p[åa]\s+leverant[öo]r|specifikationer)|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdokument)/i;
+      const RX_FILE_TXT = /\.(?:pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)\b/i;
+
+      const seen = new Set();
+      const out = [];
+      const sampleHrefs = [];
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      for (const a of anchors) {
+        const hrefRaw = a.getAttribute('href') || '';
+        if (!hrefRaw || hrefRaw === '#' || hrefRaw.startsWith('#')) continue;
+        let abs, absHost;
+        try {
+          abs = new URL(hrefRaw, location.href).toString();
+          absHost = new URL(abs).hostname.toLowerCase();
+        } catch (_) { continue; }
+        // Same-host only — block cross-domain marketing/help links and
+        // S3 references that would 403 (mirrors TenderNed handler).
+        if (!/(^|\.)tendsign\.com$/i.test(absHost)) continue;
+        if (seen.has(abs)) continue;
+        seen.add(abs);
+        const path = (new URL(abs)).pathname;
+        const search = (new URL(abs)).search;
+        const text = ((a.innerText || a.textContent || '') + ' ' + (a.getAttribute('title') || ''))
+          .trim().replace(/\s+/g, ' ').slice(0, 200);
+        const isDocByPath = RX_DOC_EXT.test(path) || RX_DOC_EXT.test(search)
+                          || RX_DOC_PATH.test(path) || RX_DOC_QS.test(search);
+        const isDocByText = RX_DOC_TXT.test(text) || RX_FILE_TXT.test(text);
+        if (isDocByPath || isDocByText) {
+          out.push({ url: abs, name: text || abs.slice(-80), reason: isDocByPath ? 'path' : 'text' });
+        }
+        if (sampleHrefs.length < 15) {
+          sampleHrefs.push({ url: abs.slice(0, 140), text: text.slice(0, 80) });
+        }
+        if (out.length >= 60) break;
+      }
+      // Also capture button texts so we can see if downloads hide behind
+      // JS-only buttons (which we'd need to click instead of GET).
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"]'))
+        .map((b) => ((b.innerText || b.value || '') + '').trim().replace(/\s+/g, ' ').slice(0, 50))
+        .filter((t) => t.length > 0 && t.length <= 50)
+        .slice(0, 10);
+      return { docs: out, totalAnchors: anchors.length, sampleHrefs, buttons };
+    }).catch(() => ({ docs: [], totalAnchors: 0, sampleHrefs: [], buttons: [] }));
+
+    console.log(
+      `    🇸🇪 tendsign: ${probe.totalAnchors} anchor(s), ${probe.docs.length} doc candidate(s), ` +
+      `${probe.buttons.length} button(s)`
+    );
+    if (probe.buttons.length) {
+      console.log(`    🇸🇪 tendsign: buttons: ${probe.buttons.map((b) => `"${b}"`).join(', ')}`);
+    }
+    if (!probe.docs.length) {
+      console.log(
+        `    🇸🇪 tendsign: no document anchors matched — sample hrefs: ` +
+        JSON.stringify(probe.sampleHrefs.slice(0, 8))
+      );
+      return [];
+    }
+
+    // Score by Swedish/Norwegian qualification-doc vocabulary. Highest:
+    // Kvalificeringskrav (qualification requirements) — the document
+    // class that the user explicitly cares about for this scraper.
+    const SCORE_RULES = [
+      { rx: /Kvalificering(?:skrav)?|Krav\s+p[åa]\s+leverant[öo]r|Lev(?:erant[öo]r)?krav|qualification\s*criteria/i, score: 30 },
+      { rx: /F[öo]rfr[åa]gningsunderlag|FFU|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdokument|RFT|RFP|tender\s*document/i, score: 18 },
+      { rx: /AUC\b|Administrativa\s+f[öo]reskrifter|administrative\s*provisions/i, score: 12 },
+      { rx: /Anbudsformul[äa]r|Tilbudsformular|tender\s*form|bid\s*form|Egenf[öo]rs[äa]kran|ESPD|UEA|Uniform\s*European/i, score: 10 },
+      { rx: /Bilaga|Bilagor|Attachment|Vedlegg|appendix/i, score: 5 },
+    ];
+    for (const d of probe.docs) {
+      d.score = 0;
+      for (const r of SCORE_RULES) {
+        if (r.rx.test(d.name) || r.rx.test(d.url)) { d.score = Math.max(d.score, r.score); }
+      }
+    }
+    probe.docs.sort((a, b) => b.score - a.score);
+    const topDocs = probe.docs.slice(0, 6);
+    console.log(
+      `    🇸🇪 tendsign: priority docs: ` +
+      topDocs.map((d) => `${d.name.slice(0, 40)}[s=${d.score}]`).join(' | ')
+    );
+
+    const texts = [];
+    for (const doc of topDocs) {
+      const labelName = doc.name.slice(0, 100);
+      // Fetch via page.evaluate so the auth cookie travels with the
+      // request. credentials:'include' is required for same-origin
+      // session cookies set with SameSite=Lax.
+      const result = await page.evaluate(async (url) => {
+        try {
+          const resp = await fetch(url, { credentials: 'include', redirect: 'follow' });
+          if (!resp.ok) return { ok: false, status: resp.status };
+          const ct = resp.headers.get('content-type') || '';
+          const cd = resp.headers.get('content-disposition') || '';
+          const ab = await resp.arrayBuffer();
+          return {
+            ok: true,
+            status: resp.status,
+            ct, cd,
+            url: resp.url || url,
+            data: Array.from(new Uint8Array(ab)),
+          };
+        } catch (e) {
+          return { ok: false, error: String(e).slice(0, 200) };
+        }
+      }, doc.url).catch((e) => ({ ok: false, error: e.message }));
+
+      if (!result || !result.ok || !result.data || result.data.length < 500) {
+        const status = result?.status || result?.error || '?';
+        console.log(`    ⚠️  tendsign: download failed for "${labelName}" (status=${status})`);
+        continue;
+      }
+      const buf = Buffer.from(result.data);
+      const ctL = (result.ct || '').toLowerCase();
+      const isPdf = buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
+      const isDocx = ctL.includes('officedocument.wordprocessingml')
+        || (buf[0] === 0x50 && buf[1] === 0x4b && /\.docx(?:[?#]|$)/i.test(doc.url));
+      const isZip = !isDocx && buf[0] === 0x50 && buf[1] === 0x4b
+        && (ctL.includes('zip') || /\.zip(?:[?#]|$)/i.test(doc.url));
+      try {
+        let text = '';
+        if (isPdf && pdfParseLib) {
+          const parsed = await pdfParseLib(buf);
+          text = ((parsed && parsed.text) || '').trim();
+        } else if (isDocx && mammothLib) {
+          const out = await mammothLib.extractRawText({ buffer: buf });
+          text = ((out && out.value) || '').trim();
+        } else if (isZip && admZipLib) {
+          // ZIP fallback — Bilagor sometimes ship as a single archive.
+          // Parse first 4 PDF/DOCX entries, concatenate.
+          try {
+            const zip = new admZipLib(buf);
+            const entries = zip.getEntries()
+              .filter((e) => !e.isDirectory && /\.(pdf|docx?)$/i.test(e.entryName))
+              .slice(0, 4);
+            for (const e of entries) {
+              const d = e.getData();
+              const isInnerPdf = d[0] === 0x25 && d[1] === 0x50 && d[2] === 0x44 && d[3] === 0x46;
+              if (isInnerPdf && pdfParseLib) {
+                const p = await pdfParseLib(d);
+                if (p && p.text) text += `\n--- ${e.entryName.slice(-80)} ---\n${p.text.trim()}`;
+              } else if (/\.docx$/i.test(e.entryName) && mammothLib) {
+                const o = await mammothLib.extractRawText({ buffer: d });
+                if (o && o.value) text += `\n--- ${e.entryName.slice(-80)} ---\n${o.value.trim()}`;
+              }
+            }
+            text = text.trim();
+          } catch (_) {}
+        }
+        if (text.length > 200) {
+          const clipped = text.slice(0, 80000);
+          texts.push(`--- (tendsign) ${labelName} ---\n${clipped}`);
+          console.log(`    🇸🇪 tendsign: parsed "${labelName}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+        } else {
+          console.log(
+            `    ⚠️  tendsign: "${labelName}" extracted text too short ` +
+            `(${text.length}ch, isPdf=${isPdf}, isDocx=${isDocx}, isZip=${isZip}, ct=${ctL.slice(0, 40)})`
+          );
+        }
+      } catch (e) {
+        console.log(`    ⚠️  tendsign: parse failed for "${labelName}": ${(e.message || '').slice(0, 80)}`);
+      }
+    }
+    return texts;
+  } catch (e) {
+    console.log(`    ⚠️  tendsign handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
 async function fetchSourcePageDetails(browser, sourceUrl) {
   // URL scheme normalisation — Mercell sometimes returns sourceUrl
   // values like "www.conselleriadefacenda.es/silex" without an
@@ -4108,6 +4355,23 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     } catch (e) {
       console.log(`    ⚠️ tarjouspalvelu handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // tendsign.com Documents handler — Swedish/Norwegian Visma Commerce
+    // platform. Session-protected attachment downloads on the same
+    // domain. No-op for non-tendsign sources.
+    try {
+      const tendSignTexts = await fetchTendSignDocuments(browser, sourceUrl);
+      if (tendSignTexts && tendSignTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + tendSignTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇸🇪 tendsign: appended ${tendSignTexts.length} doc(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ tendsign handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     srcPage.off('request', blockHandler);
