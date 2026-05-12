@@ -1079,37 +1079,111 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
             // redirects to cloudia (where session is set) and back with
             // an auth token. Click that trigger now. User-confirmed
             // 2026-05-12 DOM: <button id="continue">Log in</button>.
-            const triggerSel = await page.evaluate(() => {
+            const triggerInfo = await page.evaluate(() => {
               const RX_TRIG = /^\s*(log\s*in|login|logga\s*in|kirjaudu(?:\s*sis[äa][äa]n)?|logg\s*inn|prisijungti|connexion|anmelden|iniciar\s*sesi[óo]n)\s*$/i;
-              for (const sel of [
+              const findVisible = (el) => el && el.offsetParent !== null && !el.hasAttribute('disabled');
+              // Diagnostic pass: report ALL "Log in"-ish candidates so we
+              // can see WHICH element actually got clicked.
+              const cands = [];
+              for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+                const t = (el.textContent || '').trim();
+                if (t.length === 0 || t.length > 40) continue;
+                if (!RX_TRIG.test(t)) continue;
+                cands.push({
+                  text: t.slice(0, 30),
+                  tag: el.tagName,
+                  id: el.id || '',
+                  cls: (el.className || '').toString().slice(0, 60),
+                  visible: !!findVisible(el),
+                  href: (el.getAttribute('href') || '').slice(0, 60),
+                });
+              }
+              // Click strategy: prefer button#continue (tender page's
+              // SSO trigger per user-confirmed DOM 2026-05-13), else
+              // button.button--positive, else first visible text match
+              // that is NOT the bare "Log in" cookie banner / footer
+              // link (filter out anchors going to /privacy, /terms, etc).
+              // Known stable selectors — click WITHOUT visibility check.
+              // User-confirmed DOM 2026-05-13 on tarjouspalvelu.fi tender
+              // pages: <button id="continue" class="button--positive
+              // hidden-content hidden-content--show">Log in</button>.
+              // The `hidden-content` base class CSS-hides the element by
+              // default; the `--show` modifier overrides at runtime. Our
+              // offsetParent check sees the BASE state and rejects the
+              // button. Skip the visibility check when matching by id
+              // since we know this is the intended SSO trigger.
+              const trySelectors = [
                 'button#continue:not([disabled])',
                 'button[id="continue"]:not([disabled])',
                 'button.button--positive:not([disabled])',
-              ]) {
+              ];
+              for (const sel of trySelectors) {
                 try {
                   const el = document.querySelector(sel);
-                  if (el && el.offsetParent !== null) {
+                  if (el && !el.hasAttribute('disabled')) {
+                    // Try to make it visible first (Vaadin sometimes
+                    // toggles via JS post-hydration).
+                    try { el.scrollIntoView({ block: 'center' }); el.focus(); } catch (_) {}
                     el.click();
-                    return sel;
+                    return { clicked: sel, candidates: cands };
                   }
                 } catch (_) {}
               }
-              const all = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-              for (const el of all) {
-                if (!el || el.offsetParent === null || el.hasAttribute('disabled')) continue;
+              // Text fallback — exclude anchors to non-auth pages.
+              const RX_SKIP_HREF = /\/(?:privacy|terms|help|support|cookies?|policy|gdpr)\b/i;
+              for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+                if (!findVisible(el)) continue;
                 const t = (el.textContent || '').trim();
-                if (t.length > 30) continue;
-                if (RX_TRIG.test(t)) {
-                  try { el.click(); return `text:${t.slice(0, 20)}`; } catch (_) {}
-                }
+                if (t.length === 0 || t.length > 30) continue;
+                if (!RX_TRIG.test(t)) continue;
+                const href = el.getAttribute('href') || '';
+                if (RX_SKIP_HREF.test(href)) continue;
+                try {
+                  el.click();
+                  return {
+                    clicked: `text:${t.slice(0, 20)} (tag=${el.tagName}, id=${el.id || 'none'}, href=${href.slice(0, 40)})`,
+                    candidates: cands,
+                  };
+                } catch (_) {}
               }
-              return null;
-            }).catch(() => null);
-            if (triggerSel) {
-              console.log(`    ↪️  SSO trigger clicked (${triggerSel}) — waiting for redirect chain`);
+              return { clicked: null, candidates: cands };
+            }).catch(() => ({ clicked: null, candidates: [] }));
+
+            // Log all candidates so we can debug element selection.
+            if (triggerInfo.candidates && triggerInfo.candidates.length > 1) {
+              console.log(
+                `    ↪️  SSO trigger candidates (${triggerInfo.candidates.length}): ` +
+                triggerInfo.candidates.slice(0, 5).map((c) =>
+                  `[${c.tag}#${c.id || '_'}.${(c.cls.split(/\s+/)[0] || '_').slice(0, 20)} "${c.text}"${c.visible ? '' : ' HIDDEN'}]`
+                ).join(' ')
+              );
+            }
+            if (triggerInfo.clicked) {
+              console.log(`    ↪️  SSO trigger clicked (${triggerInfo.clicked}) — waiting for redirect chain`);
               try { await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 12000 }); } catch (_) {}
               try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 6000 }); } catch (_) {}
               await new Promise((r) => setTimeout(r, 1500));
+              // Post-click verification: did the page transition to an
+              // authed state? bodyLen jump from ~1k to >5k is a strong
+              // signal SSO completed. Log password-field presence too.
+              try {
+                const postState = await page.evaluate(() => {
+                  const RX_LOGGED = /\b(?:log\s*out|kirjaudu\s*ulos|logga\s*ut|sign\s*out|d[eé]connexion|abmelden|cerrar\s*sesi[oó]n)\b/i;
+                  const body = (document.body && document.body.innerText || '');
+                  return {
+                    url: location.href.slice(0, 120),
+                    bodyLen: body.length,
+                    hasLoggedMarker: RX_LOGGED.test(body),
+                    hasPasswordField: !!document.querySelector('input[type="password"]:not([disabled]):not([aria-hidden="true"])'),
+                  };
+                }).catch(() => null);
+                if (postState) {
+                  console.log(
+                    `    ↪️  post-SSO state: url=${postState.url.slice(-60)}, bodyLen=${postState.bodyLen}, ` +
+                    `loggedMarker=${postState.hasLoggedMarker}, passwordField=${postState.hasPasswordField}`
+                  );
+                }
+              } catch (_) {}
             } else {
               console.log(`    ↪️  no SSO trigger found on bounce-back page (already passed-through or auto-redirected)`);
             }
@@ -2246,6 +2320,29 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
       await page.setUserAgent(realUa);
     } catch (_) {}
 
+    // v10 API interception. The Download-all button click goes nowhere
+    // (Material wrapper without a working handler from our perspective),
+    // BUT when the Documenten tab activates, Angular's HttpClient fires
+    // a REST call to /papi/tenderned-rs-tns/v2/... that returns the
+    // documenten list as JSON. Capture those responses so we can extract
+    // per-file URLs / IDs without touching the click handler.
+    const capturedJsonResponses = [];
+    const papiResponseHandler = async (resp) => {
+      try {
+        const url = resp.url();
+        if (!/tenderned\.nl/i.test(url)) return;
+        // Match likely documenten/aanbesteding endpoints.
+        if (!/\/(?:papi|api)\b.*\/(?:aanbestedingen?|aankondiging|documenten?|documents?|files|stuk|attachments?)\b/i.test(url)) return;
+        const ct = (resp.headers()['content-type'] || '').toLowerCase();
+        if (!ct.includes('json') && !ct.includes('javascript')) return;
+        if (resp.status() >= 400) return;
+        const body = await resp.text().catch(() => null);
+        if (!body || body.length < 50) return;
+        capturedJsonResponses.push({ url, ct, body: body.slice(0, 200000) });
+      } catch (_) {}
+    };
+    page.on('response', papiResponseHandler);
+
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e) {
@@ -2431,6 +2528,97 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     // verbatim from the user's DOM: <span class="text-nowrap">
     // Download alle documenten </span>.
     const texts = [];
+
+    // v11 — direct bulk ZIP fetch via the actual TenderNed REST URL.
+    // User-confirmed 2026-05-14 (chrome://downloads/ source URL):
+    //   https://www.tenderned.nl/papi/tenderned-rs-tns/v2/publicaties/
+    //       {noticeId}/documenten/zip                            ← bulk
+    //   https://www.tenderned.nl/papi/tenderned-rs-tns/v2/publicaties/
+    //       {noticeId}/documenten/{docId}/content                ← per-file
+    // Files are publicly accessible — no auth required. This bypasses
+    // ALL click-based logic (the Download-all click never fires any
+    // network request from headless Chromium, see v8/v9 failures).
+    if (admZipLib) {
+      const bulkUrl = `https://www.tenderned.nl/papi/tenderned-rs-tns/v2/publicaties/${noticeId}/documenten/zip`;
+      console.log(`    🇳🇱 tenderned: v11 direct bulk-ZIP fetch → ${bulkUrl.slice(-70)}`);
+      try {
+        const r = await page.evaluate(async (url) => {
+          try {
+            const resp = await fetch(url, { credentials: 'include', redirect: 'follow' });
+            if (!resp.ok) return { ok: false, status: resp.status };
+            const ct = resp.headers.get('content-type') || '';
+            const ab = await resp.arrayBuffer();
+            return { ok: true, status: resp.status, ct, url: resp.url || url, data: Array.from(new Uint8Array(ab)) };
+          } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
+        }, bulkUrl).catch(() => null);
+        if (r && r.ok && r.data && r.data.length > 1024) {
+          const buf = Buffer.from(r.data);
+          if (buf[0] === 0x50 && buf[1] === 0x4b) {
+            console.log(`    🇳🇱 tenderned: v11 bulk ZIP OK (${buf.length}B, ct=${r.ct})`);
+            try {
+              const zip = new admZipLib(buf);
+              const entries = zip.getEntries();
+              const SCORE_RULES = [
+                { rx: /selectie\s*leidraad|selectiecriteri|selectie[-\s]?eisen|selection\s*criteria/i, score: 25 },
+                { rx: /aanbestedings?\s*leidraad|procurement\s*guide|request\s*for\s*quotation/i, score: 18 },
+                { rx: /programma\s*van\s*eisen|statement\s*of\s*requirements/i, score: 12 },
+                { rx: /uea|espd|uniform\s*europees|uniform\s*european\s*procurement/i, score: 8 },
+                { rx: /aankondiging|contract\s*notice|EF\d+/i, score: 5 },
+              ];
+              const scoreOf = (n) => {
+                let s = 0;
+                for (const r of SCORE_RULES) if (r.rx.test(n)) s = Math.max(s, r.score);
+                return s;
+              };
+              const docEntries = entries
+                .filter((e) => !e.isDirectory && /\.(pdf|docx?)$/i.test(e.entryName))
+                .map((e) => ({ entry: e, score: scoreOf(e.entryName) }))
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 6);
+              console.log(`    🇳🇱 tenderned: ZIP has ${entries.length} entries, parsing top ${docEntries.length}`);
+              for (const item of docEntries) {
+                const entry = item.entry;
+                const name = entry.entryName.slice(-100);
+                try {
+                  const data = entry.getData();
+                  let text = '';
+                  const isPdf = data[0] === 0x25 && data[1] === 0x50 && data[2] === 0x44 && data[3] === 0x46;
+                  const isDocx = /\.docx$/i.test(name);
+                  if (isPdf && pdfParseLib) {
+                    const parsed = await pdfParseLib(data);
+                    text = ((parsed && parsed.text) || '').trim();
+                  } else if (isDocx && mammothLib) {
+                    const out = await mammothLib.extractRawText({ buffer: data });
+                    text = ((out && out.value) || '').trim();
+                  }
+                  if (text.length > 200) {
+                    const clipped = text.slice(0, 80000);
+                    texts.push(`--- (tenderned) ${name} ---\n${clipped}`);
+                    console.log(`    🇳🇱 tenderned: parsed "${name}" (${data.length}B → ${clipped.length}ch, score=${item.score})`);
+                  }
+                } catch (e) {
+                  console.log(`    ⚠️  tenderned: parse failed "${name}": ${(e.message || '').slice(0, 80)}`);
+                }
+              }
+            } catch (e) {
+              console.log(`    ⚠️  tenderned: ZIP parse error: ${(e.message || '').slice(0, 100)}`);
+            }
+            // If we got any text, return early — skip all click logic.
+            if (texts.length > 0) {
+              try { page.off('response', papiResponseHandler); } catch (_) {}
+              return texts;
+            }
+          } else {
+            console.log(`    ⚠️  tenderned: v11 bulk ZIP wrong magic (got ${buf.slice(0, 4).toString('hex')}, ct=${r.ct})`);
+          }
+        } else {
+          console.log(`    ⚠️  tenderned: v11 bulk ZIP fetch failed (status=${r?.status || r?.error || '?'})`);
+        }
+      } catch (e) {
+        console.log(`    ⚠️  tenderned: v11 bulk fetch error: ${(e.message || '').slice(0, 100)}`);
+      }
+    }
+
     if (admZipLib && filenamesProbe.filenames.length > 0) {
       // v8 fix: Download-all-ZIP can return Content-Disposition:attachment
       // which Chromium routes to the download manager (response stream
@@ -2741,6 +2929,130 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         }
       } catch (_) {}
     }
+
+    // v10 API fallback — Angular fires /papi/.../documenten when the
+    // Documenten tab activates. We captured all such responses above;
+    // parse them for per-file URLs / IDs. Run only if ZIP path failed.
+    if (texts.length === 0 && capturedJsonResponses.length > 0) {
+      console.log(`    🇳🇱 tenderned: API fallback — ${capturedJsonResponses.length} JSON response(s) captured during tab activation`);
+      const apiDocs = [];
+      for (const cap of capturedJsonResponses) {
+        let json;
+        try { json = JSON.parse(cap.body); } catch (_) { continue; }
+        // Walk JSON looking for arrays of objects with file-like fields.
+        const collect = (node, depth) => {
+          if (apiDocs.length >= 30) return;
+          if (depth > 6) return;
+          if (Array.isArray(node)) { for (const x of node) collect(x, depth + 1); return; }
+          if (!node || typeof node !== 'object') return;
+          // Detect file-shaped objects — common TenderNed keys: id,
+          // bestandsnaam, naam, filename, name, contentType, type, size.
+          const keys = Object.keys(node);
+          const hasName = keys.some((k) => /^(?:bestandsnaam|filename|fileName|naam|name)$/i.test(k));
+          const hasId = keys.some((k) => /^(?:id|fileId|documentId|stukId|bestandId)$/i.test(k));
+          if (hasName && hasId) {
+            const name = node.bestandsnaam || node.filename || node.fileName || node.naam || node.name || '';
+            const id   = node.id || node.fileId || node.documentId || node.stukId || node.bestandId || '';
+            if (name && id && /\.(?:pdf|docx?|xlsx?|zip|rtf|odt|ods)$/i.test(name)) {
+              apiDocs.push({ name: String(name).slice(0, 200), id: String(id), src: cap.url.slice(0, 80) });
+            }
+          }
+          for (const k of keys) collect(node[k], depth + 1);
+        };
+        try { collect(json, 0); } catch (_) {}
+      }
+      if (apiDocs.length === 0) {
+        console.log(`    ⚠️  tenderned: API responses captured but no file-shaped objects found. URLs: ${capturedJsonResponses.slice(0, 4).map((c) => c.url.slice(-60)).join(' | ')}`);
+      } else {
+        // De-dup by (id, name)
+        const seen = new Set();
+        const uniq = [];
+        for (const d of apiDocs) {
+          const k = `${d.id}|${d.name}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          uniq.push(d);
+        }
+        console.log(`    🇳🇱 tenderned: API discovered ${uniq.length} document(s) — sample: ${uniq.slice(0, 4).map((d) => d.name.slice(0, 50)).join(' | ')}`);
+        // Score & prioritise — same vocab as ZIP path.
+        const API_SCORE = [
+          { rx: /selectie\s*leidraad|selectiecriteri|selectie[-\s]?eisen/i, score: 25 },
+          { rx: /aanbestedings?\s*leidraad|procurement\s*guide/i, score: 18 },
+          { rx: /programma\s*van\s*eisen/i, score: 12 },
+          { rx: /uea|espd|uniform\s*europees/i, score: 8 },
+          { rx: /aankondiging|EF\d+/i, score: 5 },
+        ];
+        for (const d of uniq) {
+          d.score = 0;
+          for (const r of API_SCORE) if (r.rx.test(d.name)) d.score = Math.max(d.score, r.score);
+        }
+        uniq.sort((a, b) => b.score - a.score);
+        // Try a few URL patterns per document — TenderNed exposes file
+        // downloads under multiple aliases. The right one is hard to
+        // guess from outside, so we try each in order and use the first
+        // that yields a valid PDF/DOCX. Heuristics built from observed
+        // /papi paths in captured response URLs.
+        // User-confirmed 2026-05-14: per-file URL pattern is
+        // /publicaties/{noticeId}/documenten/{docId}/content
+        const URL_PATTERNS = (id) => [
+          `https://www.tenderned.nl/papi/tenderned-rs-tns/v2/publicaties/${noticeId}/documenten/${id}/content`,
+          `https://www.tenderned.nl/papi/tenderned-rs-tns/v2/publicaties/${noticeId}/documenten/${id}`,
+        ];
+        const topDocs = uniq.slice(0, 6);
+        if (admZipLib || pdfParseLib || mammothLib) {
+          for (const doc of topDocs) {
+            let fetched = null;
+            for (const candUrl of URL_PATTERNS(doc.id)) {
+              const r = await page.evaluate(async (url) => {
+                try {
+                  const resp = await fetch(url, { credentials: 'include', redirect: 'follow' });
+                  if (!resp.ok) return { ok: false, status: resp.status };
+                  const ct = resp.headers.get('content-type') || '';
+                  const ab = await resp.arrayBuffer();
+                  return { ok: true, status: resp.status, ct, url: resp.url || url, data: Array.from(new Uint8Array(ab)) };
+                } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
+              }, candUrl).catch(() => null);
+              if (r && r.ok && r.data && r.data.length > 500) {
+                const buf = Buffer.from(r.data);
+                // Accept PDF magic OR Office-ZIP (DOCX/XLSX).
+                if ((buf[0] === 0x25 && buf[1] === 0x50) || (buf[0] === 0x50 && buf[1] === 0x4b)) {
+                  fetched = { buf, ct: r.ct, url: candUrl };
+                  break;
+                }
+              }
+            }
+            if (!fetched) {
+              console.log(`    ⚠️  tenderned: API download failed for "${doc.name.slice(0, 50)}" — all URL patterns rejected`);
+              continue;
+            }
+            try {
+              const buf = fetched.buf;
+              const isPdf = buf[0] === 0x25 && buf[1] === 0x50;
+              const isDocx = (buf[0] === 0x50 && buf[1] === 0x4b) && /\.docx$/i.test(doc.name);
+              let text = '';
+              if (isPdf && pdfParseLib) {
+                const parsed = await pdfParseLib(buf);
+                text = ((parsed && parsed.text) || '').trim();
+              } else if (isDocx && mammothLib) {
+                const out = await mammothLib.extractRawText({ buffer: buf });
+                text = ((out && out.value) || '').trim();
+              }
+              if (text.length > 200) {
+                const clipped = text.slice(0, 80000);
+                texts.push(`--- (tenderned API) ${doc.name} ---\n${clipped}`);
+                console.log(`    🇳🇱 tenderned: API parsed "${doc.name.slice(0, 60)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+              } else {
+                console.log(`    ⚠️  tenderned: API "${doc.name.slice(0, 50)}" text too short (${text.length}ch)`);
+              }
+            } catch (e) {
+              console.log(`    ⚠️  tenderned: API parse failed "${doc.name.slice(0, 50)}": ${(e.message || '').slice(0, 80)}`);
+            }
+          }
+        }
+      }
+    }
+    // Cleanup the response listener now that we're done with API path.
+    try { page.off('response', papiResponseHandler); } catch (_) {}
 
     // If ZIP path returned content, we're done. Otherwise (no ZIP lib,
     // no button, no docs detected), fall back to the original anchor-
