@@ -3445,11 +3445,18 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
     // BuyerProjectID is an opaque session token we can't construct —
     // must scrape it from the rendered page.
     if (/\/p_meformsnotice\.aspx/i.test(new URL(page.url()).pathname)) {
+      // v3: broaden matcher. User-confirmed 2026-05-14 there are TWO
+      // distinct TendSign Documents-tab URL patterns:
+      //   Flow A: <a href="p_documents.aspx?MeFormsNoticeId=X&BuyerProjectID=Y">
+      //   Flow B: <a href="s_view_advertfiles.aspx?UniqueId=X&BuyerProjectID=Y">
+      // Flow B leads to a "Next step" intermediate page that posts to
+      // /supplier/s_view_advertfiles.aspx where the actual document
+      // download links live.
       const docsTabUrl = await page.evaluate(() => {
         const anchors = Array.from(document.querySelectorAll('a[href]'));
         for (const a of anchors) {
           const href = a.getAttribute('href') || '';
-          if (!/p_documents\.aspx/i.test(href)) continue;
+          if (!/(?:p_documents|s_view_advertfiles)\.aspx/i.test(href)) continue;
           if (!/BuyerProjectID=/i.test(href)) continue;
           try { return new URL(href, location.href).toString(); }
           catch (_) {}
@@ -3465,6 +3472,41 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
           await new Promise((r) => setTimeout(r, 1200));
         } catch (e) {
           console.log(`    ⚠️  tendsign: Documents tab nav failed: ${(e.message || '').slice(0, 80)}`);
+        }
+
+        // Flow B continuation — if we're on s_view_advertfiles.aspx
+        // (NOT in /supplier/ yet), look for the "Next step" button.
+        // User-confirmed onclick payload:
+        //   document.location.href='../supplier/s_view_advertfiles.aspx?UniqueId=X&BuyerProjectID=Y'
+        if (/s_view_advertfiles\.aspx/i.test(new URL(page.url()).pathname)
+            && !/\/supplier\//i.test(new URL(page.url()).pathname)) {
+          const nextStepUrl = await page.evaluate(() => {
+            const RX_JS_HREF = /document\.location\.href\s*=\s*['"]([^'"]+)['"]/i;
+            const inputs = Array.from(document.querySelectorAll('input[type="button"], input[type="submit"], button'));
+            for (const el of inputs) {
+              const val = (el.value || el.innerText || '').trim();
+              if (!/^next\s*step$/i.test(val)) continue;
+              const onclick = el.getAttribute('onclick') || '';
+              const m = RX_JS_HREF.exec(onclick);
+              if (m && m[1]) {
+                try { return new URL(m[1], location.href).toString(); }
+                catch (_) {}
+              }
+            }
+            return null;
+          }).catch(() => null);
+          if (nextStepUrl) {
+            console.log(`    🇸🇪 tendsign: Next step → ${nextStepUrl.slice(0, 110)}`);
+            try {
+              await page.goto(nextStepUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+              await new Promise((r) => setTimeout(r, 1200));
+            } catch (e) {
+              console.log(`    ⚠️  tendsign: Next step nav failed: ${(e.message || '').slice(0, 80)}`);
+            }
+          } else {
+            console.log(`    ⚠️  tendsign: on s_view_advertfiles but no "Next step" button found`);
+          }
         }
       } else {
         console.log(`    ⚠️  tendsign: no Documents tab anchor on p_meformsnotice.aspx — staying on Advertisement view`);
@@ -3594,16 +3636,35 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
       topDocs.map((d) => `${(d.filename || d.name).slice(0, 40)}[s=${d.score}]`).join(' | ')
     );
 
+    // v3 — CDP download manager. /tools/download.aspx returns HTML for
+    // anonymous fetch() requests (ASP.NET ViewState/auth wall), even on
+    // /public/ pages. Real browser uses window.open() which inherits
+    // the page's session AND triggers a real download. We enable
+    // Browser.setDownloadBehavior so files land on disk; if fetch path
+    // fails we navigate to the URL directly (mirroring window.open).
+    let cdpSession = null, downloadDir = null;
+    try {
+      const os = require('os');
+      const fs = require('fs');
+      const path = require('path');
+      downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tendsign-dl-'));
+      cdpSession = await page.target().createCDPSession();
+      await cdpSession.send('Browser.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: downloadDir,
+      }).catch(() => null);
+      await cdpSession.send('Page.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: downloadDir,
+      }).catch(() => null);
+    } catch (_) {}
+
     const texts = [];
     for (const doc of topDocs) {
-      // Prefer filename (e.g. "2.Administrativa krav-1.pdf") over the
-      // anchor text (e.g. "Administrative requirements") — filename
-      // disambiguates Bilaga 1 vs Bilaga 2 and matches what a human
-      // reviewer would see when downloading.
       const labelName = (doc.filename || doc.name).slice(0, 100);
-      // Fetch via page.evaluate so the auth cookie travels with the
-      // request. credentials:'include' is required for same-origin
-      // session cookies set with SameSite=Lax.
+      // STEP 1 — try fetch first (faster, no disk I/O). If it returns
+      // a real PDF/DOCX it's a win; if it returns HTML (auth wall) we
+      // fall through to STEP 2.
       const result = await page.evaluate(async (url) => {
         try {
           const resp = await fetch(url, { credentials: 'include', redirect: 'follow' });
@@ -3623,13 +3684,72 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
         }
       }, doc.url).catch((e) => ({ ok: false, error: e.message }));
 
-      if (!result || !result.ok || !result.data || result.data.length < 500) {
+      let buf = null;
+      let viaDisk = false;
+      if (result && result.ok && result.data && result.data.length > 500) {
+        const tmpBuf = Buffer.from(result.data);
+        const isHtmlAuthWall = /<!doctype\s+html|<html|<head/i.test(tmpBuf.slice(0, 200).toString('utf8'));
+        if (!isHtmlAuthWall) {
+          buf = tmpBuf;
+        } else {
+          console.log(`    🇸🇪 tendsign: "${labelName.slice(0, 40)}" — fetch got HTML, trying CDP download`);
+        }
+      }
+      // STEP 2 — CDP download via navigation. ASP.NET /tools/download.aspx
+      // serves PDFs only when the request comes through a session-bearing
+      // browser navigation. page.goto on a download URL triggers Chromium's
+      // download manager (with downloadPath set), writes file to disk.
+      if (!buf && cdpSession && downloadDir) {
+        try {
+          const fs = require('fs');
+          const path = require('path');
+          // Snapshot existing files so we can detect the new one.
+          const before = new Set();
+          try { for (const n of fs.readdirSync(downloadDir)) before.add(n); } catch (_) {}
+          // Navigate to the URL — for downloads, page.goto throws
+          // "net::ERR_ABORTED" once the response is treated as download.
+          // That's expected; the file still writes to disk.
+          await page.goto(doc.url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null);
+          // Poll for new file appearing.
+          const deadline = Date.now() + 12000;
+          let downloadedPath = null;
+          while (Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 400));
+            let names = [];
+            try { names = fs.readdirSync(downloadDir); } catch (_) {}
+            const fresh = names.filter((n) => !before.has(n) && !/\.crdownload$/i.test(n));
+            if (fresh.length > 0) {
+              let biggest = null;
+              for (const n of fresh) {
+                try {
+                  const p = path.join(downloadDir, n);
+                  const st = fs.statSync(p);
+                  if (st.isFile() && st.size > 500) {
+                    if (!biggest || st.size > biggest.size) biggest = { path: p, size: st.size };
+                  }
+                } catch (_) {}
+              }
+              if (biggest) { downloadedPath = biggest.path; break; }
+            }
+          }
+          if (downloadedPath) {
+            buf = fs.readFileSync(downloadedPath);
+            viaDisk = true;
+            console.log(`    🇸🇪 tendsign: "${labelName.slice(0, 40)}" — CDP download OK (${buf.length}B)`);
+          } else {
+            console.log(`    ⚠️  tendsign: "${labelName.slice(0, 40)}" — CDP polling timed out`);
+          }
+        } catch (e) {
+          console.log(`    ⚠️  tendsign: CDP download error for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+        }
+      }
+      if (!buf) {
         const status = result?.status || result?.error || '?';
-        console.log(`    ⚠️  tendsign: download failed for "${labelName}" (status=${status})`);
+        console.log(`    ⚠️  tendsign: download failed for "${labelName}" (fetch=${status}, disk=${viaDisk})`);
         continue;
       }
-      const buf = Buffer.from(result.data);
-      const ctL = (result.ct || '').toLowerCase();
+      // ct only meaningful for fetch path; CDP path uses magic bytes.
+      const ctL = (result && result.ok ? (result.ct || '') : '').toLowerCase();
       // Filename hint check — TendSign's download.aspx wraps every
       // file with the same path so we can't rely on URL path extension;
       // the original filename comes through doc.filename (decoded from
@@ -3686,6 +3806,14 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
         console.log(`    ⚠️  tendsign: parse failed for "${labelName}": ${(e.message || '').slice(0, 80)}`);
       }
     }
+    // v3 cleanup — detach CDP + rm tmp download dir.
+    try { if (cdpSession) await cdpSession.detach(); } catch (_) {}
+    try {
+      if (downloadDir) {
+        const fs = require('fs');
+        fs.rmSync(downloadDir, { recursive: true, force: true });
+      }
+    } catch (_) {}
     return texts;
   } catch (e) {
     console.log(`    ⚠️  tendsign handler error: ${(e.message || String(e)).slice(0, 140)}`);
