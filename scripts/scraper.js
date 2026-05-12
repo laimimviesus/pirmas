@@ -186,10 +186,17 @@ function getPortalCreds(hostOrUrl) {
 // login. We force login here.
 const ALWAYS_LOGIN_HOSTS = [
   'e-avrop.com',          // Swedish — Antirio platform shell
-  // 'tendsign.com' removed 2026-05-13 — source URLs are now rewritten
-  // to the anonymous public-view variant (/public/p_meformsnotice.aspx)
-  // which doesn't need auth. Login attempts on the buyer-restricted
-  // doc.aspx variant succeed but session doesn't unlock content.
+  // tendsign.com — re-added 2026-05-14. Public anonymous view
+  // (/public/p_meformsnotice.aspx) exposes the Announcement summary
+  // and a "Dokument" tab anchor of shape
+  //   <a href="../doc.aspx?MeFormsNoticeId=<id>&Goto=Docs">Dokument</a>
+  // but clicking it lands on a LOGIN wall (user-confirmed DOM 2026-05-14
+  // for MeFormsNoticeId=91377). So we need credentials to reach the
+  // actual document URLs (Flow A p_documents.aspx / Flow B
+  // s_view_advertfiles.aspx). Login attempts on doc.aspx succeed and
+  // the session cookie carries through the public→doc.aspx redirect
+  // chain, unlocking Documents content for fetchTendSignDocuments.
+  'tendsign.com',
   'kommersannons.se',      // Swedish FMV — Kommers Annons shell
   'tarjouspalvelu.fi',     // Finnish — Cloudia-fronted (SSO via login.cloudia.net)
 ];
@@ -3528,15 +3535,26 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
     // BuyerProjectID is an opaque session token we can't construct —
     // must scrape it from the rendered page.
     if (/\/p_meformsnotice\.aspx/i.test(new URL(page.url()).pathname)) {
-      // v3: broaden matcher. User-confirmed 2026-05-14 there are TWO
-      // distinct TendSign Documents-tab URL patterns:
-      //   Flow A: <a href="p_documents.aspx?MeFormsNoticeId=X&BuyerProjectID=Y">
-      //   Flow B: <a href="s_view_advertfiles.aspx?UniqueId=X&BuyerProjectID=Y">
-      // Flow B leads to a "Next step" intermediate page that posts to
-      // /supplier/s_view_advertfiles.aspx where the actual document
-      // download links live.
+      // v4: handle THREE distinct TendSign Documents-tab anchor shapes:
+      //   Flow A:  <a href="p_documents.aspx?MeFormsNoticeId=X&BuyerProjectID=Y">
+      //   Flow B:  <a href="s_view_advertfiles.aspx?UniqueId=X&BuyerProjectID=Y">
+      //   Flow C:  <a href="../doc.aspx?MeFormsNoticeId=X&Goto=Docs">
+      // Flow C is what the PUBLIC anonymous view emits when no buyer-
+      // session cookie is present (user-confirmed DOM 2026-05-14 for
+      // MeFormsNoticeId=91377). Clicking lands on a login wall; once
+      // attemptPortalLogin (tendsign now in ALWAYS_LOGIN_HOSTS) has
+      // set cookies, the same doc.aspx URL redirects through the buyer
+      // session and emits Flow A or Flow B at the next page. So we
+      // accept doc.aspx?...&Goto=Docs as a valid Documents-tab match
+      // and follow it; the existing Flow A/B post-redirect logic
+      // handles whatever lands.
+      // Flow B already leads to a "Next step" intermediate page that
+      // posts to /supplier/s_view_advertfiles.aspx where the actual
+      // document download links live.
       const docsTabUrl = await page.evaluate(() => {
         const anchors = Array.from(document.querySelectorAll('a[href]'));
+        // Priority pass — Flow A/B with BuyerProjectID (buyer-authenticated
+        // view; landing here means cookies already valid).
         for (const a of anchors) {
           const href = a.getAttribute('href') || '';
           if (!/(?:p_documents|s_view_advertfiles)\.aspx/i.test(href)) continue;
@@ -3544,11 +3562,29 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
           try { return new URL(href, location.href).toString(); }
           catch (_) {}
         }
+        // Fallback — Flow C (Goto=Docs anchor on public anonymous view).
+        // Per user-confirmed DOM 2026-05-14:
+        //   <a class="topmenulinknormal"
+        //      href="../doc.aspx?UniqueId=&MeFormsNoticeId=91377&ID=&Goto=Docs">
+        //     Dokument
+        //   </a>
+        // No BuyerProjectID present; the value gets assigned server-side
+        // once the request hits doc.aspx with auth cookies.
+        for (const a of anchors) {
+          const href = a.getAttribute('href') || '';
+          if (!/doc\.aspx/i.test(href)) continue;
+          if (!/[?&]Goto=Docs\b/i.test(href)) continue;
+          try { return new URL(href, location.href).toString(); }
+          catch (_) {}
+        }
         return null;
       }).catch(() => null);
 
       if (docsTabUrl) {
-        console.log(`    🇸🇪 tendsign: Documents tab → ${docsTabUrl.slice(0, 110)}`);
+        const flowLabel = /Goto=Docs/i.test(docsTabUrl) ? 'C (Goto=Docs)'
+          : /s_view_advertfiles/i.test(docsTabUrl) ? 'B'
+          : 'A';
+        console.log(`    🇸🇪 tendsign: Documents tab (Flow ${flowLabel}) → ${docsTabUrl.slice(0, 110)}`);
         try {
           await page.goto(docsTabUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
           try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
@@ -3556,6 +3592,50 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
         } catch (e) {
           console.log(`    ⚠️  tendsign: Documents tab nav failed: ${(e.message || '').slice(0, 80)}`);
         }
+        // Flow C continuation — after navigating to doc.aspx?...&Goto=Docs
+        // with auth cookies, tendsign redirects to either Flow A's
+        // p_documents.aspx or Flow B's s_view_advertfiles.aspx. If we
+        // ended up on a page that STILL has a password field (login
+        // wall — cookies missing or session expired), bail with a clear
+        // log so we know the login didn't propagate. Otherwise look
+        // for a downstream Flow A/B anchor and chain into it. The
+        // doc.aspx redirect may also land us on a buyer-specific page
+        // with file anchors directly — STEP 2 (anchor scan) handles
+        // that automatically.
+        try {
+          const postNavUrl = new URL(page.url()).pathname;
+          if (/Goto=Docs/i.test(docsTabUrl) && /doc\.aspx/i.test(postNavUrl)) {
+            const stillOnDocAspx = /\/doc\.aspx/i.test(postNavUrl);
+            const passField = await page.evaluate(() => !!document.querySelector(
+              'input[type="password"]:not([disabled]):not([aria-hidden="true"])'
+            )).catch(() => false);
+            if (stillOnDocAspx && passField) {
+              console.log(`    ⚠️  tendsign Flow C: still on doc.aspx with password field → login cookies didn't propagate`);
+            } else if (stillOnDocAspx) {
+              // Look for chained Flow A/B anchor on the doc.aspx page.
+              const chainedUrl = await page.evaluate(() => {
+                const anchors = Array.from(document.querySelectorAll('a[href]'));
+                for (const a of anchors) {
+                  const href = a.getAttribute('href') || '';
+                  if (!/(?:p_documents|s_view_advertfiles)\.aspx/i.test(href)) continue;
+                  try { return new URL(href, location.href).toString(); }
+                  catch (_) {}
+                }
+                return null;
+              }).catch(() => null);
+              if (chainedUrl) {
+                console.log(`    🇸🇪 tendsign Flow C → chained → ${chainedUrl.slice(0, 100)}`);
+                try {
+                  await page.goto(chainedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                  try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+                  await new Promise((r) => setTimeout(r, 1200));
+                } catch (e) {
+                  console.log(`    ⚠️  tendsign Flow C chained nav failed: ${(e.message || '').slice(0, 80)}`);
+                }
+              }
+            }
+          }
+        } catch (_) {}
 
         // Flow B continuation — if we're on s_view_advertfiles.aspx
         // (NOT in /supplier/ yet), look for the "Next step" button.
@@ -3902,6 +3982,293 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
     console.log(`    ⚠️  tendsign handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
   } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
+// =====================================================================
+// fetchEavropDocuments
+// ---------------------------------------------------------------------
+// e-avrop.com (Antirio platform) tender pages render a "Documents"
+// section after login (Announcement.aspx). Each individual document is
+// listed inside an iframe (which the post-auth iframe-merge in
+// fetchSourcePageDetails already picks up for text-extraction). But
+// the SAME section also exposes a single one-click bulk-download:
+//
+//   <a id="mainContent_createZip"
+//      title="Download ZIP-file including full documentation"
+//      href="javascript:__doPostBack('ctl00$mainContent$createZip','')">
+//     All documents
+//   </a>
+//
+// Clicking this fires an ASP.NET postback that streams back a ZIP
+// containing every attachment. That gives us PDF/DOCX content for the
+// qualification-requirements extractor — without iframe parsing or
+// per-document download URLs (which aren't trivially extractable; they
+// require ASPX ViewState replay).
+//
+// Strategy (mirrors tendsign Flow B + tenderned bulk-ZIP):
+//   1. New page, stealth.
+//   2. Navigate to source URL (assumes login already done — host is in
+//      ALWAYS_LOGIN_HOSTS, so the browser's cookie jar carries auth).
+//   3. Set up CDP download manager pointing to a tmp dir.
+//   4. Wait for #mainContent_createZip to appear (max 10s).
+//   5. Fire __doPostBack('ctl00$mainContent$createZip','') via eval —
+//      ASP.NET will write the ZIP to the download stream and Chromium
+//      writes it to disk.
+//   6. Poll the tmp dir for the new .zip file.
+//   7. Parse with adm-zip, extract PDFs/DOCXs, score by qualification
+//      vocabulary, concatenate up to 4 docs' text.
+//   8. Return [] no-op for non-e-avrop sources.
+// =====================================================================
+async function fetchEavropDocuments(browser, sourceUrl) {
+  try {
+    const u = new URL(sourceUrl);
+    if (!/(^|\.)e-avrop\.com$/i.test(u.hostname)) return [];
+  } catch (_) { return []; }
+
+  let pdfParseLib = null, mammothLib = null, admZipLib = null;
+  try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
+  if (!admZipLib) {
+    console.log(`    ⚠️  e-avrop: adm-zip not available — skipping bulk ZIP fetch`);
+    return [];
+  }
+
+  let page = null;
+  let cdpSession = null;
+  let downloadDir = null;
+  try {
+    const os = require('os');
+    const fs = require('fs');
+    const path = require('path');
+
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(30000);
+    page.setDefaultTimeout(30000);
+    try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
+
+    // Light stealth — Antirio occasionally rejects default HeadlessChrome.
+    try {
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['sv-SE', 'sv', 'en-US', 'en'],
+        });
+      });
+      const ua = await page.browser().userAgent();
+      await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+    } catch (_) {}
+
+    // CDP download manager — set up BEFORE navigation so the createZip
+    // postback's response is intercepted as a download.
+    try {
+      downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eavrop-dl-'));
+      cdpSession = await page.target().createCDPSession();
+      await cdpSession.send('Browser.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: downloadDir,
+      }).catch(() => null);
+      await cdpSession.send('Page.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: downloadDir,
+      }).catch(() => null);
+    } catch (_) {}
+
+    try {
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (e) {
+      console.log(`    🇸🇪 e-avrop: nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 1500));
+    // Belt-and-braces — e-avrop's Announcement.aspx loads its main
+    // content (including Documents section) via deferred XHR; the
+    // post-auth-settle path in fetchSourcePageDetails uses 5s + 1.5s.
+    // Wait specifically for the createZip anchor to appear, max 10s.
+    let createZipFound = false;
+    try {
+      await page.waitForSelector('#mainContent_createZip', { timeout: 10000 });
+      createZipFound = true;
+    } catch (_) { /* will diagnose below */ }
+
+    if (!createZipFound) {
+      // Diagnostic — log whether the Documents section exists at all,
+      // and dump the first few <a id="mainContent_*"> anchors so we can
+      // iterate if Antirio re-renames the ID.
+      const diag = await page.evaluate(() => {
+        const sections = Array.from(document.querySelectorAll('.section, h1, h2, h3'))
+          .map((el) => (el.innerText || '').trim().slice(0, 40))
+          .filter((t) => t.length > 0);
+        const anchors = Array.from(document.querySelectorAll('a[id*="mainContent" i], a[href*="createZip" i], a[href*="__doPostBack" i]'))
+          .slice(0, 8)
+          .map((a) => ({
+            id: a.id || '',
+            href: (a.getAttribute('href') || '').slice(0, 80),
+            text: (a.innerText || '').trim().slice(0, 30),
+          }));
+        return {
+          url: location.href,
+          bodyLen: (document.body?.innerText || '').length,
+          sections: sections.slice(0, 12),
+          anchors,
+        };
+      }).catch(() => null);
+      console.log(`    ⚠️  e-avrop: #mainContent_createZip not found — ${JSON.stringify(diag).slice(0, 300)}`);
+      return [];
+    }
+
+    console.log(`    🇸🇪 e-avrop: #mainContent_createZip found — firing __doPostBack for bulk ZIP`);
+
+    // Snapshot existing files before triggering the postback.
+    const before = new Set();
+    try { for (const n of fs.readdirSync(downloadDir)) before.add(n); } catch (_) {}
+
+    // Fire the postback. We use page.evaluate so the call runs in the
+    // page's own JS context with __doPostBack already defined. This is
+    // more reliable than .click() — Puppeteer's .click() on an anchor
+    // with href="javascript:..." sometimes doesn't fire the handler
+    // (page navigates to literal "javascript:..." URL instead).
+    const fired = await page.evaluate(() => {
+      try {
+        if (typeof __doPostBack === 'function') {
+          // eslint-disable-next-line no-undef
+          __doPostBack('ctl00$mainContent$createZip', '');
+          return 'postback';
+        }
+        // Fallback — evaluate the href.
+        const el = document.querySelector('#mainContent_createZip');
+        if (!el) return 'no-element';
+        const href = el.getAttribute('href') || '';
+        const m = /^\s*javascript:\s*(.*)$/i.exec(href);
+        if (m && m[1]) {
+          // eslint-disable-next-line no-eval
+          (function () { eval(m[1]); }).call(window);
+          return 'eval-href';
+        }
+        el.click();
+        return 'click';
+      } catch (e) {
+        return 'error:' + String(e).slice(0, 60);
+      }
+    }).catch((e) => 'evaluate-error:' + (e.message || '').slice(0, 60));
+    console.log(`    🇸🇪 e-avrop: postback trigger result = ${fired}`);
+
+    // Poll the download dir for a fresh .zip — bulk ZIP can take a few
+    // seconds for big tenders. 30s total, 400ms poll interval.
+    const deadline = Date.now() + 30000;
+    let zipPath = null;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 400));
+      let names = [];
+      try { names = fs.readdirSync(downloadDir); } catch (_) {}
+      // Ignore .crdownload (in-flight) — wait for the rename to final.
+      const fresh = names.filter((n) => !before.has(n) && !/\.crdownload$/i.test(n));
+      if (fresh.length > 0) {
+        let biggest = null;
+        for (const n of fresh) {
+          try {
+            const p = path.join(downloadDir, n);
+            const st = fs.statSync(p);
+            if (st.isFile() && st.size > 500) {
+              if (!biggest || st.size > biggest.size) biggest = { path: p, size: st.size };
+            }
+          } catch (_) {}
+        }
+        if (biggest) { zipPath = biggest.path; break; }
+      }
+    }
+    if (!zipPath) {
+      console.log(`    ⚠️  e-avrop: ZIP download polling timed out (no new file in ${downloadDir})`);
+      return [];
+    }
+    const zipBuf = fs.readFileSync(zipPath);
+    console.log(`    🇸🇪 e-avrop: ZIP downloaded (${zipBuf.length}B) — parsing entries`);
+
+    // Verify magic bytes — must be PK\003\004.
+    if (!(zipBuf[0] === 0x50 && zipBuf[1] === 0x4b && zipBuf[2] === 0x03 && zipBuf[3] === 0x04)) {
+      console.log(
+        `    ⚠️  e-avrop: downloaded file is not a ZIP ` +
+        `(magic=${zipBuf.slice(0, 4).toString('hex')}, head=${zipBuf.slice(0, 80).toString('utf8').replace(/[^\x20-\x7e]/g, '?').slice(0, 60)})`
+      );
+      return [];
+    }
+
+    // Parse + score ZIP entries. Vocabulary mirrors tendsign's Swedish
+    // qualification rules so the highest-priority files (Kvalificerings-
+    // krav, Administrativa krav, FFU) bubble to the top.
+    const SCORE_RULES = [
+      { rx: /Kvalificering(?:skrav)?|Krav\s+p[åa]\s+(?:anbudsgivare|leverant[öo]r|leverand[øo]r)|Lev(?:erant[öo]r)?krav|Skakrav|qualification\s*criteria|tender(?:er)?\s+requirements/i, score: 30 },
+      { rx: /Administrativa\s+krav|Generella\s+krav|Krav\s+p[åa]\s+(?:tj[äa]nsten|varan|leveransen)|Uteslutningsgrund/i, score: 25 },
+      { rx: /F[öo]rfr[åa]gningsunderlag|FFU|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdokument|RFT|RFP|tender\s*document|Upphandlingsf[öo]reskrifter/i, score: 18 },
+      { rx: /AUC\b|Administrativa\s+f[öo]reskrifter|administrative\s*provisions/i, score: 12 },
+      { rx: /Anbudsformul[äa]r|Tilbudsformular|tender\s*form|bid\s*form|Egenf[öo]rs[äa]kran|ESPD|UEA|Uniform\s*European|Anbudsinbjudan/i, score: 10 },
+      { rx: /Utv[äa]rderingskriterier|Grund\s+f[öo]r\s+tilldelning|tilldelningskriterier|award\s*criteria|evaluation\s*criteria/i, score: 8 },
+      { rx: /Bilaga|Bilagor|Attachment|Vedlegg|appendix|H[åa]llbarhet|Sanningsf[öo]rs[äa]kran/i, score: 5 },
+    ];
+    let entries;
+    try {
+      const zip = new admZipLib(zipBuf);
+      entries = zip.getEntries()
+        .filter((e) => !e.isDirectory && /\.(pdf|docx?)$/i.test(e.entryName))
+        .map((e) => {
+          let score = 0;
+          for (const r of SCORE_RULES) {
+            if (r.rx.test(e.entryName)) { score = Math.max(score, r.score); break; }
+          }
+          return { entry: e, name: e.entryName, score };
+        })
+        .sort((a, b) => b.score - a.score);
+    } catch (e) {
+      console.log(`    ⚠️  e-avrop: adm-zip parse failed: ${(e.message || '').slice(0, 100)}`);
+      return [];
+    }
+    if (!entries.length) {
+      console.log(`    ⚠️  e-avrop: ZIP had no PDF/DOCX entries`);
+      return [];
+    }
+    console.log(
+      `    🇸🇪 e-avrop: priority docs in ZIP: ` +
+      entries.slice(0, 8).map((x) => `${x.name.split('/').pop().slice(0, 40)}[s=${x.score}]`).join(' | ')
+    );
+
+    const texts = [];
+    for (const x of entries.slice(0, 4)) {
+      try {
+        const data = x.entry.getData();
+        const isPdf = data[0] === 0x25 && data[1] === 0x50 && data[2] === 0x44 && data[3] === 0x46;
+        let text = '';
+        if (isPdf && pdfParseLib) {
+          const parsed = await pdfParseLib(data);
+          text = ((parsed && parsed.text) || '').trim();
+        } else if (/\.docx$/i.test(x.name) && mammothLib) {
+          const out = await mammothLib.extractRawText({ buffer: data });
+          text = ((out && out.value) || '').trim();
+        }
+        if (text.length > 200) {
+          const clipped = text.slice(0, 80000);
+          texts.push(`--- (e-avrop) ${x.name.split('/').pop()} ---\n${clipped}`);
+          console.log(`    🇸🇪 e-avrop: parsed "${x.name.split('/').pop().slice(0, 40)}" (${data.length}B → ${clipped.length}ch, score=${x.score})`);
+        } else {
+          console.log(`    ⚠️  e-avrop: "${x.name.split('/').pop().slice(0, 40)}" extracted text too short (${text.length}ch)`);
+        }
+      } catch (e) {
+        console.log(`    ⚠️  e-avrop: parse failed for "${x.name.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+      }
+    }
+    return texts;
+  } catch (e) {
+    console.log(`    ⚠️  e-avrop handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (cdpSession) await cdpSession.detach(); } catch (_) {}
+    try {
+      if (downloadDir) {
+        const fs = require('fs');
+        fs.rmSync(downloadDir, { recursive: true, force: true });
+      }
+    } catch (_) {}
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -5163,6 +5530,25 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     } catch (e) {
       console.log(`    ⚠️ tendsign handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // e-avrop.com Documents handler — Swedish Antirio platform.
+    // Triggers ASP.NET __doPostBack('ctl00$mainContent$createZip','')
+    // which streams a ZIP containing every attachment. Auth cookies
+    // already set by attemptPortalLogin (e-avrop in ALWAYS_LOGIN_HOSTS).
+    // No-op for non-e-avrop sources.
+    try {
+      const eavropTexts = await fetchEavropDocuments(browser, sourceUrl);
+      if (eavropTexts && eavropTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + eavropTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇸🇪 e-avrop: appended ${eavropTexts.length} doc(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ e-avrop handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     srcPage.off('request', blockHandler);
