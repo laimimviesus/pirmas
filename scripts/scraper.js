@@ -199,6 +199,18 @@ const ALWAYS_LOGIN_HOSTS = [
   'tendsign.com',
   'kommersannons.se',      // Swedish FMV — Kommers Annons shell
   'tarjouspalvelu.fi',     // Finnish — Cloudia-fronted (SSO via login.cloudia.net)
+  // dtvp.de — Deutsches Vergabeportal (cosinex-powered). Public notice
+  // pages on dtvp.de/Satellite/notice/<id> render metadata + tender
+  // description anonymously, but the Vergabeunterlagen (procurement
+  // documents — where qualification criteria, Eignungskriterien, etc.
+  // actually live) are gated behind the "Anmelden" wall. Without a
+  // logged-in session, document download endpoints (.../files/...)
+  // 302→Anmeldung silently and our content-type sniff lands on HTML.
+  // 2026-05-14 fix: force login so cookies authenticate subsequent
+  // document fetches. Sister hosts (vergabe.metropoleruhr.de,
+  // vergabe.rlp.de, service.bund.de, etc.) run the same cosinex stack
+  // but have separate credentials — added per-host as needed.
+  'dtvp.de',
 ];
 function hostRequiresLogin(host) {
   if (!host) return false;
