@@ -8865,41 +8865,50 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           else parseExt = (urlExt && /^(pdf|zip|docx|xlsx|odt|ods|doc|xls|rtf|json|xml|html|htm|txt)$/.test(urlExt))
             ? (urlExt === 'htm' || urlExt === 'html' ? 'xml' : urlExt)
             : 'xml';
-          let text = '';
-          let usedTedStructured = false;
-          // TED-SPECIFIC PATH — when host is ted.europa.eu AND the
-          // content sniffed as HTML, use structure-preserving extractor
-          // so section boundaries survive into the hint-anchor regex.
-          // The standard 'xml' path collapses all whitespace, including
-          // newlines from </section>, </p>, </li> — that destroys the
-          // section structure that's the WHOLE reason TED notices are
-          // a useful fallback in the first place.
           let isTedHost = false;
           try { isTedHost = /(^|\.)ted\.europa\.eu$/i.test(new URL(p.url).hostname); }
           catch (_) {}
+
+          // TED HTML SPA SKIP
+          //
+          // Confirmed 2026-05-12 via fetch + extractor trace: TED's
+          // /en/notice/-/detail/{id} page is a JS-rendered SPA whose raw
+          // HTML body contains only nav menus + footer (~3KB real text).
+          // The actual procurement content — Selection criteria, Award
+          // criteria, lot scope — is fetched via AJAX after page load
+          // and is NOT in the static HTML response.
+          //
+          // Previous runs were feeding ~30KB of menu/footer/legalese to
+          // the AI under the assumption it was procurement metadata. AI
+          // correctly ignored the noise and still filled `scope` from
+          // Mercell JSON, but qualifications stayed empty because they
+          // weren't present in the input — only nav text was.
+          //
+          // Best decision: skip TED HTML entirely. The AI gets a cleaner
+          // input (Mercell JSON title+description + source-side PDFs/HTML)
+          // and stops being misled by repetitive nav text. For Spanish
+          // tenders, source-side PLACSP docs already provide rich
+          // criteria; for auth-walled regional portals (Andalucía SiRec,
+          // Euskadi BakQ), nothing is available anyway — better to know
+          // that explicitly than pretend with nav noise.
+          //
+          // Future: revisit if/when TED exposes a server-rendered or
+          // XML/API endpoint we can hit (TED Developer Portal links to
+          // bulk download but per-notice API is rate-limited and gated).
           if (isTedHost && detectedFmt === 'html') {
-            try {
-              text = extractTedNoticeStructured(result.bytes);
-              if (text && text.length > 100) {
-                usedTedStructured = true;
-              } else {
-                text = ''; // fall through to generic path
-              }
-            } catch (e) {
-              console.log(`    ⚠️ TED structured extractor failed (${e.message?.slice(0, 60)}) — falling back to generic`);
-              text = '';
-            }
+            console.log(`    ⏭️  TED HTML notice skipped (JS-rendered SPA — raw HTML is nav-only, no procurement content): ${p.url.slice(0, 80)}`);
+            continue;
           }
-          if (!text) {
-            try {
-              text = await extractTextFromBuffer(
-                { name: p.label, ext: parseExt, bytes: result.bytes },
-                0,
-              );
-            } catch (e) {
-              console.log(`    ⚠️ public notice extractor failed for ${p.url.slice(0, 70)}: ${e.message}`);
-              continue;
-            }
+
+          let text = '';
+          try {
+            text = await extractTextFromBuffer(
+              { name: p.label, ext: parseExt, bytes: result.bytes },
+              0,
+            );
+          } catch (e) {
+            console.log(`    ⚠️ public notice extractor failed for ${p.url.slice(0, 70)}: ${e.message}`);
+            continue;
           }
           if (!text) {
             console.log(`    ⚠️ public notice empty after extract (fmt=${detectedFmt}, ext=${parseExt}): ${p.url.slice(0, 70)}`);
@@ -8907,9 +8916,7 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           }
           const clipped = text.slice(0, MAX_DOC_TEXT_CHARS);
           publicNoticeTexts.push(`--- (public:${p.label}) ${p.url} ---\n${clipped}`);
-          const pathTag = usedTedStructured ? '🇪🇺 TED-structured' : '🌐';
-          const newlineCount = (clipped.match(/\n/g) || []).length;
-          console.log(`    ${pathTag} parsed public notice (${result.size}B/${detectedFmt} -> ${clipped.length}ch${usedTedStructured ? `, ${newlineCount} newlines preserved` : ''} from ${p.url.slice(0, 70)})`);
+          console.log(`    🌐 parsed public notice (${result.size}B/${detectedFmt} -> ${clipped.length}ch from ${p.url.slice(0, 70)})`);
         }
       }
 
