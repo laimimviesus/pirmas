@@ -1053,6 +1053,25 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       }).catch(() => ({ hasMarker: false, hasVisiblePass: false }));
       if (sessionState.hasMarker && !sessionState.hasVisiblePass) {
         console.log(`    ✅ already authenticated on ${hostLabel} (logged-in marker present, no password form) — skipping login flow`);
+        // SSO BOUNCE — when we used a dedicated-login URL on a different
+        // host than the actual source (e.g. login.cloudia.net for
+        // tarjouspalvelu.fi), the dedicated host's session cookie does
+        // NOT propagate to the source host without a redirect chain that
+        // origin-side identity provider would have triggered if the user
+        // had logged in via the source. Navigate the SAME page to
+        // sourceUrl now — the source will redirect to cloudia (which is
+        // already authenticated) and back, setting the source-host
+        // cookies along the way. Without this, the caller's retry on
+        // the original tender page still hits the auth wall.
+        // 2026-05-12 fix for tarjouspalvelu.fi ZIP fetch.
+        if (dedicatedLoginUrl && sourceUrl) {
+          try {
+            console.log(`    ↪️  SSO bounce-back: navigating to ${sourceUrl.slice(0, 80)} to propagate session`);
+            await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => null);
+            try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
+            await new Promise((r) => setTimeout(r, 1200));
+          } catch (_) {}
+        }
         return true;
       }
     } catch (_) { /* fall through to normal login flow */ }
@@ -1616,6 +1635,20 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       return false;
     }
     console.log(`    ✅ login OK on ${hostLabel} (submit=${submitSel || 'Enter'})`);
+    // SSO BOUNCE-BACK — see comment in the already-authenticated branch
+    // above. When dedicatedLoginUrl is on a different host than the
+    // source (cloudia.net vs tarjouspalvelu.fi), the auth-provider's
+    // session cookie won't reach the source host unless the source
+    // initiates an SSO check. Navigate to sourceUrl now to fire that
+    // chain so the caller's retry sees authenticated content.
+    if (dedicatedLoginUrl && sourceUrl) {
+      try {
+        console.log(`    ↪️  SSO bounce-back: navigating to ${sourceUrl.slice(0, 80)} to propagate session`);
+        await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => null);
+        try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
+        await new Promise((r) => setTimeout(r, 1200));
+      } catch (_) {}
+    }
     return true;
   } catch (e) {
     console.log(`    ❌ login error on ${hostLabel}: ${(e.message || String(e)).slice(0, 200)}`);
@@ -2321,6 +2354,31 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     // Download alle documenten </span>.
     const texts = [];
     if (admZipLib && filenamesProbe.filenames.length > 0) {
+      // v8 fix: Download-all-ZIP can return Content-Disposition:attachment
+      // which Chromium routes to the download manager (response stream
+      // closes, buffer unavailable). Listen for the REQUEST URL too —
+      // we re-fetch via page.evaluate using the session's auth cookies,
+      // which bypasses Chromium's download-decision logic.
+      let capturedReqUrl = null;
+      const reqHandler = (req) => {
+        if (capturedReqUrl) return;
+        try {
+          const url = req.url();
+          if (!/(^https?:\/\/)?[^/]*tenderned\.nl/i.test(url)) return;
+          // Match likely Download-all endpoints. TenderNed serves the
+          // ZIP via a `documenten` or `zip` path segment — both noted in
+          // user inspection 2026-05-12.
+          if (!/\b(?:zip|documenten\/all|download(?:all)?\/?|alle)\b/i.test(url)) return;
+          // Skip static assets, CSS/JS chunks.
+          if (/\.(?:js|css|png|svg|woff2?|ico|map)\b/i.test(url)) return;
+          const rt = req.resourceType();
+          // 'fetch', 'xhr', 'document' (nav-triggered downloads) all OK
+          if (rt === 'image' || rt === 'stylesheet' || rt === 'script' || rt === 'font') return;
+          capturedReqUrl = url;
+        } catch (_) {}
+      };
+      page.on('request', reqHandler);
+
       const zipResponsePromise = new Promise((resolve) => {
         const timer = setTimeout(() => resolve(null), 20000);
         const handler = async (resp) => {
@@ -2418,7 +2476,46 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
 
       if (downloadClicked) {
         console.log(`    🇳🇱 tenderned: clicked Download-all (${downloadClicked}) — waiting for ZIP`);
-        const zipResp = await zipResponsePromise;
+        let zipResp = await zipResponsePromise;
+        page.off('request', reqHandler);
+        // v8 fallback: response stream may have been hijacked by the
+        // download manager. If we captured a Download-all request URL,
+        // re-fetch it via page.evaluate with the session cookies — this
+        // avoids the download routing entirely.
+        if ((!zipResp || !zipResp.buf) && capturedReqUrl) {
+          console.log(`    🇳🇱 tenderned: response capture failed — refetching ${capturedReqUrl.slice(0, 100)} via page session`);
+          try {
+            const refetch = await page.evaluate(async (url) => {
+              try {
+                const r = await fetch(url, { credentials: 'include', redirect: 'follow' });
+                if (!r.ok) return { ok: false, status: r.status };
+                const ab = await r.arrayBuffer();
+                return {
+                  ok: true,
+                  status: r.status,
+                  ct: r.headers.get('content-type') || '',
+                  url: r.url || url,
+                  data: Array.from(new Uint8Array(ab)),
+                };
+              } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
+            }, capturedReqUrl);
+            if (refetch && refetch.ok && refetch.data && refetch.data.length > 1024) {
+              const buf = Buffer.from(refetch.data);
+              if (buf[0] === 0x50 && buf[1] === 0x4b) {
+                zipResp = { buf, url: refetch.url, ct: refetch.ct };
+                console.log(`    🇳🇱 tenderned: session refetch OK (${buf.length}B)`);
+              } else {
+                console.log(`    ⚠️  tenderned: refetched bytes don't have ZIP magic (got ct=${refetch.ct}, first 2 bytes: ${buf[0].toString(16)} ${buf[1].toString(16)})`);
+              }
+            } else {
+              console.log(`    ⚠️  tenderned: session refetch failed: status=${refetch?.status || refetch?.error || '?'}`);
+            }
+          } catch (e) {
+            console.log(`    ⚠️  tenderned: refetch error: ${(e.message || '').slice(0, 100)}`);
+          }
+        } else if (!zipResp || !zipResp.buf) {
+          console.log(`    ⚠️  tenderned: no request URL captured either — click may not have triggered any download endpoint`);
+        }
         if (zipResp && zipResp.buf) {
           console.log(`    🇳🇱 tenderned: ZIP captured (${zipResp.buf.length}B) from ${zipResp.url.slice(0, 100)}`);
           try {
@@ -2478,6 +2575,8 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         }
       } else {
         console.log(`    ⚠️  tenderned: Download-all button not found on page`);
+        // Clean up request listener if we never clicked.
+        try { page.off('request', reqHandler); } catch (_) {}
       }
     }
 
