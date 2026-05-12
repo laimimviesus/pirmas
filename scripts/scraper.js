@@ -3374,6 +3374,82 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
     }
     await new Promise((r) => setTimeout(r, 1500));
 
+    // SSO SESSION WARMUP (2026-05-14 fix).
+    //
+    // attemptPortalLogin logs us in at login.cloudia.net — that sets a
+    // SESSION cookie on the cloudia.net domain. But tarjouspalvelu.fi
+    // and cloudia.net are SEPARATE hostnames; browsers don't share
+    // cookies cross-domain. So even after a successful Cloudia login,
+    // fetch('https://tarjouspalvelu.fi/Zip/...') still has zero
+    // tarjouspalvelu.fi cookies → 401 HTML auth wall.
+    //
+    // The fix: navigate to a tarjouspalvelu.fi URL that REQUIRES auth
+    // — that triggers the SSO redirect chain:
+    //   1. tarjouspalvelu.fi/protected → 302 to login.cloudia.net?ReturnUrl=…
+    //   2. login.cloudia.net sees the existing Cloudia session → 302 back
+    //      to tarjouspalvelu.fi with an SSO token
+    //   3. tarjouspalvelu.fi creates its OWN session cookie
+    //   4. Subsequent ZIP fetches carry that cookie
+    //
+    // Source URL alone doesn't trigger the chain because the public
+    // notice view doesn't require auth. We probe a known-protected
+    // tarjouspalvelu.fi URL: tenant-relative `/Login`. Plus we log
+    // cookie state before+after so we can iterate if SSO still fails.
+    try {
+      const cookiesBefore = await page.cookies('https://tarjouspalvelu.fi', 'https://login.cloudia.net');
+      const cloudia = cookiesBefore.filter((c) => /cloudia/i.test(c.domain)).map((c) => c.name);
+      const tp = cookiesBefore.filter((c) => /tarjouspalvelu/i.test(c.domain)).map((c) => c.name);
+      console.log(`    🇫🇮 tarjouspalvelu: cookies before SSO warmup — cloudia=[${cloudia.join(',')}] tarjouspalvelu=[${tp.join(',')}]`);
+    } catch (_) {}
+
+    // Build a list of warmup candidates ordered by likelihood of
+    // triggering the SSO chain. Tenant-aware first.
+    const warmupCandidates = [];
+    if (tenant) {
+      warmupCandidates.push(`https://tarjouspalvelu.fi/${tenant}/Login`);
+      warmupCandidates.push(`https://tarjouspalvelu.fi/${tenant}/Account`);
+    }
+    warmupCandidates.push('https://tarjouspalvelu.fi/Login/Login');
+    warmupCandidates.push('https://tarjouspalvelu.fi/Login');
+    warmupCandidates.push('https://tarjouspalvelu.fi/Account');
+
+    for (const wu of warmupCandidates) {
+      try {
+        await page.goto(wu, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        try { await page.waitForNetworkIdle({ idleTime: 800, timeout: 6000 }); } catch (_) {}
+        await new Promise((r) => setTimeout(r, 800));
+        // Did we end up back on tarjouspalvelu.fi? If we redirected to
+        // cloudia and got stuck there (i.e. SSO chain didn't 302 back
+        // automatically), bail to next candidate.
+        const landedHost = (() => {
+          try { return new URL(page.url()).hostname.toLowerCase(); }
+          catch (_) { return ''; }
+        })();
+        if (/tarjouspalvelu\.fi$/i.test(landedHost)) {
+          console.log(`    🇫🇮 tarjouspalvelu: SSO warmup OK — landed on ${landedHost} (via ${wu.slice(-50)})`);
+          break;
+        }
+        console.log(`    🇫🇮 tarjouspalvelu: warmup ${wu.slice(-40)} → ${landedHost} (not propagated, trying next)`);
+      } catch (e) {
+        console.log(`    🇫🇮 tarjouspalvelu: warmup ${wu.slice(-40)} failed: ${(e.message || '').slice(0, 60)}`);
+      }
+    }
+
+    // Log cookies after warmup so we can see if tarjouspalvelu.fi
+    // session cookie got set.
+    try {
+      const cookiesAfter = await page.cookies('https://tarjouspalvelu.fi', 'https://login.cloudia.net');
+      const cloudia = cookiesAfter.filter((c) => /cloudia/i.test(c.domain)).map((c) => c.name);
+      const tp = cookiesAfter.filter((c) => /tarjouspalvelu/i.test(c.domain)).map((c) => c.name);
+      console.log(`    🇫🇮 tarjouspalvelu: cookies after SSO warmup — cloudia=[${cloudia.join(',')}] tarjouspalvelu=[${tp.join(',')}]`);
+    } catch (_) {}
+
+    // Re-anchor to source URL so fetch() runs from tarjouspalvelu.fi origin.
+    try {
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    } catch (_) { /* best-effort */ }
+    await new Promise((r) => setTimeout(r, 800));
+
     // Build the ZIP URL — tenant-relative.
     const zipUrl = `https://tarjouspalvelu.fi/Zip/TarjousPyynnonLiitteet/${noticeId}`;
     console.log(`    🇫🇮 tarjouspalvelu: tender ${noticeId} (tenant=${tenant || 'n/a'}) — fetching ZIP from ${zipUrl}`);
@@ -4376,6 +4452,692 @@ async function fetchEavropDocuments(browser, sourceUrl) {
         fs.rmSync(downloadDir, { recursive: true, force: true });
       }
     } catch (_) {}
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
+// =====================================================================
+// fetchKommersAnnonsDocuments
+// ---------------------------------------------------------------------
+// kommersannons.se (Kommers Annons / "FMV" platform, ASP.NET WebForms)
+// is a Swedish multi-tenant procurement portal. Each tender lives under
+// /<tenant>/Notice/NoticeDispatch.aspx?NoticeId=X. The default landing
+// shows only the announcement summary — actual documents are revealed
+// under explicit nav tabs after login. The standard post-login body
+// looks like:
+//
+//   "Tender notice overview / Registration / Decline participation /
+//    Contract documents / Entire tender form / Appendices /
+//    Questions and answers / Additions / Create tender"
+//
+// "Contract documents" / "Entire tender form" / "Appendices" are the
+// useful tabs for qualification extraction. Each is typically an
+// ASP.NET __doPostBack anchor or a regular href like:
+//   /<tenant>/Notice/Documents.aspx?NoticeId=X
+//   /<tenant>/Notice/RequestForTender.aspx?NoticeId=X
+//   /<tenant>/Notice/Appendices.aspx?NoticeId=X
+//
+// Strategy:
+//   1. New page, Swedish locale, auth cookies from attemptPortalLogin.
+//   2. Navigate to source URL (NoticeDispatch.aspx?NoticeId=X).
+//   3. Find tab anchors by text match (EN/SV/NO synonyms).
+//   4. For each found tab URL, navigate, scan for PDF/DOCX/ZIP anchors.
+//   5. Fetch + parse via in-page fetch (carries session cookies).
+//   6. Score by Swedish qualification vocab, parse top 6 docs.
+//   7. Return [`--- (kommersannons) name ---\ntext`].
+//
+// Diagnostic-heavy because we don't have full DOM inspection of all
+// possible tab URL variants — log every step so we can iterate.
+// =====================================================================
+async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
+  try {
+    const u = new URL(sourceUrl);
+    if (!/(^|\.)kommersannons\.se$/i.test(u.hostname)) return [];
+  } catch (_) { return []; }
+
+  let pdfParseLib = null, mammothLib = null, admZipLib = null;
+  try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(25000);
+    page.setDefaultTimeout(25000);
+    try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
+
+    try {
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['sv-SE', 'sv', 'en-US', 'en'],
+        });
+      });
+      const ua = await page.browser().userAgent();
+      await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+    } catch (_) {}
+
+    try {
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    } catch (e) {
+      console.log(`    🇸🇪 kommersannons: nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // STEP 1 — find the document-tab anchors. They're typically <a> with
+    // href to a sibling /Notice/<TabName>.aspx?NoticeId=X URL, OR an
+    // __doPostBack anchor that triggers a navigate via JS. Match by
+    // text: EN ("Contract documents" / "Entire tender form" /
+    // "Appendices"), SV ("Avtalshandlingar" / "Förfrågningsunderlag" /
+    // "Bilagor"), NO ("Kontraktsdokumenter" / "Konkurransegrunnlag" /
+    // "Vedlegg"). Score order — higher = more likely to contain
+    // qualifications.
+    const TAB_RULES = [
+      // "Entire tender form" / "Hela förfrågningsunderlaget" — usually
+      // contains everything including qualifications. Highest priority.
+      { rx: /entire\s*tender\s*form|hela\s*f[öo]rfr[åa]gningsunderlaget|f[öo]rfr[åa]gningsunderlag|konkurransegrunnlag|tender\s*documents|whole\s*tender\s*form/i, score: 40, label: 'TenderForm' },
+      // "Appendices" / "Bilagor" — contains Pliegos / annexes.
+      { rx: /^\s*appendices\s*$|^\s*bilagor\s*$|^\s*vedlegg\s*$|^\s*attachments\s*$/i, score: 35, label: 'Appendices' },
+      // "Contract documents" / "Avtalshandlingar" — contract draft + docs.
+      { rx: /contract\s*documents|avtalshandlingar|kontraktsdokumenter|kontrakts(?:\s*dokument)?/i, score: 25, label: 'Contract' },
+    ];
+
+    const tabProbe = await page.evaluate((rules) => {
+      const anchors = Array.from(document.querySelectorAll('a, button, [role="button"], input[type="button"], input[type="submit"]'));
+      const allTexts = [];
+      const matched = [];
+      const seenUrl = new Set();
+      for (const a of anchors) {
+        const text = (a.innerText || a.value || a.textContent || a.getAttribute('aria-label') || '').trim();
+        if (!text || text.length > 100) continue;
+        allTexts.push(text.slice(0, 60));
+        for (const r of rules) {
+          const rx = new RegExp(r.rx.source, r.rx.flags);
+          if (!rx.test(text)) continue;
+          const hrefRaw = a.getAttribute('href') || '';
+          const onclick = a.getAttribute('onclick') || '';
+          let target = null;
+          if (hrefRaw && !/^javascript:/i.test(hrefRaw) && hrefRaw !== '#') {
+            try { target = new URL(hrefRaw, location.href).toString(); }
+            catch (_) {}
+          }
+          // __doPostBack anchors — record the eventTarget so we can
+          // navigate via the resulting URL parameter (kommersannons
+          // often uses Response.Redirect post-postback).
+          if (!target && /__doPostBack\(/.test(hrefRaw + ' ' + onclick)) {
+            target = `postback:${(hrefRaw || onclick).match(/__doPostBack\(\s*['"]([^'"]+)['"]/)?.[1] || ''}`;
+          }
+          if (!target) continue;
+          if (seenUrl.has(target)) continue;
+          seenUrl.add(target);
+          matched.push({
+            url: target,
+            text: text.slice(0, 60),
+            score: r.score,
+            label: r.label,
+          });
+          break;
+        }
+      }
+      matched.sort((a, b) => b.score - a.score);
+      return {
+        matched: matched.slice(0, 6),
+        totalAnchors: anchors.length,
+        sampleTexts: allTexts.slice(0, 25),
+      };
+    }, TAB_RULES.map((r) => ({ rx: { source: r.rx.source, flags: r.rx.flags }, score: r.score, label: r.label })))
+      .catch((e) => ({ matched: [], totalAnchors: 0, sampleTexts: [], error: e.message }));
+
+    console.log(
+      `    🇸🇪 kommersannons: ${tabProbe.totalAnchors} anchor(s), ` +
+      `${tabProbe.matched.length} tab match(es)` +
+      (tabProbe.matched.length ? ` — ${tabProbe.matched.map((m) => `${m.label}[s=${m.score}]`).join(' | ')}` : '')
+    );
+    if (!tabProbe.matched.length) {
+      console.log(`    ⚠️  kommersannons: no document-tab anchors matched. Sample texts: ${JSON.stringify(tabProbe.sampleTexts.slice(0, 12))}`);
+      return [];
+    }
+
+    // STEP 2 — for each matched tab, navigate (or fire postback), scan
+    // for download links. Aggregate all unique doc URLs.
+    const allDocAnchors = [];
+    const seenDocUrl = new Set();
+    for (const tab of tabProbe.matched) {
+      try {
+        if (tab.url.startsWith('postback:')) {
+          const eventTarget = tab.url.slice('postback:'.length);
+          if (!eventTarget) continue;
+          console.log(`    🇸🇪 kommersannons: firing __doPostBack('${eventTarget}') for ${tab.label}`);
+          await page.evaluate((et) => {
+            try {
+              if (typeof __doPostBack === 'function') {
+                // eslint-disable-next-line no-undef
+                __doPostBack(et, '');
+              }
+            } catch (_) {}
+          }, eventTarget).catch(() => null);
+          try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
+          await new Promise((r) => setTimeout(r, 1500));
+        } else {
+          console.log(`    🇸🇪 kommersannons: navigating to ${tab.label} → ${tab.url.slice(-80)}`);
+          await page.goto(tab.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
+          await new Promise((r) => setTimeout(r, 1200));
+        }
+        const docs = await page.evaluate(() => {
+          // Match anchors that look like document downloads —
+          // standard ASP.NET download endpoints + file extensions.
+          const RX_DL_PATH = /\/(?:Download|DownloadFile|GetFile|DownloadAttachment|Documents?)\.(?:aspx|ashx)|\/Notice\/.*\/Download/i;
+          const RX_DL_EXT  = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:[?&#]|$)/i;
+          const out = [];
+          const anchors = Array.from(document.querySelectorAll('a[href]'));
+          for (const a of anchors) {
+            const hrefRaw = a.getAttribute('href') || '';
+            if (!hrefRaw || /^javascript:/i.test(hrefRaw) || hrefRaw === '#') continue;
+            let abs;
+            try { abs = new URL(hrefRaw, location.href).toString(); }
+            catch (_) { continue; }
+            // Same-origin guard.
+            try {
+              if (new URL(abs).host !== location.host) continue;
+            } catch (_) { continue; }
+            const isDl = RX_DL_PATH.test(abs) || RX_DL_EXT.test(abs);
+            if (!isDl) continue;
+            const text = ((a.innerText || a.textContent || '').trim() || a.getAttribute('title') || '')
+              .slice(0, 120);
+            // Pull filename hint from URL if present.
+            let filename = '';
+            try {
+              const url = new URL(abs);
+              filename = url.searchParams.get('filename')
+                || url.searchParams.get('Filename')
+                || url.searchParams.get('fileName')
+                || url.pathname.split('/').pop()
+                || '';
+              if (filename) filename = decodeURIComponent(filename.replace(/\+/g, ' '));
+            } catch (_) {}
+            out.push({ url: abs, text, filename });
+          }
+          return out;
+        }).catch(() => []);
+        for (const d of docs) {
+          if (seenDocUrl.has(d.url)) continue;
+          seenDocUrl.add(d.url);
+          allDocAnchors.push(d);
+        }
+        console.log(`    🇸🇪 kommersannons: ${tab.label} → ${docs.length} doc anchor(s)`);
+      } catch (e) {
+        console.log(`    ⚠️  kommersannons: tab ${tab.label} error: ${(e.message || '').slice(0, 80)}`);
+      }
+    }
+
+    if (!allDocAnchors.length) {
+      console.log(`    ⚠️  kommersannons: no document download anchors found across tabs`);
+      return [];
+    }
+    console.log(`    🇸🇪 kommersannons: collected ${allDocAnchors.length} unique doc anchor(s) across tabs`);
+
+    // STEP 3 — score by Swedish qualification vocab (same rules as
+    // tendsign + e-avrop handlers).
+    const SCORE_RULES = [
+      { rx: /Kvalificering(?:skrav)?|Krav\s+p[åa]\s+(?:anbudsgivare|leverant[öo]r|leverand[øo]r)|Lev(?:erant[öo]r)?krav|Skakrav|qualification\s*criteria|tender(?:er)?\s+requirements/i, score: 30 },
+      { rx: /Administrativa\s+krav|Generella\s+krav|Krav\s+p[åa]\s+(?:tj[äa]nsten|varan|leveransen)|Uteslutningsgrund/i, score: 25 },
+      { rx: /F[öo]rfr[åa]gningsunderlag|FFU|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdokument|tender\s*document|Upphandlingsf[öo]reskrifter/i, score: 18 },
+      { rx: /AUC\b|Administrativa\s+f[öo]reskrifter/i, score: 12 },
+      { rx: /Anbudsformul[äa]r|Tilbudsformular|Egenf[öo]rs[äa]kran|ESPD|UEA/i, score: 10 },
+      { rx: /Utv[äa]rderingskriterier|Grund\s+f[öo]r\s+tilldelning|tilldelningskriterier|award\s*criteria/i, score: 8 },
+      { rx: /Bilaga|Bilagor|Attachment|Vedlegg|appendix/i, score: 5 },
+    ];
+    for (const d of allDocAnchors) {
+      d.score = 0;
+      const targets = [d.text || '', d.filename || '', d.url || ''];
+      for (const r of SCORE_RULES) {
+        for (const t of targets) {
+          if (r.rx.test(t)) { d.score = Math.max(d.score, r.score); break; }
+        }
+      }
+    }
+    allDocAnchors.sort((a, b) => b.score - a.score);
+    const topDocs = allDocAnchors.slice(0, 6);
+    console.log(
+      `    🇸🇪 kommersannons: priority docs: ` +
+      topDocs.map((d) => `${(d.filename || d.text || d.url.split('/').pop()).slice(0, 40)}[s=${d.score}]`).join(' | ')
+    );
+
+    // STEP 4 — fetch + parse top 6.
+    const detectFormat = (buf) => {
+      if (!buf || buf.length < 4) return 'unknown';
+      const b0 = buf[0], b1 = buf[1], b2 = buf[2], b3 = buf[3];
+      if (b0 === 0x25 && b1 === 0x50 && b2 === 0x44 && b3 === 0x46) return 'pdf';
+      if (b0 === 0x50 && b1 === 0x4B && (b2 === 0x03 || b2 === 0x05 || b2 === 0x07)) return 'zip';
+      if (b0 === 0xD0 && b1 === 0xCF && b2 === 0x11 && b3 === 0xE0) return 'cfb';
+      const head = buf.slice(0, 64).toString('utf8').trim().toLowerCase();
+      if (head.startsWith('<!doctype') || head.startsWith('<html')) return 'html';
+      return 'unknown';
+    };
+
+    const texts = [];
+    for (const doc of topDocs) {
+      const labelName = (doc.filename || doc.text || doc.url.split('/').pop()).slice(0, 100);
+      const result = await page.evaluate(async (url) => {
+        try {
+          const resp = await fetch(url, { credentials: 'include', redirect: 'follow' });
+          if (!resp.ok) return { ok: false, status: resp.status };
+          const ct = resp.headers.get('content-type') || '';
+          const ab = await resp.arrayBuffer();
+          return {
+            ok: true,
+            status: resp.status,
+            ct,
+            url: resp.url || url,
+            data: Array.from(new Uint8Array(ab)),
+          };
+        } catch (e) {
+          return { ok: false, error: String(e).slice(0, 200) };
+        }
+      }, doc.url).catch((e) => ({ ok: false, error: e.message }));
+
+      if (!result || !result.ok || !result.data || result.data.length < 500) {
+        const status = result?.status || result?.error || '?';
+        console.log(`    ⚠️  kommersannons: fetch failed "${labelName.slice(0, 40)}" (status=${status})`);
+        continue;
+      }
+      const buf = Buffer.from(result.data);
+      const fmt = detectFormat(buf);
+      console.log(
+        `    🇸🇪 kommersannons: fetched "${labelName.slice(0, 40)}" ` +
+        `(${buf.length}B, magic=${fmt}, ct=${(result.ct || '').slice(0, 30)})`
+      );
+
+      try {
+        let text = '';
+        if (fmt === 'pdf' && pdfParseLib) {
+          const parsed = await pdfParseLib(buf);
+          text = ((parsed && parsed.text) || '').trim();
+        } else if (fmt === 'zip' && admZipLib) {
+          // ZIP bundle — extract inner PDF/DOCX entries.
+          try {
+            const zip = new admZipLib(buf);
+            const entries = zip.getEntries()
+              .filter((e) => !e.isDirectory && /\.(pdf|docx?)$/i.test(e.entryName))
+              .slice(0, 4);
+            const parts = [];
+            for (const e of entries) {
+              const d = e.getData();
+              const inner = detectFormat(d);
+              if (inner === 'pdf' && pdfParseLib) {
+                const p = await pdfParseLib(d);
+                if (p && p.text) parts.push(`--- ${e.entryName.slice(-80)} ---\n${p.text.trim().slice(0, 60000)}`);
+              } else if (/\.docx$/i.test(e.entryName) && mammothLib) {
+                const o = await mammothLib.extractRawText({ buffer: d });
+                if (o && o.value) parts.push(`--- ${e.entryName.slice(-80)} ---\n${o.value.trim().slice(0, 60000)}`);
+              }
+            }
+            text = parts.join('\n\n').trim();
+          } catch (_) {}
+        } else if (/\.docx$/i.test(labelName) && mammothLib) {
+          // Magic might be 'zip' (DOCX is a ZIP container) — handled above
+          // but fallback by extension if magic says zip and filename is docx.
+          const out = await mammothLib.extractRawText({ buffer: buf });
+          text = ((out && out.value) || '').trim();
+        } else if (fmt === 'html') {
+          console.log(`    ⚠️  kommersannons: "${labelName.slice(0, 40)}" served HTML — likely auth-wall`);
+        }
+        if (text.length > 200) {
+          const clipped = text.slice(0, 80000);
+          texts.push(`--- (kommersannons) ${labelName} ---\n${clipped}`);
+          console.log(`    🇸🇪 kommersannons: parsed "${labelName.slice(0, 40)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+        } else {
+          console.log(`    ⚠️  kommersannons: "${labelName.slice(0, 40)}" extracted text too short (${text.length}ch)`);
+        }
+      } catch (e) {
+        console.log(`    ⚠️  kommersannons: parse failed for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+      }
+    }
+    return texts;
+  } catch (e) {
+    console.log(`    ⚠️  kommersannons handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
+// =====================================================================
+// fetchPlacspDocuments
+// ---------------------------------------------------------------------
+// contrataciondelestado.es (Plataforma de Contratación del Sector
+// Público — PLACSP) is Spain's national e-procurement portal. Each
+// tender lists its documents as anchors pointing at
+// /FileSystem/servlet/GetDocumentByIdServlet — the servlet streams
+// PDFs (Pliego de Cláusulas Administrativas, Pliego de Prescripciones
+// Técnicas, Anuncio de Licitación), occasionally a single ZIP
+// "Documento de Pliegos" bundling everything.
+//
+// There is ALREADY a comprehensive inline PLACSP harvest inside the
+// main fetchSourcePageDetails page.evaluate. That logic:
+//   - Detects 4 servlet URL patterns (GetDocumentByIdServlet, docAccCmpnt,
+//     GetDocumentsById, deeplink:detalle_pliego)
+//   - Reads doc type from <tr>'s tipoDocumento cell (PCAP > PPT > etc.)
+//   - Has snapshot-rescue if main eval missed
+//   - Bumps char caps to 150k/file 180k/total
+//
+// This DEDICATED handler complements the inline logic by addressing
+// THREE gaps the inline scan can't:
+//
+//   1. Hardcoded ext='pdf' — inline sets every PLACSP doc as PDF, so
+//      "Documento de Pliegos" (which is ALWAYS a ZIP bundle) fails the
+//      magic-byte check and is silently skipped. The dedicated handler
+//      detects format from magic bytes and uses adm-zip to recurse.
+//
+//   2. Main document only — inline scan misses anchors hosted inside
+//      same-origin iframes (some PLACSP portlets render the documents
+//      table inside an iframe).
+//
+//   3. No per-doc parse diagnostic — inline harvest goes through the
+//      generic prefetch loop; failures appear as "magic mismatch" with
+//      no PLACSP-specific context.
+//
+// Strategy:
+//   1. New page, Spanish locale.
+//   2. Navigate to source URL, settle.
+//   3. Strict cookie-banner dismissal (excludes "aceptar la cesión" /
+//      "aceptar términos" — those are tender-acceptance triggers).
+//   4. Scan main doc + same-origin iframes for PLACSP doc anchors.
+//   5. Score by doc type (PCAP > PPT > Pliego > Anuncio > DocPliegos
+//      > Decreto), like the inline logic.
+//   6. Fetch top 6 docs via page.evaluate fetch (carries session
+//      cookies if any).
+//   7. Determine format from magic bytes:
+//        %PDF -> pdf-parse
+//        PK\x03\x04 -> adm-zip (extract inner PDF/DOCX, recurse)
+//        D0 CF 11 E0 -> CFB (Office 97 .doc / .xls) — log + skip
+//        else -> log + skip
+//   8. Return [`--- (placsp) name ---\ntext`] array.
+// =====================================================================
+async function fetchPlacspDocuments(browser, sourceUrl) {
+  try {
+    const u = new URL(sourceUrl);
+    if (!/(^|\.)contrataciondelestado\.es$/i.test(u.hostname)) return [];
+  } catch (_) { return []; }
+
+  let pdfParseLib = null, mammothLib = null, admZipLib = null;
+  try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
+  if (!pdfParseLib && !mammothLib && !admZipLib) {
+    console.log(`    ⚠️  PLACSP: no parser libs available — skipping`);
+    return [];
+  }
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(30000);
+    page.setDefaultTimeout(30000);
+    try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
+
+    // Spanish locale — some PLACSP portlets render different markup based
+    // on Accept-Language. Also disable webdriver flag.
+    try {
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['es-ES', 'es', 'en-US', 'en'],
+        });
+      });
+      const ua = await page.browser().userAgent();
+      await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+    } catch (_) {}
+
+    try {
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (e) {
+      console.log(`    🇪🇸 PLACSP: nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // STRICT cookie-banner dismissal — only matches buttons whose text
+    // is EXACTLY "aceptar"/"aceptar todas"/"aceptar cookies"/etc. The
+    // existing main-loop cookie-accept logic skips PLACSP entirely
+    // because "aceptar la cesión" / "aceptar términos" anchors share
+    // the prefix. Here we use exact-match with word boundaries to
+    // exclude those (no "la cesión" / "términos" follow-up word).
+    try {
+      const dismissed = await page.evaluate(() => {
+        const RX_COOKIE = /^\s*(aceptar(?:\s+(?:todas|cookies))?|acepto\s+todas|de\s*acuerdo|entendido)\s*$/i;
+        const btns = Array.from(document.querySelectorAll('button, a, input[type="button"]'));
+        for (const b of btns) {
+          const t = (b.textContent || b.value || '').trim();
+          if (!t || t.length > 30) continue;
+          if (!RX_COOKIE.test(t)) continue;
+          // Avoid clicking inside the document table — only outer banner
+          // elements (typically fixed-position with high z-index).
+          try {
+            const r = b.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+          } catch (_) {}
+          try { b.click(); return `clicked:${t.slice(0, 30)}`; }
+          catch (_) {}
+        }
+        return null;
+      }).catch(() => null);
+      if (dismissed) {
+        console.log(`    🇪🇸 PLACSP: cookie banner ${dismissed}`);
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    } catch (_) {}
+
+    // Find PLACSP doc anchors in main doc + same-origin iframes.
+    const probe = await page.evaluate(() => {
+      const URL_RE = [
+        /\/FileSystem\/servlet\/GetDocumentByIdServlet/i,
+        /docAccCmpnt/i,
+        /GetDocumentsById/i,
+        /uri=deeplink:detalle_(?:pliego|anuncio)/i,
+      ];
+      const ROW_TYPE_RE = [
+        { rank: 0, name: 'PCAP',       re: /pliego\s+cl[aá]usulas\s+administrativas|cl[aá]usulas\s+administrativas\s+particulares/i },
+        { rank: 1, name: 'PPT',        re: /pliego\s+prescripciones\s+t[eé]cnicas|prescripciones\s+t[eé]cnicas\s+particulares/i },
+        { rank: 2, name: 'Pliego',     re: /\bpliego\b/i },
+        { rank: 3, name: 'Anuncio',    re: /anuncio\s+de\s+licitaci[oó]n/i },
+        { rank: 4, name: 'DocPliegos', re: /documento\s+de\s+pliegos/i },
+        { rank: 5, name: 'Decreto',    re: /decreto\s+aprobando\s+(?:el\s+)?pliego/i },
+      ];
+      const collectFromRoot = (root, sourceLabel) => {
+        const out = [];
+        const seen = new Set();
+        const anchors = Array.from(root.querySelectorAll('a[href]'));
+        for (const a of anchors) {
+          const hrefRaw = a.getAttribute('href') || '';
+          if (!hrefRaw || /^javascript:/i.test(hrefRaw) || hrefRaw === '#') continue;
+          let abs;
+          try { abs = new URL(hrefRaw, location.href).toString(); }
+          catch (_) { continue; }
+          if (seen.has(abs)) continue;
+          const urlMatch = URL_RE.some(re => re.test(abs));
+          const ownText = (a.textContent || a.getAttribute('title') || '').trim();
+          const row = a.closest('tr');
+          const rowText = row
+            ? (row.innerText || row.textContent || '').replace(/\s+/g, ' ').trim()
+            : '';
+          let chosenType = null;
+          for (const rt of ROW_TYPE_RE) {
+            if (rt.re.test(rowText) || rt.re.test(ownText)) {
+              chosenType = rt;
+              break;
+            }
+          }
+          if (!urlMatch && !chosenType) continue;
+          seen.add(abs);
+          out.push({
+            url: abs,
+            name: chosenType
+              ? `${chosenType.name}: ${(rowText || ownText).slice(0, 100)}`
+              : (ownText || `placsp-doc-${out.length + 1}`).slice(0, 120),
+            rank: chosenType ? chosenType.rank : 50,
+            type: chosenType ? chosenType.name : 'unknown',
+            source: sourceLabel,
+          });
+        }
+        return out;
+      };
+      // Main document scan.
+      const mainDocs = collectFromRoot(document, 'main');
+      // Same-origin iframe scan.
+      const iframeDocs = [];
+      const iframes = Array.from(document.querySelectorAll('iframe'));
+      for (const f of iframes) {
+        try {
+          const doc = f.contentDocument;
+          if (doc && doc.body) {
+            const ifSrc = (f.getAttribute('src') || 'no-src').slice(0, 60);
+            const found = collectFromRoot(doc, `iframe:${ifSrc}`);
+            iframeDocs.push(...found);
+          }
+        } catch (_) { /* cross-origin — skip */ }
+      }
+      // Dedupe by URL — main wins over iframe.
+      const seen = new Set(mainDocs.map((d) => d.url));
+      const merged = [
+        ...mainDocs,
+        ...iframeDocs.filter((d) => !seen.has(d.url)),
+      ];
+      merged.sort((a, b) => a.rank - b.rank);
+      return {
+        docs: merged,
+        totalIframes: iframes.length,
+        mainCount: mainDocs.length,
+        iframeCount: iframeDocs.length,
+      };
+    }).catch(() => ({ docs: [], totalIframes: 0, mainCount: 0, iframeCount: 0 }));
+
+    console.log(
+      `    🇪🇸 PLACSP: ${probe.docs.length} doc candidate(s) ` +
+      `(main=${probe.mainCount}, iframes=${probe.iframeCount}/${probe.totalIframes})`
+    );
+    if (!probe.docs.length) {
+      return [];
+    }
+    // Log priority list — first 6.
+    console.log(
+      `    🇪🇸 PLACSP priority: ` +
+      probe.docs.slice(0, 6).map((d) =>
+        `${d.type}[${d.source.startsWith('iframe') ? 'if' : 'main'}](r=${d.rank})`
+      ).join(' | ')
+    );
+
+    // Magic-byte format detection.
+    const detectFormat = (buf) => {
+      if (!buf || buf.length < 4) return 'unknown';
+      const b0 = buf[0], b1 = buf[1], b2 = buf[2], b3 = buf[3];
+      if (b0 === 0x25 && b1 === 0x50 && b2 === 0x44 && b3 === 0x46) return 'pdf';
+      if (b0 === 0x50 && b1 === 0x4B && (b2 === 0x03 || b2 === 0x05 || b2 === 0x07)) return 'zip';
+      if (b0 === 0xD0 && b1 === 0xCF && b2 === 0x11 && b3 === 0xE0) return 'cfb';
+      if (b0 === 0x7B && b1 === 0x5C && b2 === 0x72 && b3 === 0x74) return 'rtf';
+      const head = buf.slice(0, 64).toString('utf8').trim().toLowerCase();
+      if (head.startsWith('<!doctype') || head.startsWith('<html')) return 'html';
+      if (head.startsWith('<?xml') || head.startsWith('<')) return 'xml';
+      return 'unknown';
+    };
+
+    const texts = [];
+    const topDocs = probe.docs.slice(0, 6);
+    for (const doc of topDocs) {
+      const labelName = doc.name.slice(0, 100);
+      // Fetch via page.evaluate (carries session cookies).
+      const result = await page.evaluate(async (url) => {
+        try {
+          const resp = await fetch(url, { credentials: 'include', redirect: 'follow' });
+          if (!resp.ok) return { ok: false, status: resp.status };
+          const ct = resp.headers.get('content-type') || '';
+          const ab = await resp.arrayBuffer();
+          return {
+            ok: true,
+            status: resp.status,
+            ct,
+            url: resp.url || url,
+            data: Array.from(new Uint8Array(ab)),
+          };
+        } catch (e) {
+          return { ok: false, error: String(e).slice(0, 200) };
+        }
+      }, doc.url).catch((e) => ({ ok: false, error: e.message }));
+
+      if (!result || !result.ok || !result.data || result.data.length < 500) {
+        const status = result?.status || result?.error || '?';
+        console.log(`    ⚠️  PLACSP: fetch failed "${labelName.slice(0, 40)}" (status=${status})`);
+        continue;
+      }
+      const buf = Buffer.from(result.data);
+      const fmt = detectFormat(buf);
+      console.log(
+        `    🇪🇸 PLACSP: fetched "${labelName.slice(0, 40)}" ` +
+        `(${buf.length}B, magic=${fmt}, ct=${(result.ct || '').slice(0, 30)})`
+      );
+
+      try {
+        let text = '';
+        if (fmt === 'pdf' && pdfParseLib) {
+          const parsed = await pdfParseLib(buf);
+          text = ((parsed && parsed.text) || '').trim();
+        } else if (fmt === 'zip' && admZipLib) {
+          // ZIP bundle — extract inner PDF/DOCX entries and concat.
+          // Per-entry cap of 80k chars to fit ~3 files in a typical
+          // "Documento de Pliegos" bundle without blowing the AI input.
+          try {
+            const zip = new admZipLib(buf);
+            const entries = zip.getEntries()
+              .filter((e) => !e.isDirectory && /\.(pdf|docx?)$/i.test(e.entryName))
+              .slice(0, 5);
+            const parts = [];
+            for (const e of entries) {
+              const d = e.getData();
+              const inner = detectFormat(d);
+              if (inner === 'pdf' && pdfParseLib) {
+                const p = await pdfParseLib(d);
+                if (p && p.text) parts.push(`--- ${e.entryName.slice(-80)} ---\n${p.text.trim().slice(0, 80000)}`);
+              } else if (/\.docx$/i.test(e.entryName) && mammothLib) {
+                const o = await mammothLib.extractRawText({ buffer: d });
+                if (o && o.value) parts.push(`--- ${e.entryName.slice(-80)} ---\n${o.value.trim().slice(0, 80000)}`);
+              }
+            }
+            text = parts.join('\n\n').trim();
+            if (parts.length) {
+              console.log(`    🇪🇸 PLACSP: ZIP parsed ${parts.length} inner entries from "${labelName.slice(0, 40)}"`);
+            }
+          } catch (e) {
+            console.log(`    ⚠️  PLACSP: ZIP parse failed for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+          }
+        } else if (fmt === 'cfb') {
+          console.log(`    ⚠️  PLACSP: "${labelName.slice(0, 40)}" is legacy Office .doc/.xls (CFB) — no parser, skipping`);
+        } else if (fmt === 'html') {
+          console.log(`    ⚠️  PLACSP: "${labelName.slice(0, 40)}" served HTML (likely auth-wall or error page) — skipping`);
+        } else {
+          console.log(`    ⚠️  PLACSP: "${labelName.slice(0, 40)}" unknown format (magic=${fmt}) — skipping`);
+        }
+        if (text.length > 200) {
+          // Per-priority-file cap at 150k chars (PCAP bodies routinely
+          // run 50-70 pages; ANEXO 3 with the actual thresholds lives
+          // around page 50, so caps below 100k drop it).
+          const clipped = text.slice(0, 150000);
+          texts.push(`--- (placsp ${doc.type}) ${labelName} ---\n${clipped}`);
+          console.log(`    🇪🇸 PLACSP: parsed "${labelName.slice(0, 40)}" (${clipped.length}ch, rank=${doc.rank})`);
+        } else if (fmt === 'pdf' || fmt === 'zip') {
+          console.log(`    ⚠️  PLACSP: "${labelName.slice(0, 40)}" extracted text too short (${text.length}ch)`);
+        }
+      } catch (e) {
+        console.log(`    ⚠️  PLACSP: parse failed for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+      }
+    }
+    return texts;
+  } catch (e) {
+    console.log(`    ⚠️  PLACSP handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -5656,6 +6418,47 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     } catch (e) {
       console.log(`    ⚠️ e-avrop handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // kommersannons.se Documents handler — Swedish Kommers Annons /
+    // FMV platform. Post-login the notice page exposes nav tabs
+    // ("Contract documents" / "Entire tender form" / "Appendices");
+    // each leads to a documents subpage with PDF/DOCX/ZIP download
+    // anchors. Handler clicks/navigates the tabs and harvests docs.
+    // No-op for non-kommersannons sources.
+    try {
+      const kaTexts = await fetchKommersAnnonsDocuments(browser, sourceUrl);
+      if (kaTexts && kaTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + kaTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇸🇪 kommersannons: appended ${kaTexts.length} doc(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ kommersannons handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // contrataciondelestado.es (PLACSP) Documents handler — Spanish
+    // public-procurement platform. Detects PCAP / PPT / Anuncio /
+    // DocPliegos anchors (servlet URL + <tr> row text), fetches with
+    // magic-byte format detection (PDFs + ZIP bundles), and parses.
+    // Complements the inline PLACSP harvest by handling ZIP bundles
+    // (which inline ext='pdf' hardcoding misses) and iframe-hosted
+    // document tables. No-op for non-PLACSP sources.
+    try {
+      const placspTexts = await fetchPlacspDocuments(browser, sourceUrl);
+      if (placspTexts && placspTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + placspTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇪🇸 PLACSP: appended ${placspTexts.length} doc(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ PLACSP handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     srcPage.off('request', blockHandler);
