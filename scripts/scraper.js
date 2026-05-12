@@ -3407,7 +3407,47 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       console.log(`    🇫🇮 tarjouspalvelu: cookies before login — cloudia=[${cloudia.join(',')}] tarjouspalvelu=[${tp.join(',')}]`);
     } catch (_) {}
 
+    // Step 1.5: ALREADY-AUTHENTICATED detection (2026-05-15 fix).
+    // FI run revealed `TarjPalv` cookie persists across runs (SSO from
+    // a previous scraper run still valid). When that's set, the source
+    // URL renders WITHOUT login form — instead we see the authenticated
+    // supplier portal ("My profile / Log out / sales@cornercasetech.com").
+    // Detection signals:
+    //   1. `TarjPalv` cookie on tarjouspalvelu.fi domain
+    //   2. Body contains "Log out" / "Kirjaudu ulos" / our email
+    //   3. URL contains /UX/TP/ (authenticated supplier portal route)
+    // If authenticated, SKIP the entire email/login flow and proceed
+    // directly to ZIP fetch.
+    let alreadyAuthenticated = false;
+    try {
+      const allCookies = await page.cookies('https://tarjouspalvelu.fi');
+      const hasTarjPalv = allCookies.some((c) => /^TarjPalv$/i.test(c.name));
+      const authMarker = await page.evaluate((email) => {
+        const body = (document.body && document.body.innerText || '').toLowerCase();
+        const RX_LOGGED = /\b(log\s*out|kirjaudu\s*ulos|log\s*off|my\s*profile|oma\s*profiili)\b/i;
+        return {
+          url: location.href,
+          hasLoggedOut: RX_LOGGED.test(body),
+          hasOurEmail: email ? body.toLowerCase().includes(email.toLowerCase()) : false,
+        };
+      }, tpCreds.username).catch(() => null);
+      const onAuthRoute = authMarker && /\/UX\/TP\//i.test(authMarker.url || '');
+      alreadyAuthenticated = hasTarjPalv && (authMarker?.hasLoggedOut || authMarker?.hasOurEmail || onAuthRoute);
+      if (alreadyAuthenticated) {
+        console.log(
+          `    ✅ tarjouspalvelu: ALREADY authenticated (TarjPalv=${hasTarjPalv}, ` +
+          `logOutMarker=${!!authMarker?.hasLoggedOut}, emailInBody=${!!authMarker?.hasOurEmail}, ` +
+          `onAuthRoute=${onAuthRoute}) — skipping login, proceeding to ZIP fetch`
+        );
+      }
+    } catch (_) {}
+
     // Step 2: Find email input + Login button on tarjouspalvelu corner.
+    // SKIP this entire block if already authenticated.
+    if (alreadyAuthenticated) {
+      // Jump directly to ZIP fetch.
+    } else { /* keep open — closing brace before zipUrl below */ }
+    if (!alreadyAuthenticated) {
     // 2026-05-15 fix v2: prior version's strict email-keyword filter
     // missed tarjouspalvelu's email field (it doesn't have obvious
     // email/username keywords in its id/name/placeholder). New approach:
@@ -3666,6 +3706,7 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       await new Promise((r) => setTimeout(r, 1500));
       console.log(`    🇫🇮 tarjouspalvelu: re-anchored to source URL — ${page.url().slice(-80)}`);
     } catch (_) { /* best-effort */ }
+    } // close `if (!alreadyAuthenticated) {` block — login flow only runs when not already auth.
 
     // Build the ZIP URL — tenant-relative.
     const zipUrl = `https://tarjouspalvelu.fi/Zip/TarjousPyynnonLiitteet/${noticeId}`;
