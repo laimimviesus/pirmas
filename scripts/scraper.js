@@ -199,18 +199,28 @@ const ALWAYS_LOGIN_HOSTS = [
   'tendsign.com',
   'kommersannons.se',      // Swedish FMV — Kommers Annons shell
   'tarjouspalvelu.fi',     // Finnish — Cloudia-fronted (SSO via login.cloudia.net)
-  // dtvp.de — Deutsches Vergabeportal (cosinex-powered). Public notice
-  // pages on dtvp.de/Satellite/notice/<id> render metadata + tender
-  // description anonymously, but the Vergabeunterlagen (procurement
-  // documents — where qualification criteria, Eignungskriterien, etc.
-  // actually live) are gated behind the "Anmelden" wall. Without a
-  // logged-in session, document download endpoints (.../files/...)
-  // 302→Anmeldung silently and our content-type sniff lands on HTML.
-  // 2026-05-14 fix: force login so cookies authenticate subsequent
-  // document fetches. Sister hosts (vergabe.metropoleruhr.de,
-  // vergabe.rlp.de, service.bund.de, etc.) run the same cosinex stack
-  // but have separate credentials — added per-host as needed.
-  'dtvp.de',
+  // dtvp.de — REMOVED 2026-05-14 (briefly added then reverted same day).
+  //
+  // The Germany run revealed two facts that make forced-login a NET
+  // NEGATIVE for dtvp.de:
+  //
+  // 1. The bulk-documents ZIP ("Alle Dokumente als ZIP-Datei
+  //    herunterladen") is anonymously downloadable on most dtvp.de
+  //    notice pages — the existing source-prefetch flow grabs it
+  //    without auth (proven on tender CXS0YYEYTPNPSNPC: 9 MB ZIP →
+  //    30 000 ch text → AI extracted Eignungskriterien correctly).
+  //
+  // 2. The id.dtvp.de Keycloak login form's submit currently fails
+  //    ("login submission did not clear password field"). The fail
+  //    path triggers a POST-LOGIN source re-fetch that OVERWRITES the
+  //    sourceFilesText we already collected, wiping out the 30 000 ch
+  //    of ZIP content. Net result: less context for the AI.
+  //
+  // Until either the anonymous ZIP fails (proven failing case) OR the
+  // Keycloak login is debugged + merged (instead of overwrite), keep
+  // dtvp.de out of ALWAYS_LOGIN_HOSTS. The /Satellite/notice/<id>/documents
+  // URL renders the body with the bulk ZIP link anonymously — that's
+  // the path that already works.
 ];
 function hostRequiresLogin(host) {
   if (!host) return false;
@@ -3574,80 +3584,84 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
           try { return new URL(href, location.href).toString(); }
           catch (_) {}
         }
-        // Fallback — Flow C (Goto=Docs anchor on public anonymous view).
-        // Per user-confirmed DOM 2026-05-14:
-        //   <a class="topmenulinknormal"
-        //      href="../doc.aspx?UniqueId=&MeFormsNoticeId=91377&ID=&Goto=Docs">
-        //     Dokument
-        //   </a>
-        // No BuyerProjectID present; the value gets assigned server-side
-        // once the request hits doc.aspx with auth cookies.
-        for (const a of anchors) {
-          const href = a.getAttribute('href') || '';
-          if (!/doc\.aspx/i.test(href)) continue;
-          if (!/[?&]Goto=Docs\b/i.test(href)) continue;
-          try { return new URL(href, location.href).toString(); }
-          catch (_) {}
-        }
         return null;
       }).catch(() => null);
 
-      if (docsTabUrl) {
-        const flowLabel = /Goto=Docs/i.test(docsTabUrl) ? 'C (Goto=Docs)'
-          : /s_view_advertfiles/i.test(docsTabUrl) ? 'B'
-          : 'A';
-        console.log(`    🇸🇪 tendsign: Documents tab (Flow ${flowLabel}) → ${docsTabUrl.slice(0, 110)}`);
+      // v5 — when Flow A/B with BuyerProjectID is NOT in the public
+      // view, the page only exposes a Flow C anchor
+      // (../doc.aspx?MeFormsNoticeId=X&Goto=Docs). Empirically (SE run
+      // 2026-05-14, tenders 91538/91424/91377), navigating to that
+      // Goto=Docs URL hits a login wall — apparently the buyer-side
+      // session uses a different cookie scope than what login.aspx
+      // sets when invoked from /public/. Sidestep this by navigating
+      // to the bare doc.aspx?MeFormsNoticeId=<id> URL (NO Goto param);
+      // with auth cookies present, tendsign renders the BUYER view of
+      // the tender, which exposes Flow A or B anchors with proper
+      // BuyerProjectID. Then we follow that anchor as usual.
+      let resolvedDocsTabUrl = docsTabUrl;
+      if (!resolvedDocsTabUrl) {
+        // Extract MeFormsNoticeId from current URL (already on public
+        // view) and probe doc.aspx without Goto.
+        let noticeIdProbe = null;
         try {
-          await page.goto(docsTabUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          const cur = new URL(page.url());
+          noticeIdProbe = cur.searchParams.get('MeFormsNoticeId') || cur.searchParams.get('UnikID');
+        } catch (_) {}
+        if (noticeIdProbe && /^\d+$/.test(noticeIdProbe)) {
+          const buyerProbeUrl = `https://tendsign.com/doc.aspx?MeFormsNoticeId=${noticeIdProbe}`;
+          console.log(`    🇸🇪 tendsign: no Flow A/B with BuyerProjectID on public view — probing buyer-view ${buyerProbeUrl}`);
+          try {
+            await page.goto(buyerProbeUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+            try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
+            await new Promise((r) => setTimeout(r, 1200));
+          } catch (e) {
+            console.log(`    ⚠️  tendsign: buyer-view nav failed: ${(e.message || '').slice(0, 80)}`);
+          }
+          // Did we land on a login form? If so, cookies didn't carry —
+          // bail; the Flow C path below would just hit the same wall.
+          const buyerStillLogin = await page.evaluate(() => {
+            const pathOk = /\/doc\.aspx/i.test(location.pathname);
+            const passField = !!document.querySelector(
+              'input[type="password"]:not([disabled]):not([aria-hidden="true"])'
+            );
+            return { onDocAspx: pathOk, hasPasswordField: passField, url: location.href };
+          }).catch(() => ({ onDocAspx: false, hasPasswordField: false, url: '' }));
+          if (buyerStillLogin.hasPasswordField || /\/login\.aspx/i.test(buyerStillLogin.url || '')) {
+            console.log(`    ⚠️  tendsign: buyer-view probe also hit login wall (url=${(buyerStillLogin.url || '').slice(-60)}) — auth cookies aren't accepted by buyer-view`);
+          } else {
+            // Re-scan for Flow A/B anchors on the buyer view.
+            resolvedDocsTabUrl = await page.evaluate(() => {
+              const anchors = Array.from(document.querySelectorAll('a[href]'));
+              for (const a of anchors) {
+                const href = a.getAttribute('href') || '';
+                if (!/(?:p_documents|s_view_advertfiles)\.aspx/i.test(href)) continue;
+                if (!/BuyerProjectID=/i.test(href)) continue;
+                try { return new URL(href, location.href).toString(); }
+                catch (_) {}
+              }
+              return null;
+            }).catch(() => null);
+            if (resolvedDocsTabUrl) {
+              console.log(`    🇸🇪 tendsign: buyer-view resolved → Flow A/B URL with BuyerProjectID`);
+            } else {
+              console.log(`    ⚠️  tendsign: buyer-view rendered but no Flow A/B anchor found`);
+            }
+          }
+        }
+      }
+      // Re-bind for the navigation block below.
+      const finalDocsTabUrl = resolvedDocsTabUrl;
+
+      if (finalDocsTabUrl) {
+        const flowLabel = /s_view_advertfiles/i.test(finalDocsTabUrl) ? 'B' : 'A';
+        console.log(`    🇸🇪 tendsign: Documents tab (Flow ${flowLabel}) → ${finalDocsTabUrl.slice(0, 110)}`);
+        try {
+          await page.goto(finalDocsTabUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
           try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
           await new Promise((r) => setTimeout(r, 1200));
         } catch (e) {
           console.log(`    ⚠️  tendsign: Documents tab nav failed: ${(e.message || '').slice(0, 80)}`);
         }
-        // Flow C continuation — after navigating to doc.aspx?...&Goto=Docs
-        // with auth cookies, tendsign redirects to either Flow A's
-        // p_documents.aspx or Flow B's s_view_advertfiles.aspx. If we
-        // ended up on a page that STILL has a password field (login
-        // wall — cookies missing or session expired), bail with a clear
-        // log so we know the login didn't propagate. Otherwise look
-        // for a downstream Flow A/B anchor and chain into it. The
-        // doc.aspx redirect may also land us on a buyer-specific page
-        // with file anchors directly — STEP 2 (anchor scan) handles
-        // that automatically.
-        try {
-          const postNavUrl = new URL(page.url()).pathname;
-          if (/Goto=Docs/i.test(docsTabUrl) && /doc\.aspx/i.test(postNavUrl)) {
-            const stillOnDocAspx = /\/doc\.aspx/i.test(postNavUrl);
-            const passField = await page.evaluate(() => !!document.querySelector(
-              'input[type="password"]:not([disabled]):not([aria-hidden="true"])'
-            )).catch(() => false);
-            if (stillOnDocAspx && passField) {
-              console.log(`    ⚠️  tendsign Flow C: still on doc.aspx with password field → login cookies didn't propagate`);
-            } else if (stillOnDocAspx) {
-              // Look for chained Flow A/B anchor on the doc.aspx page.
-              const chainedUrl = await page.evaluate(() => {
-                const anchors = Array.from(document.querySelectorAll('a[href]'));
-                for (const a of anchors) {
-                  const href = a.getAttribute('href') || '';
-                  if (!/(?:p_documents|s_view_advertfiles)\.aspx/i.test(href)) continue;
-                  try { return new URL(href, location.href).toString(); }
-                  catch (_) {}
-                }
-                return null;
-              }).catch(() => null);
-              if (chainedUrl) {
-                console.log(`    🇸🇪 tendsign Flow C → chained → ${chainedUrl.slice(0, 100)}`);
-                try {
-                  await page.goto(chainedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-                  try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
-                  await new Promise((r) => setTimeout(r, 1200));
-                } catch (e) {
-                  console.log(`    ⚠️  tendsign Flow C chained nav failed: ${(e.message || '').slice(0, 80)}`);
-                }
-              }
-            }
-          }
-        } catch (_) {}
 
         // Flow B continuation — if we're on s_view_advertfiles.aspx
         // (NOT in /supplier/ yet), look for the "Next step" button.
@@ -4103,7 +4117,88 @@ async function fetchEavropDocuments(browser, sourceUrl) {
     try {
       await page.waitForSelector('#mainContent_createZip', { timeout: 10000 });
       createZipFound = true;
-    } catch (_) { /* will diagnose below */ }
+    } catch (_) { /* will look in iframe / SubscribeBtn fallback */ }
+
+    if (!createZipFound) {
+      // v2 — fallback A: navigate to the supplier-side procurement
+      // view. 2026-05-14 SE run revealed e-avrop's Announcement.aspx
+      // page wraps the actual tender body INSIDE a same-origin iframe
+      // pointing to /<tenant>/e-Upphandling/leverantor/annons/procurement.aspx?id=X&ownerid=Y
+      // (leverantor = Swedish for "supplier"). That iframe URL is the
+      // supplier view of the procurement — its DOM contains the
+      // Documents section and #mainContent_createZip. Navigating the
+      // main page to that URL (auth cookies already set on
+      // e-avrop.com via attemptPortalLogin) lands us directly on the
+      // documents view, where we can fire __doPostBack reliably.
+      const iframeUrl = await page.evaluate(() => {
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        for (const f of iframes) {
+          const src = f.getAttribute('src') || '';
+          if (!src) continue;
+          // Match the supplier-side procurement.aspx path. The exact
+          // tenant prefix varies (RegionHalland, linkoping, karolinska,
+          // vob, etc.), so we match by suffix.
+          if (/\/leverantor\/annons\/procurement\.aspx\?/i.test(src)) {
+            try { return new URL(src, location.href).toString(); }
+            catch (_) {}
+          }
+        }
+        return null;
+      }).catch(() => null);
+      if (iframeUrl) {
+        console.log(`    🇸🇪 e-avrop: createZip not in main doc → navigating to supplier iframe URL ${iframeUrl.slice(0, 110)}`);
+        try {
+          await page.goto(iframeUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+          try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
+          await new Promise((r) => setTimeout(r, 1500));
+        } catch (e) {
+          console.log(`    ⚠️  e-avrop: iframe URL nav failed: ${(e.message || '').slice(0, 80)}`);
+        }
+        try {
+          await page.waitForSelector('#mainContent_createZip', { timeout: 8000 });
+          createZipFound = true;
+        } catch (_) { /* still missing — fall through to SubscribeBtn */ }
+      }
+    }
+
+    if (!createZipFound) {
+      // v2 — fallback B: some tenders gate the Documents section
+      // behind clicking the "Download and Subscribe" button
+      // (#navigationContent_SubscribeBtn — an ASP.NET __doPostBack
+      // anchor). Clicking it registers the user as an interested
+      // supplier AND re-renders the page with the Documents section
+      // visible (including createZip). This IS invasive — adds us as
+      // a tracked bidder on each tender — but it's the only way to
+      // reach documents on tenders that haven't been pre-subscribed.
+      const hasSubscribeBtn = await page.evaluate(() => {
+        return !!document.querySelector('#navigationContent_SubscribeBtn');
+      }).catch(() => false);
+      if (hasSubscribeBtn) {
+        console.log(`    🇸🇪 e-avrop: createZip still not found — firing SubscribeBtn __doPostBack as fallback`);
+        const fired = await page.evaluate(() => {
+          try {
+            if (typeof __doPostBack === 'function') {
+              // eslint-disable-next-line no-undef
+              __doPostBack('ctl00$navigationContent$SubscribeBtn', '');
+              return 'postback';
+            }
+            const el = document.querySelector('#navigationContent_SubscribeBtn');
+            if (!el) return 'no-element';
+            el.click();
+            return 'click';
+          } catch (e) {
+            return 'error:' + String(e).slice(0, 60);
+          }
+        }).catch(() => 'evaluate-error');
+        console.log(`    🇸🇪 e-avrop: SubscribeBtn trigger result = ${fired}`);
+        try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+        await new Promise((r) => setTimeout(r, 1500));
+        try {
+          await page.waitForSelector('#mainContent_createZip', { timeout: 8000 });
+          createZipFound = true;
+        } catch (_) { /* still missing — bail */ }
+      }
+    }
 
     if (!createZipFound) {
       // Diagnostic — log whether the Documents section exists at all,
@@ -4127,7 +4222,7 @@ async function fetchEavropDocuments(browser, sourceUrl) {
           anchors,
         };
       }).catch(() => null);
-      console.log(`    ⚠️  e-avrop: #mainContent_createZip not found — ${JSON.stringify(diag).slice(0, 300)}`);
+      console.log(`    ⚠️  e-avrop: #mainContent_createZip not found (after iframe + SubscribeBtn fallbacks) — ${JSON.stringify(diag).slice(0, 300)}`);
       return [];
     }
 
