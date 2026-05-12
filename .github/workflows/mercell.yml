@@ -61,4 +61,12 @@ jobs:
           TEST_MODE: ${{ inputs.test_mode || 'false' }}
           # NEW — country filter for targeted PLACSP debugging
           COUNTRY_FILTER: ${{ inputs.country_filter || '' }}
-        run: node scripts/scraper.js
+        run: node scripts/scraper.js 2>&1 | tee scraper-output.log
+
+      - name: Save scraper log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-log-${{ github.run_number }}
+          path: scraper-output.log
+          retention-days: 7
