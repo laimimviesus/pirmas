@@ -3407,43 +3407,88 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       console.log(`    🇫🇮 tarjouspalvelu: cookies before login — cloudia=[${cloudia.join(',')}] tarjouspalvelu=[${tp.join(',')}]`);
     } catch (_) {}
 
-    // Step 2: Find the email input + Login button in tarjouspalvelu corner.
+    // Step 2: Find email input + Login button on tarjouspalvelu corner.
+    // 2026-05-15 fix v2: prior version's strict email-keyword filter
+    // missed tarjouspalvelu's email field (it doesn't have obvious
+    // email/username keywords in its id/name/placeholder). New approach:
+    // BROADER input search + diagnostic dump showing all visible inputs
+    // if no match. Strategy: find a visible button/link with "Kirjaudu"/
+    // "Login" text first, then pick the nearest visible input above it.
     const emailFieldFilled = await page.evaluate((email) => {
-      // Tarjouspalvelu's top-right login form: typically an
-      // <input type="email"> or <input name="email"> + a submit/button
-      // labelled "Kirjaudu" / "Login" / "Kirjaudu sisään".
-      const inputs = Array.from(document.querySelectorAll(
-        'input[type="email"]:not([disabled]), ' +
-        'input[name*="email" i]:not([disabled]), ' +
-        'input[id*="email" i]:not([disabled]), ' +
-        'input[name*="username" i]:not([disabled]), ' +
-        'input[id*="username" i]:not([disabled]), ' +
-        'input[type="text"]:not([disabled])'
-      ));
-      // Find first VISIBLE input that looks like an email/username field.
-      const visEmail = inputs.find((el) => {
-        if (el.offsetParent === null) return false;
+      const RX_LOGIN_BTN = /^\s*(kirjaudu(?:\s*sis[äa][äa]n)?|log[\s-]?in|sign[\s-]?in)\s*$/i;
+      const RX_EMAIL_HINT = /email|username|user|käyttäjä|sähköposti|tunnus/i;
+      const RX_REJECT_HINT = /search|haku|sökning|zip|postnumero|phone|puhelin|address|osoite|cookie/i;
+      // Diagnostic snapshot — all visible inputs.
+      const allInputs = Array.from(document.querySelectorAll('input:not([disabled]):not([type="hidden"])'));
+      const visibleInputs = allInputs.filter((el) => el.offsetParent !== null);
+      const sample = visibleInputs.slice(0, 8).map((el) => ({
+        type: el.type || '',
+        id: el.id || '',
+        name: el.name || '',
+        placeholder: el.placeholder || '',
+        aria: el.getAttribute('aria-label') || '',
+      }));
+      // Strategy 1: input with email/username keyword hint.
+      let target = visibleInputs.find((el) => {
+        if (el.type === 'password') return false;
         const blob = ((el.id || '') + ' ' + (el.name || '') + ' ' + (el.placeholder || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
-        // Reject obvious non-email inputs (search/zip/etc).
-        if (/search|haku|sökning|zip|postnumero|phone|puhelin|address|osoite/.test(blob)) return false;
-        return /email|username|user|käyttäjä|sähköposti/.test(blob) || el.type === 'email';
+        if (RX_REJECT_HINT.test(blob)) return false;
+        return RX_EMAIL_HINT.test(blob) || el.type === 'email';
       });
-      if (!visEmail) return { ok: false, reason: 'no-email-field' };
+      // Strategy 2: find a button with login text, then look for an input
+      // immediately above/before it in DOM order.
+      if (!target) {
+        const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a'));
+        const loginBtn = buttons.find((b) => {
+          if (b.offsetParent === null) return false;
+          const t = (b.innerText || b.value || b.textContent || '').trim();
+          return t.length > 0 && t.length <= 30 && RX_LOGIN_BTN.test(t);
+        });
+        if (loginBtn) {
+          // Find input that's a sibling/cousin of loginBtn — same form
+          // OR within 4 ancestors up. We pick the FIRST text-style input
+          // (not password, not hidden, not search).
+          let container = loginBtn.closest('form') || loginBtn.parentElement;
+          for (let i = 0; i < 4 && container; i++) {
+            const candidates = Array.from(container.querySelectorAll('input:not([disabled]):not([type="hidden"])'));
+            const pick = candidates.find((el) => {
+              if (el.type === 'password') return false;
+              if (el.offsetParent === null) return false;
+              const blob = ((el.id || '') + ' ' + (el.name || '') + ' ' + (el.placeholder || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+              if (RX_REJECT_HINT.test(blob)) return false;
+              return true;
+            });
+            if (pick) { target = pick; break; }
+            container = container.parentElement;
+          }
+        }
+      }
+      if (!target) {
+        return { ok: false, reason: 'no-email-field', sample, totalInputs: allInputs.length, visibleInputs: visibleInputs.length };
+      }
       try {
-        visEmail.focus();
-        visEmail.value = email;
-        visEmail.dispatchEvent(new Event('input', { bubbles: true }));
-        visEmail.dispatchEvent(new Event('change', { bubbles: true }));
-        return { ok: true, sel: '#' + visEmail.id || visEmail.name };
+        target.focus();
+        target.value = email;
+        target.dispatchEvent(new Event('input', { bubbles: true }));
+        target.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, sel: target.id ? '#' + target.id : (target.name || target.type || 'input'), placeholder: target.placeholder || '' };
       } catch (e) {
         return { ok: false, reason: 'fill-error: ' + String(e).slice(0, 60) };
       }
     }, tpCreds.username).catch(() => ({ ok: false, reason: 'evaluate-error' }));
     if (!emailFieldFilled.ok) {
-      console.log(`    ⚠️  tarjouspalvelu: email input not found (${emailFieldFilled.reason}) — bailing`);
-      return [];
+      console.log(
+        `    ⚠️  tarjouspalvelu: email input not found (${emailFieldFilled.reason}) — ` +
+        `${emailFieldFilled.visibleInputs || 0}/${emailFieldFilled.totalInputs || 0} visible inputs. ` +
+        `Sample: ${JSON.stringify((emailFieldFilled.sample || []).slice(0, 5))}`
+      );
+      // 2026-05-15 fix v3: even without email pre-fill, try clicking the
+      // Login button. Maybe the click navigates to cloudia.net where we
+      // can fill BOTH email and password fields. Don't bail entirely.
+      console.log(`    🇫🇮 tarjouspalvelu: attempting Login click WITHOUT email pre-fill (will fill on Cloudia page)`);
+    } else {
+      console.log(`    🇫🇮 tarjouspalvelu: email filled (${emailFieldFilled.sel}, placeholder="${emailFieldFilled.placeholder}") — clicking Login`);
     }
-    console.log(`    🇫🇮 tarjouspalvelu: email filled (${emailFieldFilled.sel}) — clicking Login`);
 
     // Step 3: Click Login button. Could be a submit input/button,
     // or a link. Look for one near the email field with "Kirjaudu/Login" text.
@@ -3467,19 +3512,53 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       console.log(`    ⚠️  tarjouspalvelu: Login button not found — bailing`);
       return [];
     }
-    console.log(`    🇫🇮 tarjouspalvelu: Login clicked ("${loginClicked.text}") — waiting for Cloudia password page`);
+    console.log(`    🇫🇮 tarjouspalvelu: Login clicked ("${loginClicked.text}") — waiting for Cloudia page`);
 
-    // Step 4: Wait for navigation to login.cloudia.net password page.
+    // Step 4: Wait for navigation to login.cloudia.net page.
     try {
       await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 25000 });
     } catch (_) {}
     try { await page.waitForNetworkIdle({ idleTime: 800, timeout: 8000 }); } catch (_) {}
     await new Promise((r) => setTimeout(r, 1200));
 
-    // Step 5: Fill password on cloudia.net and submit.
-    const passFilled = await page.evaluate((password) => {
+    // Step 5: On Cloudia, fill email (if not pre-filled) + password, then submit.
+    const passFilled = await page.evaluate((email, password) => {
       const pass = document.querySelector('input[type="password"]:not([disabled])');
-      if (!pass || pass.offsetParent === null) return { ok: false, reason: 'no-password-field', url: location.href };
+      if (!pass || pass.offsetParent === null) {
+        // Maybe we landed on Cloudia's email-first page (asks for email
+        // before showing password field). Try filling email if present.
+        const emailInp = document.querySelector(
+          'input[type="email"]:not([disabled]), ' +
+          'input[name*="email" i]:not([disabled]), ' +
+          'input[id*="email" i]:not([disabled]), ' +
+          'input[name*="username" i]:not([disabled])'
+        );
+        if (emailInp && emailInp.offsetParent !== null) {
+          try {
+            emailInp.focus();
+            emailInp.value = email;
+            emailInp.dispatchEvent(new Event('input', { bubbles: true }));
+            emailInp.dispatchEvent(new Event('change', { bubbles: true }));
+            return { ok: false, reason: 'no-password-yet-email-filled', url: location.href };
+          } catch (_) {}
+        }
+        return { ok: false, reason: 'no-password-field', url: location.href };
+      }
+      // Also fill email field on cloudia.net if it's empty (sometimes
+      // username param wasn't carried via URL).
+      try {
+        const emailInp = document.querySelector(
+          'input[type="email"]:not([disabled]), ' +
+          'input[name*="email" i]:not([disabled]), ' +
+          'input[name*="username" i]:not([disabled])'
+        );
+        if (emailInp && emailInp.offsetParent !== null && !emailInp.value) {
+          emailInp.focus();
+          emailInp.value = email;
+          emailInp.dispatchEvent(new Event('input', { bubbles: true }));
+          emailInp.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      } catch (_) {}
       try {
         pass.focus();
         pass.value = password;
@@ -3489,7 +3568,7 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       } catch (e) {
         return { ok: false, reason: 'fill-error: ' + String(e).slice(0, 50), url: location.href };
       }
-    }, tpCreds.password).catch(() => ({ ok: false, reason: 'evaluate-error' }));
+    }, tpCreds.username, tpCreds.password).catch(() => ({ ok: false, reason: 'evaluate-error' }));
     if (!passFilled.ok) {
       console.log(`    ⚠️  tarjouspalvelu: password field not found on ${(passFilled.url || '').slice(-60)} (${passFilled.reason}) — bailing`);
       return [];
@@ -4398,28 +4477,68 @@ async function fetchEavropDocuments(browser, sourceUrl) {
     } catch (_) { /* will look in iframe / SubscribeBtn fallback */ }
 
     if (!createZipFound) {
-      // v2 — fallback A: navigate to the supplier-side procurement
-      // view. 2026-05-14 SE run revealed e-avrop's Announcement.aspx
-      // page wraps the actual tender body INSIDE a same-origin iframe
-      // pointing to /<tenant>/e-Upphandling/leverantor/annons/procurement.aspx?id=X&ownerid=Y
-      // (leverantor = Swedish for "supplier"). That iframe URL is the
-      // supplier view of the procurement — its DOM contains the
-      // Documents section and #mainContent_createZip. Navigating the
-      // main page to that URL (auth cookies already set on
-      // e-avrop.com via attemptPortalLogin) lands us directly on the
-      // documents view, where we can fire __doPostBack reliably.
+      // 2026-05-15 fix v3: SubscribeBtn FIRST (on Announcement.aspx
+      // main page where it exists), THEN iframe URL navigation.
+      // Earlier v2 order navigated to iframe URL FIRST and looked for
+      // SubscribeBtn AFTER — but SubscribeBtn lives on Announcement.aspx,
+      // not on the supplier iframe URL, so the click never happened.
+      // SE run 2026-05-15 confirmed: iframe URL has "Documents" section
+      // but #mainContent_createZip anchor is missing until user is
+      // registered as interested supplier (via SubscribeBtn click on
+      // main page).
+      //
+      // Fallback A: click SubscribeBtn on Announcement.aspx (registers
+      // user as interested supplier — invasive but unblocks docs).
+      const hasSubscribeBtn = await page.evaluate(() => {
+        return !!document.querySelector('#navigationContent_SubscribeBtn');
+      }).catch(() => false);
+      if (hasSubscribeBtn) {
+        console.log(`    🇸🇪 e-avrop: createZip not found on main → firing SubscribeBtn (registers user as interested supplier)`);
+        let fired = 'no-attempt';
+        try {
+          await page.click('#navigationContent_SubscribeBtn');
+          fired = 'page.click';
+        } catch (_) {
+          try {
+            fired = await page.evaluate(() => {
+              const el = document.querySelector('#navigationContent_SubscribeBtn');
+              if (!el) return 'no-element';
+              const href = el.getAttribute('href') || '';
+              const m = /^\s*javascript:\s*(.*)$/i.exec(href);
+              if (m && m[1]) {
+                try { (0, eval)(m[1]); return 'eval-href'; }
+                catch (e) { return 'eval-error:' + String(e).slice(0, 40); }
+              }
+              return 'no-href';
+            }).catch((e) => 'evaluate-error:' + (e.message || '').slice(0, 40));
+          } catch (e) { fired = 'click-error:' + (e.message || '').slice(0, 40); }
+        }
+        console.log(`    🇸🇪 e-avrop: SubscribeBtn trigger = ${fired}`);
+        try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+        await new Promise((r) => setTimeout(r, 2000));
+        // Check createZip on main page after SubscribeBtn — postback
+        // may have re-rendered with createZip now visible.
+        try {
+          await page.waitForSelector('#mainContent_createZip', { timeout: 5000 });
+          createZipFound = true;
+          console.log(`    🇸🇪 e-avrop: createZip now visible on main page after SubscribeBtn`);
+        } catch (_) { /* may need iframe URL nav next */ }
+      }
+    }
+
+    if (!createZipFound) {
+      // Fallback B: navigate to the supplier-side procurement view.
+      // After SubscribeBtn click (above), user is registered as
+      // interested supplier and the supplier-side iframe URL
+      // (/<tenant>/e-Upphandling/leverantor/annons/procurement.aspx?id=X&ownerid=Y)
+      // should now expose #mainContent_createZip. We navigate there
+      // because some tenders only show createZip on the supplier
+      // iframe page (not on Announcement.aspx).
       const iframeUrl = await page.evaluate(() => {
         const iframes = Array.from(document.querySelectorAll('iframe'));
         for (const f of iframes) {
           const src = f.getAttribute('src') || '';
           if (!src) continue;
-          // Match the supplier-side procurement.aspx path. The exact
-          // tenant prefix varies (RegionHalland, linkoping, karolinska,
-          // vob, etc.), so we match by suffix.
-          // 2026-05-14 fix v2: iframe src is RELATIVE
-          // ("leverantor/annons/procurement.aspx?...") with NO leading
-          // slash — the previous regex required a leading slash and
-          // therefore never matched. Drop the leading-slash anchor.
           if (/leverantor\/annons\/procurement\.aspx\?/i.test(src)) {
             try { return new URL(src, location.href).toString(); }
             catch (_) {}
@@ -4428,7 +4547,7 @@ async function fetchEavropDocuments(browser, sourceUrl) {
         return null;
       }).catch(() => null);
       if (iframeUrl) {
-        console.log(`    🇸🇪 e-avrop: createZip not in main doc → navigating to supplier iframe URL ${iframeUrl.slice(0, 110)}`);
+        console.log(`    🇸🇪 e-avrop: trying supplier iframe URL after SubscribeBtn → ${iframeUrl.slice(0, 110)}`);
         try {
           await page.goto(iframeUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
           try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
@@ -4439,68 +4558,7 @@ async function fetchEavropDocuments(browser, sourceUrl) {
         try {
           await page.waitForSelector('#mainContent_createZip', { timeout: 8000 });
           createZipFound = true;
-        } catch (_) { /* still missing — fall through to SubscribeBtn */ }
-      }
-    }
-
-    if (!createZipFound) {
-      // v2 — fallback B: some tenders gate the Documents section
-      // behind clicking the "Download and Subscribe" button
-      // (#navigationContent_SubscribeBtn — an ASP.NET __doPostBack
-      // anchor). Clicking it registers the user as an interested
-      // supplier AND re-renders the page with the Documents section
-      // visible (including createZip). This IS invasive — adds us as
-      // a tracked bidder on each tender — but it's the only way to
-      // reach documents on tenders that haven't been pre-subscribed.
-      const hasSubscribeBtn = await page.evaluate(() => {
-        return !!document.querySelector('#navigationContent_SubscribeBtn');
-      }).catch(() => false);
-      if (hasSubscribeBtn) {
-        console.log(`    🇸🇪 e-avrop: createZip still not found — firing SubscribeBtn __doPostBack as fallback`);
-        // 2026-05-14 fix v2: the earlier `typeof __doPostBack === 'function'`
-        // check inside page.evaluate triggered a strict-mode TypeError
-        // ("'caller', 'callee', 'arguments' properties may not be accessed").
-        // Antirio's __doPostBack implementation introspects `arguments.callee`
-        // and breaks under V8's strict-mode evaluation context. Solution:
-        // skip the typeof check entirely. Two safer paths:
-        //   1. Use `page.click(selector)` — Puppeteer's click navigates the
-        //      page's own document, which is non-strict; the anchor's
-        //      href="javascript:__doPostBack(...)" runs in page scope.
-        //   2. As a backup, run the javascript: payload via indirect eval
-        //      `(0, eval)(payload)` which executes in global non-strict
-        //      scope.
-        let fired = 'no-attempt';
-        try {
-          await page.click('#navigationContent_SubscribeBtn');
-          fired = 'page.click';
-        } catch (_) {
-          // Fallback: indirect eval of the href's javascript: payload.
-          try {
-            fired = await page.evaluate(() => {
-              const el = document.querySelector('#navigationContent_SubscribeBtn');
-              if (!el) return 'no-element';
-              const href = el.getAttribute('href') || '';
-              const m = /^\s*javascript:\s*(.*)$/i.exec(href);
-              if (m && m[1]) {
-                try {
-                  // Indirect eval — runs in global scope, non-strict by
-                  // default, bypasses arguments.callee restriction.
-                  (0, eval)(m[1]);
-                  return 'eval-href';
-                } catch (e) {
-                  return 'eval-error:' + String(e).slice(0, 50);
-                }
-              }
-              return 'no-href';
-            }).catch((e) => 'evaluate-error:' + (e.message || '').slice(0, 50));
-          } catch (e) { fired = 'click-error:' + (e.message || '').slice(0, 50); }
-        }
-        console.log(`    🇸🇪 e-avrop: SubscribeBtn trigger result = ${fired}`);
-        try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
-        await new Promise((r) => setTimeout(r, 1500));
-        try {
-          await page.waitForSelector('#mainContent_createZip', { timeout: 8000 });
-          createZipFound = true;
+          console.log(`    🇸🇪 e-avrop: createZip visible on supplier iframe URL`);
         } catch (_) { /* still missing — bail */ }
       }
     }
