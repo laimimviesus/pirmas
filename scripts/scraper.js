@@ -3703,7 +3703,111 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
             return { onDocAspx: pathOk, hasPasswordField: passField, url: location.href };
           }).catch(() => ({ onDocAspx: false, hasPasswordField: false, url: '' }));
           if (buyerStillLogin.hasPasswordField || /\/login\.aspx/i.test(buyerStillLogin.url || '')) {
-            console.log(`    ⚠️  tendsign: buyer-view probe also hit login wall (url=${(buyerStillLogin.url || '').slice(-60)}) — auth cookies aren't accepted by buyer-view`);
+            // 2026-05-15 fix: tendsign's session is bound to the URL
+            // navigation referrer — auth cookies from attemptPortalLogin
+            // (set in a separate page context) DON'T carry into doc.aspx
+            // fresh navigation. User-confirmed flow that DOES work in a
+            // real browser:
+            //   1. Visit doc.aspx?MeFormsNoticeId=X
+            //   2. Tendsign 302s to login.aspx?URL=s_meformsnotice.aspx?MeFormsNoticeId=X
+            //   3. Fill credentials INLINE in same tab + submit
+            //   4. Tendsign creates session tied to THIS tender's URL
+            //   5. Lands on buyer view with Documents tab visible
+            // So we need to submit credentials in THIS page (not give up).
+            console.log(`    🇸🇪 tendsign: buyer-view probe hit login wall — attempting INLINE login to establish tender-bound session`);
+            const tsCreds = getPortalCreds('tendsign.com');
+            if (!tsCreds || !tsCreds.username || !tsCreds.password) {
+              console.log(`    ⚠️  tendsign: no credentials for inline login — bailing`);
+            } else {
+              // Find username + password fields on the login page.
+              const sels = await page.evaluate(() => {
+                const findVis = (selectors) => {
+                  for (const sel of selectors) {
+                    try {
+                      const el = document.querySelector(sel);
+                      if (el && el.offsetParent !== null) return sel;
+                    } catch (_) {}
+                  }
+                  return null;
+                };
+                return {
+                  userSel: findVis([
+                    'input[type="email"]:not([disabled])',
+                    'input[name="email" i]:not([disabled])',
+                    'input[id*="username" i]:not([disabled])',
+                    'input[id*="user" i]:not([disabled])',
+                    'input[name*="user" i]:not([disabled])',
+                    'input[type="text"]:not([disabled])',
+                  ]),
+                  passSel: findVis(['input[type="password"]:not([disabled])']),
+                };
+              }).catch(() => ({ userSel: null, passSel: null }));
+              if (!sels.passSel) {
+                console.log(`    ⚠️  tendsign: inline login — password field not found, bailing`);
+              } else {
+                try {
+                  if (sels.userSel) {
+                    await page.click(sels.userSel, { clickCount: 3 }).catch(() => null);
+                    await page.type(sels.userSel, String(tsCreds.username), { delay: 20 });
+                  }
+                  await page.click(sels.passSel, { clickCount: 3 }).catch(() => null);
+                  await page.type(sels.passSel, String(tsCreds.password), { delay: 20 });
+                  // Find and submit. Tendsign's login form has
+                  // UcomLogin_btn_Submit per earlier successful login.
+                  let submitFired = false;
+                  try {
+                    await page.click('#UcomLogin_btn_Submit');
+                    submitFired = true;
+                  } catch (_) {
+                    try {
+                      await page.click('input[type="submit"]');
+                      submitFired = true;
+                    } catch (_) {
+                      try { await page.keyboard.press('Enter'); submitFired = true; }
+                      catch (_) {}
+                    }
+                  }
+                  if (submitFired) {
+                    console.log(`    🇸🇪 tendsign: inline login submitted — waiting for buyer view`);
+                    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 })
+                      .catch(() => null);
+                    await new Promise((r) => setTimeout(r, 1500));
+                    // Verify we're past the login wall.
+                    const afterLogin = await page.evaluate(() => ({
+                      url: location.href,
+                      hasPass: !!document.querySelector('input[type="password"]:not([disabled]):not([aria-hidden="true"])'),
+                      bodyLen: (document.body?.innerText || '').length,
+                    })).catch(() => null);
+                    if (afterLogin && !afterLogin.hasPass) {
+                      console.log(`    ✅ tendsign: inline login OK — on ${(afterLogin.url || '').slice(-60)}, bodyLen=${afterLogin.bodyLen}`);
+                      // Now scan for Flow A/B anchor on this buyer view.
+                      resolvedDocsTabUrl = await page.evaluate(() => {
+                        const anchors = Array.from(document.querySelectorAll('a[href]'));
+                        for (const a of anchors) {
+                          const href = a.getAttribute('href') || '';
+                          if (!/(?:p_documents|s_view_advertfiles)\.aspx/i.test(href)) continue;
+                          if (!/BuyerProjectID=/i.test(href)) continue;
+                          try { return new URL(href, location.href).toString(); }
+                          catch (_) {}
+                        }
+                        return null;
+                      }).catch(() => null);
+                      if (resolvedDocsTabUrl) {
+                        console.log(`    🇸🇪 tendsign: inline-login → Flow A/B URL with BuyerProjectID resolved`);
+                      } else {
+                        console.log(`    ⚠️  tendsign: inline login OK but no Flow A/B anchor in DOM`);
+                      }
+                    } else {
+                      console.log(`    ⚠️  tendsign: inline login didn't clear password field (creds wrong? URL=${(afterLogin?.url || '').slice(-60)})`);
+                    }
+                  } else {
+                    console.log(`    ⚠️  tendsign: inline login submit failed (no button matched)`);
+                  }
+                } catch (e) {
+                  console.log(`    ⚠️  tendsign: inline login error: ${(e.message || '').slice(0, 80)}`);
+                }
+              }
+            }
           } else {
             // Re-scan for Flow A/B anchors on the buyer view.
             resolvedDocsTabUrl = await page.evaluate(() => {
@@ -4655,10 +4759,60 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
           await new Promise((r) => setTimeout(r, 1200));
         }
+        // 2026-05-15 fix: BEFORE scanning for downloads, the tab page
+        // usually requires the user to click "Anmäl intresse" (Register
+        // Interest). User-confirmed DOM:
+        //   <a id="ctl00_ctl00_ctl00_content_Content_NoticeInnerContent_lbRegister"
+        //      class="btn btn-primary"
+        //      href="javascript:__doPostBack('ctl00$ctl00$ctl00$content$Content$NoticeInnerContent$lbRegister','')">
+        //     Anmäl intresse
+        //   </a>
+        // Fire that postback first; document anchors only render after.
+        // Use page.click() (non-strict native context) — same approach as
+        // the e-avrop SubscribeBtn fix.
+        const hasRegisterBtn = await page.evaluate(() => {
+          const el = document.querySelector('#ctl00_ctl00_ctl00_content_Content_NoticeInnerContent_lbRegister')
+            || document.querySelector('a[href*="lbRegister"]')
+            || Array.from(document.querySelectorAll('a, button, input[type="button"]')).find((b) => {
+                const t = (b.innerText || b.value || '').trim();
+                return /^\s*(anm[äa]l\s*intresse|register\s*interest)\s*$/i.test(t);
+              });
+          return !!el;
+        }).catch(() => false);
+        if (hasRegisterBtn) {
+          console.log(`    🇸🇪 kommersannons: "Anmäl intresse" found on ${tab.label} — firing postback to reveal docs`);
+          let regFired = 'no-attempt';
+          try {
+            await page.click('#ctl00_ctl00_ctl00_content_Content_NoticeInnerContent_lbRegister');
+            regFired = 'page.click';
+          } catch (_) {
+            try {
+              regFired = await page.evaluate(() => {
+                const el = document.querySelector('#ctl00_ctl00_ctl00_content_Content_NoticeInnerContent_lbRegister')
+                  || document.querySelector('a[href*="lbRegister"]');
+                if (!el) return 'no-element';
+                const href = el.getAttribute('href') || '';
+                const m = /^\s*javascript:\s*(.*)$/i.exec(href);
+                if (m && m[1]) {
+                  try { (0, eval)(m[1]); return 'eval-href'; }
+                  catch (e) { return 'eval-error:' + String(e).slice(0, 40); }
+                }
+                return 'no-href';
+              }).catch((e) => 'evaluate-error:' + (e.message || '').slice(0, 40));
+            } catch (_) { regFired = 'click-error'; }
+          }
+          console.log(`    🇸🇪 kommersannons: Anmäl intresse trigger = ${regFired}`);
+          try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+          await new Promise((r) => setTimeout(r, 1500));
+        }
         const docs = await page.evaluate(() => {
-          // Match anchors that look like document downloads —
-          // standard ASP.NET download endpoints + file extensions.
-          const RX_DL_PATH = /\/(?:Download|DownloadFile|GetFile|DownloadAttachment|Documents?)\.(?:aspx|ashx)|\/Notice\/.*\/Download/i;
+          // Match anchors that look like document downloads.
+          // 2026-05-15 fix: user-confirmed kommersannons uses
+          // /<tenant>/Utils/FileDownload.aspx?FileId=<id> — added
+          // FileDownload.aspx to the path regex. Previously we
+          // matched only Download.aspx / Documents.aspx / GetFile.aspx
+          // patterns and silently missed every kommersannons doc.
+          const RX_DL_PATH = /\/(?:Download|DownloadFile|FileDownload|GetFile|DownloadAttachment|Documents?)\.(?:aspx|ashx)|\/Notice\/.*\/Download|\/Utils\/FileDownload/i;
           const RX_DL_EXT  = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:[?&#]|$)/i;
           const out = [];
           const anchors = Array.from(document.querySelectorAll('a[href]'));
@@ -4687,7 +4841,10 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
                 || '';
               if (filename) filename = decodeURIComponent(filename.replace(/\+/g, ' '));
             } catch (_) {}
-            out.push({ url: abs, text, filename });
+            // kommersannons FileDownload.aspx URLs have ?FileId=<id> but
+            // no filename in URL — the filename lives in the anchor's
+            // visible text. Prefer text as the display name.
+            out.push({ url: abs, text, filename: filename || text });
           }
           return out;
         }).catch(() => []);
