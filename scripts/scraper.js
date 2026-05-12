@@ -1070,6 +1070,46 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
             await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => null);
             try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
             await new Promise((r) => setTimeout(r, 1200));
+            // SSO TRIGGER CLICK — bounce-back navigation alone doesn't
+            // fire the SSO check; the tarjouspalvelu tender page shows
+            // its auth wall until user clicks the "Log in" button which
+            // redirects to cloudia (where session is set) and back with
+            // an auth token. Click that trigger now. User-confirmed
+            // 2026-05-12 DOM: <button id="continue">Log in</button>.
+            const triggerSel = await page.evaluate(() => {
+              const RX_TRIG = /^\s*(log\s*in|login|logga\s*in|kirjaudu(?:\s*sis[äa][äa]n)?|logg\s*inn|prisijungti|connexion|anmelden|iniciar\s*sesi[óo]n)\s*$/i;
+              for (const sel of [
+                'button#continue:not([disabled])',
+                'button[id="continue"]:not([disabled])',
+                'button.button--positive:not([disabled])',
+              ]) {
+                try {
+                  const el = document.querySelector(sel);
+                  if (el && el.offsetParent !== null) {
+                    el.click();
+                    return sel;
+                  }
+                } catch (_) {}
+              }
+              const all = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+              for (const el of all) {
+                if (!el || el.offsetParent === null || el.hasAttribute('disabled')) continue;
+                const t = (el.textContent || '').trim();
+                if (t.length > 30) continue;
+                if (RX_TRIG.test(t)) {
+                  try { el.click(); return `text:${t.slice(0, 20)}`; } catch (_) {}
+                }
+              }
+              return null;
+            }).catch(() => null);
+            if (triggerSel) {
+              console.log(`    ↪️  SSO trigger clicked (${triggerSel}) — waiting for redirect chain`);
+              try { await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 12000 }); } catch (_) {}
+              try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 6000 }); } catch (_) {}
+              await new Promise((r) => setTimeout(r, 1500));
+            } else {
+              console.log(`    ↪️  no SSO trigger found on bounce-back page (already passed-through or auto-redirected)`);
+            }
           } catch (_) {}
         }
         return true;
@@ -1647,6 +1687,41 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => null);
         try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
         await new Promise((r) => setTimeout(r, 1200));
+        // SSO TRIGGER CLICK (mirrors the already-authenticated branch).
+        const triggerSel = await page.evaluate(() => {
+          const RX_TRIG = /^\s*(log\s*in|login|logga\s*in|kirjaudu(?:\s*sis[äa][äa]n)?|logg\s*inn|prisijungti|connexion|anmelden|iniciar\s*sesi[óo]n)\s*$/i;
+          for (const sel of [
+            'button#continue:not([disabled])',
+            'button[id="continue"]:not([disabled])',
+            'button.button--positive:not([disabled])',
+          ]) {
+            try {
+              const el = document.querySelector(sel);
+              if (el && el.offsetParent !== null) {
+                el.click();
+                return sel;
+              }
+            } catch (_) {}
+          }
+          const all = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+          for (const el of all) {
+            if (!el || el.offsetParent === null || el.hasAttribute('disabled')) continue;
+            const t = (el.textContent || '').trim();
+            if (t.length > 30) continue;
+            if (RX_TRIG.test(t)) {
+              try { el.click(); return `text:${t.slice(0, 20)}`; } catch (_) {}
+            }
+          }
+          return null;
+        }).catch(() => null);
+        if (triggerSel) {
+          console.log(`    ↪️  SSO trigger clicked (${triggerSel}) — waiting for redirect chain`);
+          try { await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 12000 }); } catch (_) {}
+          try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 6000 }); } catch (_) {}
+          await new Promise((r) => setTimeout(r, 1500));
+        } else {
+          console.log(`    ↪️  no SSO trigger found on bounce-back page (already passed-through or auto-redirected)`);
+        }
       } catch (_) {}
     }
     return true;
@@ -2379,6 +2454,33 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
       };
       page.on('request', reqHandler);
 
+      // v9 fix: Puppeteer's default behaviour BLOCKS downloads silently.
+      // v8 logs showed "no request URL captured either" — the click on
+      // Download-all triggered a download attempt but Chromium aborted
+      // it without emitting any request the response listener could see
+      // (because the navigation target was a Content-Disposition asset
+      // and download manager was disabled). Enable CDP-level allow +
+      // tmp directory so the file is actually written to disk; we then
+      // poll the directory for a new .zip and read it back.
+      let downloadDir = null;
+      let cdpSession = null;
+      try {
+        const os = require('os');
+        const fs = require('fs');
+        const path = require('path');
+        downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tenderned-dl-'));
+        cdpSession = await page.target().createCDPSession();
+        await cdpSession.send('Browser.setDownloadBehavior', {
+          behavior: 'allow',
+          downloadPath: downloadDir,
+        }).catch(() => null);
+        // Page-level fallback for older Chromium where Browser.* is gated.
+        await cdpSession.send('Page.setDownloadBehavior', {
+          behavior: 'allow',
+          downloadPath: downloadDir,
+        }).catch(() => null);
+      } catch (_) { /* CDP setup best-effort; we still try the request path */ }
+
       const zipResponsePromise = new Promise((resolve) => {
         const timer = setTimeout(() => resolve(null), 20000);
         const handler = async (resp) => {
@@ -2516,6 +2618,55 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         } else if (!zipResp || !zipResp.buf) {
           console.log(`    ⚠️  tenderned: no request URL captured either — click may not have triggered any download endpoint`);
         }
+        // v9 fallback: if still no ZIP, poll the CDP download directory.
+        // Chromium routes Content-Disposition:attachment directly to the
+        // download manager (bypasses our request listener entirely). With
+        // Browser.setDownloadBehavior:allow + downloadPath, the file is
+        // written to disk. Poll up to 15s for a .zip / .crdownload to
+        // appear, then read it back.
+        if ((!zipResp || !zipResp.buf) && downloadDir) {
+          try {
+            const fs = require('fs');
+            const path = require('path');
+            const deadline = Date.now() + 15000;
+            let zipPath = null;
+            while (Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, 500));
+              let names = [];
+              try { names = fs.readdirSync(downloadDir); } catch (_) {}
+              // Skip in-flight .crdownload — wait for finalized name.
+              const finished = names.filter((n) => !/\.crdownload$/i.test(n));
+              if (finished.length > 0) {
+                // Pick the largest finished file (downloads typically settle
+                // to one file; multiple would mean multi-document download).
+                let biggest = null;
+                for (const n of finished) {
+                  try {
+                    const p = path.join(downloadDir, n);
+                    const st = fs.statSync(p);
+                    if (st.isFile() && st.size > 1024) {
+                      if (!biggest || st.size > biggest.size) biggest = { path: p, size: st.size, name: n };
+                    }
+                  } catch (_) {}
+                }
+                if (biggest) { zipPath = biggest.path; break; }
+              }
+            }
+            if (zipPath) {
+              const buf = fs.readFileSync(zipPath);
+              if (buf.length > 1024 && buf[0] === 0x50 && buf[1] === 0x4b) {
+                zipResp = { buf, url: `file://${zipPath}`, ct: 'application/zip' };
+                console.log(`    🇳🇱 tenderned: ZIP captured from disk (${buf.length}B → ${path.basename(zipPath)})`);
+              } else {
+                console.log(`    ⚠️  tenderned: disk file "${path.basename(zipPath)}" not a ZIP (${buf.length}B, magic=${buf.slice(0, 4).toString('hex')})`);
+              }
+            } else {
+              console.log(`    ⚠️  tenderned: download dir polling timed out — no file appeared in ${downloadDir.slice(-40)}`);
+            }
+          } catch (e) {
+            console.log(`    ⚠️  tenderned: disk read error: ${(e.message || '').slice(0, 100)}`);
+          }
+        }
         if (zipResp && zipResp.buf) {
           console.log(`    🇳🇱 tenderned: ZIP captured (${zipResp.buf.length}B) from ${zipResp.url.slice(0, 100)}`);
           try {
@@ -2578,6 +2729,14 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         // Clean up request listener if we never clicked.
         try { page.off('request', reqHandler); } catch (_) {}
       }
+      // v9: detach CDP session and rm tmp download dir if we set them up.
+      try { if (cdpSession) await cdpSession.detach(); } catch (_) {}
+      try {
+        if (downloadDir) {
+          const fs = require('fs');
+          fs.rmSync(downloadDir, { recursive: true, force: true });
+        }
+      } catch (_) {}
     }
 
     // If ZIP path returned content, we're done. Otherwise (no ZIP lib,
