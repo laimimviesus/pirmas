@@ -1632,6 +1632,50 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     }
 
     const submitSel = await page.evaluate((passSelStr) => {
+      // Tier 0: FORM-SCOPED — when the password input lives inside a
+      // <form>, prefer the submit element inside THAT form over any
+      // global match. This prevents picking a stray search/contact-form
+      // <input type="submit"> elsewhere on the page (kommersannons.se's
+      // /<tenant>/Account/Login.aspx renders header search + footer
+      // contact alongside the actual login form, so a global
+      // `input[type="submit"]` query returned the wrong button on
+      // 2026-05-11). ASP.NET pages typically have ID suffix
+      // "LoginButton" / "btnLogin" / "$LoginButton" — but text match
+      // is the safest disambiguator across locales.
+      try {
+        const passEl0 = passSelStr ? document.querySelector(passSelStr) : null;
+        const passForm0 = passEl0 ? passEl0.closest('form') : null;
+        if (passForm0) {
+          const inForm = Array.from(passForm0.querySelectorAll(
+            'button[type="submit"]:not([disabled]),' +
+            ' input[type="submit"]:not([disabled]),' +
+            ' button[type="button"]:not([disabled])'
+          )).filter((el) => el && el.offsetParent !== null);
+          // ASP.NET LoginButton id/name pattern first.
+          const ATTR_LOGIN = /(loginbutton|btnlogin|signin|btnsubmit|login\$|\$login)/i;
+          const byAttr = inForm.find((el) => {
+            const blob = [
+              el.id || '',
+              el.getAttribute('name') || '',
+              el.className || '',
+            ].join(' ').toLowerCase();
+            return ATTR_LOGIN.test(blob);
+          });
+          if (byAttr) { byAttr.click(); return 'form0-attr:' + (byAttr.id || byAttr.name || '').slice(0, 30); }
+          // Text-match login vocabulary inside the form.
+          const TXT_LOGIN = /^\s*(login|log[\s-]?in|logga[\s-]?in|sign[\s-]?in|signin|connexion|se[\s-]?connecter|anmelden|kirjaudu|iniciar\s*sesi[oó]n|acceder|entrar|prisijungti|logg[\s-]?inn|prijava)\s*$/i;
+          const byText = inForm.find((el) => {
+            const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+            return t.length > 0 && t.length <= 20 && TXT_LOGIN.test(t);
+          });
+          if (byText) { byText.click(); return 'form0-text:' + (byText.innerText || byText.value || '').trim().slice(0, 20); }
+          // Single in-form submit candidate — safe to click.
+          if (inForm.length === 1) {
+            inForm[0].click();
+            return 'form0-only:' + inForm[0].tagName + ':' + (inForm[0].id || inForm[0].name || '').slice(0, 30);
+          }
+        }
+      } catch (_) { /* fall through to global */ }
       // Tier 1: standard semantic submit selectors. Catches normal HTML
       // forms and ASP.NET pages whose LoginButton renders as a real
       // <input type="submit" id="...LoginButton">.
