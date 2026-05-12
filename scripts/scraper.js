@@ -3374,81 +3374,179 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
     }
     await new Promise((r) => setTimeout(r, 1500));
 
-    // SSO SESSION WARMUP (2026-05-14 fix).
+    // EMAIL-FIRST MULTI-PAGE LOGIN (2026-05-15 fix).
     //
-    // attemptPortalLogin logs us in at login.cloudia.net — that sets a
-    // SESSION cookie on the cloudia.net domain. But tarjouspalvelu.fi
-    // and cloudia.net are SEPARATE hostnames; browsers don't share
-    // cookies cross-domain. So even after a successful Cloudia login,
-    // fetch('https://tarjouspalvelu.fi/Zip/...') still has zero
-    // tarjouspalvelu.fi cookies → 401 HTML auth wall.
+    // User-confirmed real auth flow for tarjouspalvelu.fi:
+    //   1. Visit tarjouspalvelu.fi/<tenant>?id=X (anonymous tender page)
+    //   2. Top-corner has email input + "Kirjaudu/Login" button
+    //   3. Fill email + click → redirects to
+    //      login.cloudia.net/user/login?username=X&application=redirect:UUID
+    //      (email pre-filled, UUID = tarjouspalvelu's Cloudia app id)
+    //   4. Fill password + submit
+    //   5. Cloudia auth → redirects back to tarjouspalvelu.fi (or to
+    //      cloudia.net/user/user; we then re-nav back to source URL)
+    //   6. Now authenticated on tarjouspalvelu.fi — session cookie set
     //
-    // The fix: navigate to a tarjouspalvelu.fi URL that REQUIRES auth
-    // — that triggers the SSO redirect chain:
-    //   1. tarjouspalvelu.fi/protected → 302 to login.cloudia.net?ReturnUrl=…
-    //   2. login.cloudia.net sees the existing Cloudia session → 302 back
-    //      to tarjouspalvelu.fi with an SSO token
-    //   3. tarjouspalvelu.fi creates its OWN session cookie
-    //   4. Subsequent ZIP fetches carry that cookie
-    //
-    // Source URL alone doesn't trigger the chain because the public
-    // notice view doesn't require auth. We probe a known-protected
-    // tarjouspalvelu.fi URL: tenant-relative `/Login`. Plus we log
-    // cookie state before+after so we can iterate if SSO still fails.
+    // Our previous SSO warmup approach used the dedicated
+    // login.cloudia.net/user/login URL WITHOUT the application=redirect
+    // parameter, so Cloudia auth granted Cloudia dashboard access but
+    // NOT tarjouspalvelu tender access. The correct flow starts from
+    // tarjouspalvelu's own corner Login button, which sets the
+    // application=redirect:UUID parameter on the redirect to Cloudia.
+    const tpCreds = getPortalCreds('tarjouspalvelu.fi');
+    if (!tpCreds || !tpCreds.username || !tpCreds.password) {
+      console.log(`    ⚠️  tarjouspalvelu: no credentials configured — bailing`);
+      return [];
+    }
+
+    // Step 1: Cookie state before login.
     try {
       const cookiesBefore = await page.cookies('https://tarjouspalvelu.fi', 'https://login.cloudia.net');
       const cloudia = cookiesBefore.filter((c) => /cloudia/i.test(c.domain)).map((c) => c.name);
       const tp = cookiesBefore.filter((c) => /tarjouspalvelu/i.test(c.domain)).map((c) => c.name);
-      console.log(`    🇫🇮 tarjouspalvelu: cookies before SSO warmup — cloudia=[${cloudia.join(',')}] tarjouspalvelu=[${tp.join(',')}]`);
+      console.log(`    🇫🇮 tarjouspalvelu: cookies before login — cloudia=[${cloudia.join(',')}] tarjouspalvelu=[${tp.join(',')}]`);
     } catch (_) {}
 
-    // Build a list of warmup candidates ordered by likelihood of
-    // triggering the SSO chain. Tenant-aware first.
-    const warmupCandidates = [];
-    if (tenant) {
-      warmupCandidates.push(`https://tarjouspalvelu.fi/${tenant}/Login`);
-      warmupCandidates.push(`https://tarjouspalvelu.fi/${tenant}/Account`);
-    }
-    warmupCandidates.push('https://tarjouspalvelu.fi/Login/Login');
-    warmupCandidates.push('https://tarjouspalvelu.fi/Login');
-    warmupCandidates.push('https://tarjouspalvelu.fi/Account');
-
-    for (const wu of warmupCandidates) {
+    // Step 2: Find the email input + Login button in tarjouspalvelu corner.
+    const emailFieldFilled = await page.evaluate((email) => {
+      // Tarjouspalvelu's top-right login form: typically an
+      // <input type="email"> or <input name="email"> + a submit/button
+      // labelled "Kirjaudu" / "Login" / "Kirjaudu sisään".
+      const inputs = Array.from(document.querySelectorAll(
+        'input[type="email"]:not([disabled]), ' +
+        'input[name*="email" i]:not([disabled]), ' +
+        'input[id*="email" i]:not([disabled]), ' +
+        'input[name*="username" i]:not([disabled]), ' +
+        'input[id*="username" i]:not([disabled]), ' +
+        'input[type="text"]:not([disabled])'
+      ));
+      // Find first VISIBLE input that looks like an email/username field.
+      const visEmail = inputs.find((el) => {
+        if (el.offsetParent === null) return false;
+        const blob = ((el.id || '') + ' ' + (el.name || '') + ' ' + (el.placeholder || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+        // Reject obvious non-email inputs (search/zip/etc).
+        if (/search|haku|sökning|zip|postnumero|phone|puhelin|address|osoite/.test(blob)) return false;
+        return /email|username|user|käyttäjä|sähköposti/.test(blob) || el.type === 'email';
+      });
+      if (!visEmail) return { ok: false, reason: 'no-email-field' };
       try {
-        await page.goto(wu, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        try { await page.waitForNetworkIdle({ idleTime: 800, timeout: 6000 }); } catch (_) {}
-        await new Promise((r) => setTimeout(r, 800));
-        // Did we end up back on tarjouspalvelu.fi? If we redirected to
-        // cloudia and got stuck there (i.e. SSO chain didn't 302 back
-        // automatically), bail to next candidate.
-        const landedHost = (() => {
-          try { return new URL(page.url()).hostname.toLowerCase(); }
-          catch (_) { return ''; }
-        })();
-        if (/tarjouspalvelu\.fi$/i.test(landedHost)) {
-          console.log(`    🇫🇮 tarjouspalvelu: SSO warmup OK — landed on ${landedHost} (via ${wu.slice(-50)})`);
-          break;
-        }
-        console.log(`    🇫🇮 tarjouspalvelu: warmup ${wu.slice(-40)} → ${landedHost} (not propagated, trying next)`);
+        visEmail.focus();
+        visEmail.value = email;
+        visEmail.dispatchEvent(new Event('input', { bubbles: true }));
+        visEmail.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, sel: '#' + visEmail.id || visEmail.name };
       } catch (e) {
-        console.log(`    🇫🇮 tarjouspalvelu: warmup ${wu.slice(-40)} failed: ${(e.message || '').slice(0, 60)}`);
+        return { ok: false, reason: 'fill-error: ' + String(e).slice(0, 60) };
+      }
+    }, tpCreds.username).catch(() => ({ ok: false, reason: 'evaluate-error' }));
+    if (!emailFieldFilled.ok) {
+      console.log(`    ⚠️  tarjouspalvelu: email input not found (${emailFieldFilled.reason}) — bailing`);
+      return [];
+    }
+    console.log(`    🇫🇮 tarjouspalvelu: email filled (${emailFieldFilled.sel}) — clicking Login`);
+
+    // Step 3: Click Login button. Could be a submit input/button,
+    // or a link. Look for one near the email field with "Kirjaudu/Login" text.
+    const loginClicked = await page.evaluate(() => {
+      const RX_LOGIN = /^\s*(kirjaudu(?:\s*sis[äa][äa]n)?|log[\s-]?in|sign[\s-]?in)\s*$/i;
+      const candidates = Array.from(document.querySelectorAll(
+        'button:not([disabled]), input[type="submit"]:not([disabled]), input[type="button"]:not([disabled]), a:not([href="#"])'
+      ));
+      for (const el of candidates) {
+        if (el.offsetParent === null) continue;
+        const t = (el.innerText || el.value || el.textContent || el.getAttribute('aria-label') || '').trim();
+        if (!t || t.length > 30) continue;
+        if (RX_LOGIN.test(t)) {
+          try { el.click(); return { ok: true, text: t.slice(0, 30) }; }
+          catch (_) {}
+        }
+      }
+      return { ok: false };
+    }).catch(() => ({ ok: false }));
+    if (!loginClicked.ok) {
+      console.log(`    ⚠️  tarjouspalvelu: Login button not found — bailing`);
+      return [];
+    }
+    console.log(`    🇫🇮 tarjouspalvelu: Login clicked ("${loginClicked.text}") — waiting for Cloudia password page`);
+
+    // Step 4: Wait for navigation to login.cloudia.net password page.
+    try {
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 25000 });
+    } catch (_) {}
+    try { await page.waitForNetworkIdle({ idleTime: 800, timeout: 8000 }); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 1200));
+
+    // Step 5: Fill password on cloudia.net and submit.
+    const passFilled = await page.evaluate((password) => {
+      const pass = document.querySelector('input[type="password"]:not([disabled])');
+      if (!pass || pass.offsetParent === null) return { ok: false, reason: 'no-password-field', url: location.href };
+      try {
+        pass.focus();
+        pass.value = password;
+        pass.dispatchEvent(new Event('input', { bubbles: true }));
+        pass.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, url: location.href };
+      } catch (e) {
+        return { ok: false, reason: 'fill-error: ' + String(e).slice(0, 50), url: location.href };
+      }
+    }, tpCreds.password).catch(() => ({ ok: false, reason: 'evaluate-error' }));
+    if (!passFilled.ok) {
+      console.log(`    ⚠️  tarjouspalvelu: password field not found on ${(passFilled.url || '').slice(-60)} (${passFilled.reason}) — bailing`);
+      return [];
+    }
+    console.log(`    🇫🇮 tarjouspalvelu: password filled on ${(passFilled.url || '').slice(-60)} — submitting`);
+
+    // Step 6: Click submit button.
+    let pwSubmitFired = false;
+    try {
+      await page.click('button[type="submit"]:not([disabled])');
+      pwSubmitFired = true;
+    } catch (_) {
+      try {
+        await page.click('input[type="submit"]:not([disabled])');
+        pwSubmitFired = true;
+      } catch (_) {
+        try { await page.keyboard.press('Enter'); pwSubmitFired = true; }
+        catch (_) {}
       }
     }
+    if (!pwSubmitFired) {
+      console.log(`    ⚠️  tarjouspalvelu: no submit method worked — bailing`);
+      return [];
+    }
+    try {
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 });
+    } catch (_) {}
+    await new Promise((r) => setTimeout(r, 2000));
 
-    // Log cookies after warmup so we can see if tarjouspalvelu.fi
-    // session cookie got set.
+    // Step 7: Verify login by checking auth cookies + URL.
+    let loginVerified = false;
     try {
       const cookiesAfter = await page.cookies('https://tarjouspalvelu.fi', 'https://login.cloudia.net');
       const cloudia = cookiesAfter.filter((c) => /cloudia/i.test(c.domain)).map((c) => c.name);
       const tp = cookiesAfter.filter((c) => /tarjouspalvelu/i.test(c.domain)).map((c) => c.name);
-      console.log(`    🇫🇮 tarjouspalvelu: cookies after SSO warmup — cloudia=[${cloudia.join(',')}] tarjouspalvelu=[${tp.join(',')}]`);
+      const finalUrl = page.url();
+      console.log(`    🇫🇮 tarjouspalvelu: cookies after login — cloudia=[${cloudia.join(',')}] tarjouspalvelu=[${tp.join(',')}] | URL=${finalUrl.slice(-80)}`);
+      // Auth-cookie heuristic — if we have ANY cookie name suggesting
+      // auth (Auth/Login/Token/Session beyond the basic SessionId we
+      // had pre-login), consider it OK.
+      const newCookies = [...cloudia, ...tp];
+      loginVerified = newCookies.some((n) => /auth|login|token|sso|signin/i.test(n)) || /tarjouspalvelu/i.test(finalUrl);
     } catch (_) {}
+    if (!loginVerified) {
+      console.log(`    ⚠️  tarjouspalvelu: login verification weak — proceeding anyway`);
+    } else {
+      console.log(`    ✅ tarjouspalvelu: login verified`);
+    }
 
-    // Re-anchor to source URL so fetch() runs from tarjouspalvelu.fi origin.
+    // Step 8: Navigate back to source URL — Cloudia might have landed
+    // us on /user/user dashboard instead of tarjouspalvelu.
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
+      await new Promise((r) => setTimeout(r, 1500));
+      console.log(`    🇫🇮 tarjouspalvelu: re-anchored to source URL — ${page.url().slice(-80)}`);
     } catch (_) { /* best-effort */ }
-    await new Promise((r) => setTimeout(r, 800));
 
     // Build the ZIP URL — tenant-relative.
     const zipUrl = `https://tarjouspalvelu.fi/Zip/TarjousPyynnonLiitteet/${noticeId}`;
