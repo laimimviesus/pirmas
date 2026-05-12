@@ -214,16 +214,22 @@ const LOGIN_URLS = {
   'e-avrop.com':              'https://www.e-avrop.com/login.aspx',
   // kommersannons.se hosts MULTIPLE buyer tenants under the same root
   // domain (/fmv/, /elite/, /roslagsvatten/, /goteborgshamn/, etc.) and
-  // each tenant has its OWN /<tenant>/Default.aspx login page. The
+  // each tenant has its OWN /<tenant>/Account/Login.aspx login form. The
   // ASP.NET session cookie set on /fmv/ does NOT carry over to /elite/
   // because the form uses tenant-relative paths and ASP.NET path-
   // scopes its auth cookie. We therefore derive the login URL from the
   // source URL's first path segment at call time (see
   // getDedicatedLoginUrl). The entry below is just a host-presence
   // marker — the value is used as a fallback when source URL has no
-  // tenant prefix (i.e. it's the bare root). 2026-05-11 fix for Nacka
-  // kommun /elite/ tender failing because we logged in on /fmv/.
-  'kommersannons.se':         'https://www.kommersannons.se/fmv/Default.aspx',
+  // tenant prefix (i.e. it's the bare root).
+  // 2026-05-12 fix: switched from /Default.aspx → /Account/Login.aspx.
+  // /Default.aspx is the tenant HOMEPAGE — it renders header/footer
+  // and a generic "Login" button that links to Account/Login.aspx. The
+  // homepage has NO email/password form, so attemptPortalLogin's
+  // password-field scan returned 0 fields and we hit a random submit
+  // button (search/contact). Account/Login.aspx is the actual login
+  // form with email + password inputs.
+  'kommersannons.se':         'https://www.kommersannons.se/fmv/Account/Login.aspx',
   // tarjouspalvelu.fi (Finnish national tender front-end) doesn't host
   // its own login form — the Cloudia SaaS platform serves authentication
   // at login.cloudia.net. After login there, session cookies are valid
@@ -243,9 +249,13 @@ function getDedicatedLoginUrl(host, sourceUrl) {
   if (!host) return null;
   const h = String(host).trim().toLowerCase().replace(/^www\./, '');
   // kommersannons.se — multi-tenant: extract /<tenant>/ from the source
-  // URL and build /<tenant>/Default.aspx so we log in on the SAME path
-  // scope as the tender page. Falls through to the static LOGIN_URLS
-  // entry if no tenant prefix is parseable.
+  // URL and build /<tenant>/Account/Login.aspx so we log in on the SAME
+  // path scope as the tender page. Falls through to the static
+  // LOGIN_URLS entry if no tenant prefix is parseable.
+  // 2026-05-12: user confirmed the actual login form lives at
+  // /<tenant>/Account/Login.aspx (not /<tenant>/Default.aspx — that's
+  // the homepage, which contains only header navigation and a "Login"
+  // button that links here).
   if (h === 'kommersannons.se' || h.endsWith('.kommersannons.se')) {
     try {
       if (sourceUrl) {
@@ -256,9 +266,9 @@ function getDedicatedLoginUrl(host, sourceUrl) {
         // happen if the URL was already on /Notice/...).
         const segs = u.pathname.split('/').filter(Boolean);
         const first = segs[0] || '';
-        const RESERVED = new Set(['notice', 'login', 'default.aspx', 'admin', 'app']);
+        const RESERVED = new Set(['notice', 'login', 'default.aspx', 'admin', 'app', 'account']);
         if (first && /^[a-z0-9_-]{2,40}$/i.test(first) && !RESERVED.has(first.toLowerCase())) {
-          return `https://www.kommersannons.se/${first}/Default.aspx`;
+          return `https://www.kommersannons.se/${first}/Account/Login.aspx`;
         }
       }
     } catch (_) { /* fall through */ }
@@ -2542,15 +2552,28 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
       const bulkUrl = `https://www.tenderned.nl/papi/tenderned-rs-tns/v2/publicaties/${noticeId}/documenten/zip`;
       console.log(`    🇳🇱 tenderned: v11 direct bulk-ZIP fetch → ${bulkUrl.slice(-70)}`);
       try {
-        const r = await page.evaluate(async (url) => {
-          try {
-            const resp = await fetch(url, { credentials: 'include', redirect: 'follow' });
-            if (!resp.ok) return { ok: false, status: resp.status };
-            const ct = resp.headers.get('content-type') || '';
-            const ab = await resp.arrayBuffer();
-            return { ok: true, status: resp.status, ct, url: resp.url || url, data: Array.from(new Uint8Array(ab)) };
-          } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
-        }, bulkUrl).catch(() => null);
+        // v12 retry — "TypeError: Failed to fetch" hits ~25% of large
+        // (5-13MB) responses, likely Chromium race condition between
+        // fetch + CORS preflight + connection reuse. Three attempts
+        // with 1.5s back-off resolves nearly all transients.
+        let r = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          r = await page.evaluate(async (url) => {
+            try {
+              const resp = await fetch(url, { credentials: 'include', redirect: 'follow' });
+              if (!resp.ok) return { ok: false, status: resp.status };
+              const ct = resp.headers.get('content-type') || '';
+              const ab = await resp.arrayBuffer();
+              return { ok: true, status: resp.status, ct, url: resp.url || url, data: Array.from(new Uint8Array(ab)) };
+            } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
+          }, bulkUrl).catch(() => null);
+          if (r && r.ok && r.data && r.data.length > 1024) break; // success
+          // Only retry on transient errors — not on HTTP error codes.
+          const isTransient = r && !r.ok && r.error && /failed\s*to\s*fetch|network\s*error|err_|aborted/i.test(r.error);
+          if (!isTransient || attempt === 3) break;
+          console.log(`    🇳🇱 tenderned: v11 attempt ${attempt} transient (${r.error.slice(0, 60)}) — retrying after 1.5s`);
+          await new Promise((rs) => setTimeout(rs, 1500));
+        }
         if (r && r.ok && r.data && r.data.length > 1024) {
           const buf = Buffer.from(r.data);
           if (buf[0] === 0x50 && buf[1] === 0x4b) {
@@ -2963,6 +2986,22 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
       }
       if (apiDocs.length === 0) {
         console.log(`    ⚠️  tenderned: API responses captured but no file-shaped objects found. URLs: ${capturedJsonResponses.slice(0, 4).map((c) => c.url.slice(-60)).join(' | ')}`);
+        // v12 diagnostic — dump top-level keys + sample object shapes
+        // from the first response so we can refine the file-shape
+        // detector. Limited to 1 response and 400 chars to avoid noise.
+        try {
+          const first = capturedJsonResponses[0];
+          if (first) {
+            const parsed = JSON.parse(first.body);
+            const summary = (() => {
+              if (Array.isArray(parsed)) return `array(len=${parsed.length}), first[0] keys=${parsed[0] ? Object.keys(parsed[0]).slice(0, 10).join(',') : 'none'}`;
+              if (parsed && typeof parsed === 'object') return `object keys=${Object.keys(parsed).slice(0, 10).join(',')}`;
+              return `primitive(${typeof parsed})`;
+            })();
+            const snippet = JSON.stringify(parsed).slice(0, 400);
+            console.log(`    🔎 tenderned: JSON shape — ${summary}. Snippet: ${snippet}`);
+          }
+        } catch (_) {}
       } else {
         // De-dup by (id, name)
         const seen = new Set();
