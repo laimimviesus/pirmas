@@ -3521,54 +3521,94 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
     try { await page.waitForNetworkIdle({ idleTime: 800, timeout: 8000 }); } catch (_) {}
     await new Promise((r) => setTimeout(r, 1200));
 
-    // Step 5: On Cloudia, fill email (if not pre-filled) + password, then submit.
-    const passFilled = await page.evaluate((email, password) => {
-      const pass = document.querySelector('input[type="password"]:not([disabled])');
-      if (!pass || pass.offsetParent === null) {
-        // Maybe we landed on Cloudia's email-first page (asks for email
-        // before showing password field). Try filling email if present.
-        const emailInp = document.querySelector(
+    // Step 5: Multi-step login state machine. 2026-05-15 fix v3:
+    // FI run revealed the actual flow has THREE pages:
+    //   Page A: tarjouspalvelu.fi/<tenant>?id=X — only LOG IN button
+    //           (no email field visible, hidden via CSS/modal)
+    //   Page B: tarjouspalvelu.fi/UX/TP/SiirryTarjouspyyntoon/?tpId=X&p=Y
+    //           — intermediate page with email input (NO password yet)
+    //   Page C: login.cloudia.net/user/login?username=X&application=redirect:UUID
+    //           — password input
+    // After password submit → redirects back to tarjouspalvelu.fi (auth).
+    //
+    // State machine: up to 4 iterations of "look for inputs, fill, submit, wait".
+    // Each iteration handles one page of the chain.
+    let passFilled = { ok: false, reason: 'not-attempted' };
+    for (let step = 0; step < 4; step++) {
+      const stepResult = await page.evaluate((email, password) => {
+        const findVisible = (sel) => {
+          for (const el of Array.from(document.querySelectorAll(sel))) {
+            if (el.offsetParent !== null && !el.disabled) return el;
+          }
+          return null;
+        };
+        const passInp = findVisible('input[type="password"]');
+        const emailInp = findVisible(
           'input[type="email"]:not([disabled]), ' +
           'input[name*="email" i]:not([disabled]), ' +
           'input[id*="email" i]:not([disabled]), ' +
-          'input[name*="username" i]:not([disabled])'
+          'input[name*="username" i]:not([disabled]), ' +
+          'input[id*="username" i]:not([disabled]), ' +
+          'input[type="text"]:not([disabled])'
         );
-        if (emailInp && emailInp.offsetParent !== null) {
+        // Both fields visible → fill both, submit, done.
+        if (passInp) {
+          try {
+            if (emailInp && !emailInp.value) {
+              emailInp.focus();
+              emailInp.value = email;
+              emailInp.dispatchEvent(new Event('input', { bubbles: true }));
+              emailInp.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            passInp.focus();
+            passInp.value = password;
+            passInp.dispatchEvent(new Event('input', { bubbles: true }));
+            passInp.dispatchEvent(new Event('change', { bubbles: true }));
+            return { state: 'both-filled', url: location.href, emailWasFilled: emailInp ? (emailInp.value === email) : false };
+          } catch (e) {
+            return { state: 'fill-error', err: String(e).slice(0, 60), url: location.href };
+          }
+        }
+        // Only email visible (intermediate page) → fill email, submit will fire in caller.
+        if (emailInp) {
           try {
             emailInp.focus();
             emailInp.value = email;
             emailInp.dispatchEvent(new Event('input', { bubbles: true }));
             emailInp.dispatchEvent(new Event('change', { bubbles: true }));
-            return { ok: false, reason: 'no-password-yet-email-filled', url: location.href };
-          } catch (_) {}
+            return { state: 'email-only-filled', url: location.href };
+          } catch (e) {
+            return { state: 'fill-error', err: String(e).slice(0, 60), url: location.href };
+          }
         }
-        return { ok: false, reason: 'no-password-field', url: location.href };
-      }
-      // Also fill email field on cloudia.net if it's empty (sometimes
-      // username param wasn't carried via URL).
-      try {
-        const emailInp = document.querySelector(
-          'input[type="email"]:not([disabled]), ' +
-          'input[name*="email" i]:not([disabled]), ' +
-          'input[name*="username" i]:not([disabled])'
-        );
-        if (emailInp && emailInp.offsetParent !== null && !emailInp.value) {
-          emailInp.focus();
-          emailInp.value = email;
-          emailInp.dispatchEvent(new Event('input', { bubbles: true }));
-          emailInp.dispatchEvent(new Event('change', { bubbles: true }));
+        return { state: 'no-field', url: location.href };
+      }, tpCreds.username, tpCreds.password).catch(() => ({ state: 'evaluate-error' }));
+
+      console.log(`    🇫🇮 tarjouspalvelu: login step ${step + 1} — state=${stepResult.state}, url=${(stepResult.url || '').slice(-60)}`);
+
+      if (stepResult.state === 'both-filled') {
+        passFilled = { ok: true, url: stepResult.url };
+        break;
+      } else if (stepResult.state === 'email-only-filled') {
+        // Submit email form (intermediate page → password page).
+        try {
+          await page.click('button[type="submit"]:not([disabled])');
+        } catch (_) {
+          try { await page.click('input[type="submit"]:not([disabled])'); }
+          catch (_) { try { await page.keyboard.press('Enter'); } catch (_) {} }
         }
-      } catch (_) {}
-      try {
-        pass.focus();
-        pass.value = password;
-        pass.dispatchEvent(new Event('input', { bubbles: true }));
-        pass.dispatchEvent(new Event('change', { bubbles: true }));
-        return { ok: true, url: location.href };
-      } catch (e) {
-        return { ok: false, reason: 'fill-error: ' + String(e).slice(0, 50), url: location.href };
+        try {
+          await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 });
+        } catch (_) {}
+        try { await page.waitForNetworkIdle({ idleTime: 800, timeout: 6000 }); } catch (_) {}
+        await new Promise((r) => setTimeout(r, 1200));
+        // Continue loop — next iteration looks for password.
+      } else {
+        // no-field / evaluate-error / fill-error — bail out of loop.
+        passFilled = { ok: false, reason: stepResult.state, url: stepResult.url };
+        break;
       }
-    }, tpCreds.username, tpCreds.password).catch(() => ({ ok: false, reason: 'evaluate-error' }));
+    }
     if (!passFilled.ok) {
       console.log(`    ⚠️  tarjouspalvelu: password field not found on ${(passFilled.url || '').slice(-60)} (${passFilled.reason}) — bailing`);
       return [];
