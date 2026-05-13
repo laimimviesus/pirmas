@@ -8471,6 +8471,18 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         dumpField('originalNotices', json.originalNotices);
         dumpField('publicationNumber', json.publicationNumber);
         dumpField('externalReferences', json.externalReferences);
+        // Capture fileReferenceNumber INTO details so downstream
+        // resolvers (marches-publics deep-link search) can use the
+        // buyer's INTERNAL reference instead of the TED publication
+        // ID that lives in details.referenceNumber. The two are
+        // different identifiers — buyer ref ("GNU 2026/67", "ET183")
+        // is what the public portal indexes by; TED ID
+        // ("00323730-2026") is just the EU publication number.
+        if (typeof json.fileReferenceNumber === 'string'
+            && json.fileReferenceNumber.trim().length > 0
+            && !/^(todo|n\/a|null)$/i.test(json.fileReferenceNumber.trim())) {
+          details.fileReferenceNumber = json.fileReferenceNumber.trim();
+        }
       }
 
       const fields = extractFieldsFromTenderJson(json);
@@ -9677,11 +9689,22 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         !src.maxBudget && !src.requirementsForSupplier &&
         !src.qualificationRequirements && !src.offerWeighingCriteria &&
         !src.scopeOfAgreement;
-      if (hostIsMarchesPublics && sourceLooksEmpty && details.referenceNumber) {
-        console.log(`    🇫🇷 marches-publics: anonymous fetch returned dashboard (empty fields) — trying deep-link resolver`);
+      // Prefer the buyer's INTERNAL reference (fileReferenceNumber)
+      // over the TED publication ID (referenceNumber). marches-publics
+      // indexes by the buyer's own ref ("B26-01823-MP", "GNU 2026/67"),
+      // NOT by TED IDs ("00323730-2026"). FR test 2026-05-16 confirmed
+      // the TED-ID search returns 0 results even when the form fills
+      // and submits cleanly.
+      const searchRef = (details.fileReferenceNumber && details.fileReferenceNumber.trim())
+        || details.referenceNumber;
+      const refSource = (details.fileReferenceNumber && details.fileReferenceNumber.trim())
+        ? 'fileReferenceNumber'
+        : 'referenceNumber';
+      if (hostIsMarchesPublics && sourceLooksEmpty && searchRef) {
+        console.log(`    🇫🇷 marches-publics: anonymous fetch returned dashboard (empty fields) — trying deep-link resolver with ${refSource}="${searchRef}"`);
         try {
           const deepLink = await resolveMarchesPublicsDeepLink(
-            browser, details.referenceNumber, src.sourceHost
+            browser, searchRef, src.sourceHost
           );
           if (deepLink) {
             console.log(`    🔁 marches-publics: refetching on deep-link URL`);
@@ -9798,10 +9821,16 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
             // fails. Real-world: this is the difference between 4%
             // and ~40% marches-publics qualification rate.
             let refetchUrl = details.sourceUrl;
+            // Prefer buyer's internal ref (fileReferenceNumber) over
+            // TED publication ID — see comment at the post-fetch
+            // marches-publics fallback for full explanation.
+            const postLoginSearchRef =
+              (details.fileReferenceNumber && details.fileReferenceNumber.trim())
+              || details.referenceNumber;
             if (/(^|\.)marches-publics\.gouv\.fr$/i.test(src.sourceHost || '')
-                && details.referenceNumber) {
+                && postLoginSearchRef) {
               const deepLink = await resolveMarchesPublicsDeepLink(
-                browser, details.referenceNumber, src.sourceHost
+                browser, postLoginSearchRef, src.sourceHost
               );
               if (deepLink) {
                 refetchUrl = deepLink;
