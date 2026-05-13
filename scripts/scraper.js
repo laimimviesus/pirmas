@@ -9652,6 +9652,61 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         console.log(`    🇪🇸 PLACSP stats: anchors=${ps.totalAnchors}, textMatches=${ps.textMatches}, urlMatches=${ps.urlMatches}; sample=[${sample}]`);
       }
 
+      // MARCHES-PUBLICS DASHBOARD FALLBACK
+      //
+      // 2026-05-16 FR test run: when the browser already has a session
+      // cookie from an earlier tender, marches-publics root URL
+      // (https://www.marches-publics.gouv.fr/) returns the dashboard
+      // page — "Bienvenue ... Mon compte Déconnexion ... Mon panier
+      // Consultations en cours". This is NOT a login form (so
+      // loginGated=false) and NOT useful content (all source fields
+      // null, no sourceFilesText), so the deep-link resolver that
+      // lives in the post-login branch never fires.
+      //
+      // Fix: when source fetch returned success-but-empty AND the
+      // host is marches-publics AND we have a reference number, trigger
+      // resolveMarchesPublicsDeepLink directly. The resolver itself
+      // already handles the "Recherche avancée" link click for dashboard
+      // landings, so it should work from this entry point too.
+      //
+      // Same pattern as PLACSP federal fallback above.
+      const hostIsMarchesPublics = src?.sourceHost &&
+        /(^|\.)marches-publics\.gouv\.fr$/i.test(src.sourceHost);
+      const sourceLooksEmpty = src && !src.error && !src.skipped && !src.loginGated &&
+        !src.sourceFilesText &&
+        !src.maxBudget && !src.requirementsForSupplier &&
+        !src.qualificationRequirements && !src.offerWeighingCriteria &&
+        !src.scopeOfAgreement;
+      if (hostIsMarchesPublics && sourceLooksEmpty && details.referenceNumber) {
+        console.log(`    🇫🇷 marches-publics: anonymous fetch returned dashboard (empty fields) — trying deep-link resolver`);
+        try {
+          const deepLink = await resolveMarchesPublicsDeepLink(
+            browser, details.referenceNumber, src.sourceHost
+          );
+          if (deepLink) {
+            console.log(`    🔁 marches-publics: refetching on deep-link URL`);
+            const t1 = Date.now();
+            const src2 = await fetchSourcePageDetails(browser, deepLink);
+            const elapsed2 = Date.now() - t1;
+            console.log(`    🔁 marches-publics deep-link refetch done in ${elapsed2}ms (host: ${src2?.sourceHost || 'n/a'}, err: ${src2?.error || 'none'}${src2?.skipped ? ', skipped: ' + src2.skipped : ''})`);
+            if (src2 && !src2.skipped && !src2.error) {
+              const before = src.sourceFilesText?.length || 0;
+              const after = src2.sourceFilesText?.length || 0;
+              console.log(`    ✓ marches-publics deep-link: source content ${before}ch → ${after}ch`);
+              src = src2;
+              details.sourceFallbackFrom = details.sourceUrl;
+              details.sourceFallbackTo = deepLink;
+            } else {
+              console.log(`    ✗ marches-publics deep-link refetch failed — keeping original empty result`);
+            }
+          } else {
+            console.log(`    ℹ️  marches-publics: deep-link resolver returned null (search form / Recherche avancée flow didn't find the tender)`);
+          }
+        } catch (e) {
+          console.log(`    ✗ marches-publics deep-link path threw: ${(e.message || '').slice(0, 80)}`);
+        }
+      }
+
       // FORCE-LOGIN coercion — if host is in ALWAYS_LOGIN_HOSTS and we
       // haven't yet authenticated, upgrade the result to loginGated so
       // the next branch tries the credentials we have. We trigger on
