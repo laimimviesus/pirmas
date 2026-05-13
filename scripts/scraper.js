@@ -5251,10 +5251,47 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           // FileDownload.aspx to the path regex. Previously we
           // matched only Download.aspx / Documents.aspx / GetFile.aspx
           // patterns and silently missed every kommersannons doc.
-          const RX_DL_PATH = /\/(?:Download|DownloadFile|FileDownload|GetFile|DownloadAttachment|Documents?)\.(?:aspx|ashx)|\/Notice\/.*\/Download|\/Utils\/FileDownload/i;
+          //
+          // 2026-05-16 fix v3:
+          //   (a) Bug 1 — /Documents.aspx is the tab-page URL we just
+          //       navigated to (Notice/Request/Documents.aspx?
+          //       ProcurementId=X), not a real download. It used to
+          //       pollute the priority list and waste fetch cycles on
+          //       HTML auth-walls. Explicitly exclude same-URL self-
+          //       links AND any /Documents.aspx without a file-style
+          //       query param (FileId / DocId / AttachmentId).
+          //   (b) Bug 2 — FileDownload.aspx?FileId=X anchors often
+          //       have empty <a> text (the visible filename lives in
+          //       a sibling <span> or parent <td>). Walk parent
+          //       containers to find a displayable filename so the
+          //       priority scorer can match qualification vocab.
+          const RX_DL_PATH = /\/(?:Download|DownloadFile|FileDownload|GetFile|DownloadAttachment)\.(?:aspx|ashx)|\/Notice\/.*\/Download|\/Utils\/FileDownload/i;
+          const RX_DOCS_TAB = /\/Documents\.aspx(?:\?|$)/i;
           const RX_DL_EXT  = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:[?&#]|$)/i;
+
+          // Parent-walking helper: find the closest ancestor's text
+          // that contains a file-like token (extension or "filename"
+          // word). Walks up at most 4 levels.
+          const findContainerText = (el) => {
+            let cur = el.parentElement;
+            for (let i = 0; i < 4 && cur; i++) {
+              // Prefer typical row containers
+              const t = (cur.innerText || cur.textContent || '').trim();
+              if (t && t.length < 300 && /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)\b/i.test(t)) {
+                // Strip the anchor's own text repeats; trim to first line.
+                const firstLine = t.split('\n').map((s) => s.trim()).filter(Boolean)[0] || '';
+                if (firstLine.length > 3 && firstLine.length < 200) return firstLine;
+              }
+              // Stop at obvious page-level containers
+              if (/(BODY|MAIN|NAV|HEADER|FOOTER|FORM)/.test(cur.tagName || '')) break;
+              cur = cur.parentElement;
+            }
+            return '';
+          };
+
           const out = [];
           const anchors = Array.from(document.querySelectorAll('a[href]'));
+          const currentUrl = location.href.split('#')[0];
           for (const a of anchors) {
             const hrefRaw = a.getAttribute('href') || '';
             if (!hrefRaw || /^javascript:/i.test(hrefRaw) || hrefRaw === '#') continue;
@@ -5265,10 +5302,36 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
             try {
               if (new URL(abs).host !== location.host) continue;
             } catch (_) { continue; }
-            const isDl = RX_DL_PATH.test(abs) || RX_DL_EXT.test(abs);
+
+            // Self-link guard — Documents.aspx tab-page pointing to
+            // itself or to /Documents.aspx without a file-style query
+            // param (FileId / DocId / AttachmentId). User-confirmed
+            // kommersannons file URLs ALWAYS carry FileId.
+            if (RX_DOCS_TAB.test(abs)) {
+              let absNoHash = abs.split('#')[0];
+              if (absNoHash === currentUrl) continue;
+              try {
+                const u = new URL(abs);
+                const hasFileParam = ['FileId', 'fileId', 'DocId', 'docId', 'AttachmentId', 'attachmentId']
+                  .some((k) => u.searchParams.has(k));
+                if (!hasFileParam) continue;
+              } catch (_) { continue; }
+            }
+
+            const isDl = RX_DL_PATH.test(abs) || RX_DL_EXT.test(abs) || RX_DOCS_TAB.test(abs);
             if (!isDl) continue;
-            const text = ((a.innerText || a.textContent || '').trim() || a.getAttribute('title') || '')
-              .slice(0, 120);
+
+            // Capture anchor text — direct first, then title/aria-label.
+            let text = ((a.innerText || a.textContent || '').trim() || a.getAttribute('title') || a.getAttribute('aria-label') || '')
+              .slice(0, 200);
+
+            // Parent-text fallback (Bug 2 fix) — when anchor text is
+            // empty/icon-only, walk ancestors to find filename text.
+            if (!text || text.length < 4 || /^(download|h[äa]mta|t[eé]l[eé]charger|herunterladen)$/i.test(text)) {
+              const containerText = findContainerText(a);
+              if (containerText) text = containerText.slice(0, 200);
+            }
+
             // Pull filename hint from URL if present.
             let filename = '';
             try {
@@ -5300,6 +5363,32 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
 
     if (!allDocAnchors.length) {
       console.log(`    ⚠️  kommersannons: no document download anchors found across tabs`);
+      // ZERO-ANCHOR DIAGNOSTIC — dump sample button/anchor texts from
+      // the current page so we can identify what trigger we're missing.
+      // Real-world (goteborg.kommersannons.se 2026-05-15): the Documents
+      // tab shows 0 anchors because the page needs a tenant-specific
+      // button (e.g. "Visa upphandlingsdokument" / "Begär tillgång")
+      // that doesn't match the "Anmäl intresse" selector. Capture text
+      // samples so next iteration can extend the trigger regex.
+      try {
+        const sample = await page.evaluate(() => {
+          const els = Array.from(document.querySelectorAll('a, button, input[type="button"], input[type="submit"], [role="button"]'));
+          const texts = [];
+          const seen = new Set();
+          for (const el of els) {
+            const t = (el.innerText || el.value || el.textContent || el.getAttribute('aria-label') || '').trim();
+            if (!t || t.length > 80 || seen.has(t)) continue;
+            seen.add(t);
+            texts.push(t);
+            if (texts.length >= 30) break;
+          }
+          return { url: location.href, totalEls: els.length, texts };
+        }).catch(() => null);
+        if (sample) {
+          console.log(`    🔍 kommersannons zero-anchor diag: url=${sample.url.slice(0, 100)} totalEls=${sample.totalEls}`);
+          console.log(`    🔍 kommersannons clickable text samples: ${JSON.stringify(sample.texts.slice(0, 20))}`);
+        }
+      } catch (_) {}
       return [];
     }
     console.log(`    🇸🇪 kommersannons: collected ${allDocAnchors.length} unique doc anchor(s) across tabs`);
@@ -5830,6 +5919,42 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       const fixed = u.toString();
       console.log(`    ↪️  marchespublics: rewriting Mercell typo → ${fixed.slice(0, 80)}`);
       sourceUrl = fixed;
+    }
+  } catch (_) {}
+
+  // dtvp.de URL normaliser — Mercell's "Go to source" for DTVP can land
+  // on several path variants of the notice page:
+  //   /Satellite/notice/<id>                  (notice summary, no docs)
+  //   /Satellite/notice/<id>/                 (trailing slash variant)
+  //   /Satellite/notice/<id>/projectSpace     (project space landing)
+  //   /Satellite/notice/<id>/documents        (doc list page — what we want)
+  //
+  // The bulk-ZIP link "Alle Dokumente als ZIP-Datei herunterladen" is
+  // rendered on the /documents page specifically. Other entry points
+  // either don't show it at all, or hide it behind a click that triggers
+  // a tab change. Rewriting any DTVP notice URL to the /documents form
+  // upfront skips that nav and lands the generic source-page handler on
+  // the page that has the link we need.
+  //
+  // Legal context: German Vergabeverordnung §41 requires anonymous
+  // public access to procurement documents — so the /documents page is
+  // always accessible without authentication. No login flow needed.
+  // (Confirmed via DTVP info-center FAQ + BaFin Hilfestellung guide.)
+  try {
+    const u = new URL(sourceUrl);
+    if (u.hostname === 'www.dtvp.de' || u.hostname === 'dtvp.de') {
+      const noticeMatch = u.pathname.match(/^\/Satellite\/notice\/([A-Z0-9]{6,40})(?:\/.*)?$/i);
+      if (noticeMatch && !/\/documents\/?$/i.test(u.pathname)) {
+        const noticeId = noticeMatch[1];
+        u.pathname = `/Satellite/notice/${noticeId}/documents`;
+        // Reset search/hash — query params on the notice landing page
+        // (e.g. ?tab=overview) don't apply to /documents.
+        u.search = '';
+        u.hash = '';
+        const fixed = u.toString();
+        console.log(`    ↪️  dtvp: rewriting to /documents endpoint → ${fixed.slice(0, 90)}`);
+        sourceUrl = fixed;
+      }
     }
   } catch (_) {}
 
