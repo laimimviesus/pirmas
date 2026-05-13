@@ -859,6 +859,87 @@ async function clickButtonContainsText(page, text) {
   }, text);
 }
 
+// ---------------------------------------------------------------------
+// clickRobust
+// ---------------------------------------------------------------------
+// Robust click that survives Puppeteer's "Node is either not clickable
+// or not an Element" error. This happens when the element exists in the
+// DOM (waitForSelector succeeded) but Puppeteer's clickable-point check
+// fails — typical causes:
+//   - The element is animating in (opacity/transform transition)
+//   - A modal/overlay/cookie banner is covering it
+//   - The element is off-screen (needs scroll)
+//   - The element is hidden by parent display:none / visibility:hidden
+//
+// Strategy:
+//   1. Wait for selector to exist (caller may have done this already, no-op if so)
+//   2. Try scroll into view + native page.click()
+//   3. If native click throws, fall back to el.click() via page.evaluate()
+//      — DOM click() bypasses Puppeteer's clickability heuristic and works
+//      on elements that are technically in the DOM tree even if not yet
+//      visually interactive
+//
+// Returns true on any successful click, false on hard failure.
+// =====================================================================
+async function clickRobust(page, selector, opts = {}) {
+  const { timeout = 15000, retryDelay = 500 } = opts;
+  // Make sure the element is present
+  try {
+    await page.waitForSelector(selector, { timeout });
+  } catch (e) {
+    console.log(`    ⚠️  clickRobust: selector "${selector}" not found within ${timeout}ms`);
+    return false;
+  }
+  // Try scroll + native click first
+  try {
+    await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (el && typeof el.scrollIntoView === 'function') {
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      }
+    }, selector).catch(() => null);
+    await new Promise((r) => setTimeout(r, 100));
+    await page.click(selector);
+    return true;
+  } catch (e1) {
+    const msg = (e1 && e1.message || '').slice(0, 80);
+    console.log(`    ⚠️  clickRobust: native click failed (${msg}) — falling back to DOM click`);
+  }
+  // Fallback — DOM .click() via page.evaluate (bypasses clickable-point check)
+  await new Promise((r) => setTimeout(r, retryDelay));
+  try {
+    const clicked = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return false;
+      if (typeof el.scrollIntoView === 'function') {
+        el.scrollIntoView({ block: 'center', inline: 'center' });
+      }
+      // Try native HTMLElement.click() first; if missing, dispatch a click event
+      if (typeof el.click === 'function') {
+        el.click();
+      } else {
+        const rect = el.getBoundingClientRect();
+        const evt = new MouseEvent('click', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX: rect.left + rect.width / 2,
+          clientY: rect.top + rect.height / 2,
+        });
+        el.dispatchEvent(evt);
+      }
+      return true;
+    }, selector).catch(() => false);
+    if (clicked) {
+      console.log(`    ✓ clickRobust: DOM click fallback succeeded for "${selector}"`);
+      return true;
+    }
+  } catch (e2) {
+    console.log(`    ⚠️  clickRobust: DOM click fallback also failed: ${(e2.message || '').slice(0, 80)}`);
+  }
+  return false;
+}
+
 async function clickSpanContainsText(page, text) {
   return await page.evaluate((t) => {
     const spans = Array.from(document.querySelectorAll('span'));
@@ -9892,8 +9973,15 @@ async function runScraper() {
     // ---- OPEN FILTERS ----
     console.log('--- FILTERS ---');
     await clickButtonContainsText(page, 'Search & Filters');
-    await page.waitForSelector('button[data-testid="more-filters-toggle-button"]', { timeout: 15000 });
-    await page.click('button[data-testid="more-filters-toggle-button"]');
+    // 2026-05-16 FATAL fix: raw page.click() failed here with
+    // "Node is either not clickable or not an Element" — element was
+    // in DOM (waitForSelector succeeded) but Puppeteer's clickable-
+    // point check rejected it because the React re-render hadn't
+    // finished animating it in. clickRobust adds scroll-into-view +
+    // DOM-click fallback that bypasses the visibility heuristic.
+    if (!await clickRobust(page, 'button[data-testid="more-filters-toggle-button"]', { timeout: 15000 })) {
+      throw new Error('clickRobust failed: more-filters-toggle-button (1st)');
+    }
 
     await page.waitForFunction(() => {
       const loc = document.querySelector('div[data-testid="location-dropdown"]');
@@ -9913,8 +10001,9 @@ async function runScraper() {
     ];
 
     await clickButtonContainsText(page, 'Search & Filters');
-    await page.waitForSelector('button[data-testid="more-filters-toggle-button"]', { timeout: 15000 });
-    await page.click('button[data-testid="more-filters-toggle-button"]');
+    if (!await clickRobust(page, 'button[data-testid="more-filters-toggle-button"]', { timeout: 15000 })) {
+      throw new Error('clickRobust failed: more-filters-toggle-button (2nd)');
+    }
     await clickSpanContainsText(page, 'Location');
     await page.waitForSelector('span.p-treenode-label', { timeout: 15000 });
 
