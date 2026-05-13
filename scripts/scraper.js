@@ -941,13 +941,65 @@ async function clickRobust(page, selector, opts = {}) {
 }
 
 async function clickSpanContainsText(page, text) {
-  return await page.evaluate((t) => {
+  // 2026-05-16 — upgraded from raw el.click() in page.evaluate to a
+  // stamp + Puppeteer native page.click() pattern (same approach line
+  // 1073 uses for accordion checkboxes). Reason: el.click() called
+  // from page.evaluate often fails to trigger React's onClick handler
+  // on PrimeVue components (Mercell uses PrimeVue). Puppeteer's real
+  // page.click() dispatches a full mousedown/mouseup/click sequence
+  // that React's synthetic event system reliably catches.
+  //
+  // Real-world (2026-05-16 SE test run): clickSpanContainsText(page,
+  // 'Location') returned true (span was found and el.click() invoked)
+  // but the dropdown never opened — the subsequent waitForSelector
+  // 'span.p-treenode-label' timed out at 15s and aborted the whole
+  // scrape. Stamp+native-click pattern fixed it.
+  const tagged = await page.evaluate((t) => {
+    // Clear any stale stamps from prior calls
+    document.querySelectorAll('[data-mx-span-click="1"]').forEach((el) =>
+      el.removeAttribute('data-mx-span-click')
+    );
     const spans = Array.from(document.querySelectorAll('span'));
-    const el = spans.find(s => (s.textContent || '').trim().startsWith(t));
-    if (!el) return false;
-    el.click();
+    const el = spans.find((s) => (s.textContent || '').trim().startsWith(t));
+    if (!el) return { ok: false, reason: 'no matching span' };
+    el.setAttribute('data-mx-span-click', '1');
+    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+    return { ok: true };
+  }, text).catch((e) => ({ ok: false, reason: 'evaluate error: ' + (e.message || '') }));
+
+  if (!tagged.ok) {
+    console.log(`    ⚠️  clickSpanContainsText("${text}"): ${tagged.reason}`);
+    return false;
+  }
+  try {
+    await page.click('[data-mx-span-click="1"]', { delay: 20 });
     return true;
-  }, text);
+  } catch (e1) {
+    // Native click failed (rare — span may have moved during scroll).
+    // Fall back to DOM dispatch with full mouseEvent sequence.
+    const ok = await page.evaluate(() => {
+      const el = document.querySelector('[data-mx-span-click="1"]');
+      if (!el) return false;
+      const rect = el.getBoundingClientRect();
+      const opts = {
+        bubbles: true, cancelable: true, view: window,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + rect.height / 2,
+      };
+      try {
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
+        return true;
+      } catch (_) { return false; }
+    }).catch(() => false);
+    if (ok) {
+      console.log(`    ✓ clickSpanContainsText("${text}"): mouse-event fallback succeeded`);
+      return true;
+    }
+    console.log(`    ⚠️  clickSpanContainsText("${text}"): all click strategies failed (${(e1.message || '').slice(0, 80)})`);
+    return false;
+  }
 }
 
 async function checkTreeNodeByName(page, name) {
@@ -9482,7 +9534,33 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         const preview = src.bodyTextPreview || '';
         const LOGGED_IN_MARKER = /\b(?:log\s*out|log\s*off|logout|logga\s*ut|logg\s*ut|cerrar\s*sesi[oó]n|d[eé]connexion|abmelden|uitloggen|kirjaudu\s*ulos|wyloguj|sign\s*out|min(?:a)?\s*(?:profil|sidor|side)|mein\s*konto|mon\s*compte|my\s*account|my\s*pages|mitt\s*konto|moja\s*strona)\b/i;
         const hasLoggedInMarker = LOGGED_IN_MARKER.test(preview);
-        if (hostRequiresLogin(src.sourceHost) && (looksThinShell || !hasLoggedInMarker)) {
+        // 2026-05-16 — substantial-content guard.
+        //
+        // If a portal-specific handler (tendsign Flow A, e-avrop, tarjouspalvelu,
+        // kommersannons, etc.) has already fetched a meaningful blob of docs
+        // into src.sourceFilesText, the source handler did its job — DO NOT
+        // force a login that might (a) clobber the existing content and (b)
+        // fail anyway on a blocked/limited account.
+        //
+        // Real-world (2026-05-16 SE test run, tender 91596 Digitala läromedel):
+        // tendsign Flow A extracted 6 priority PDFs (Krav på anbudsgivaren,
+        // Administrativa krav, Generella krav, ...) — 93718ch into sourceFiles
+        // Text. Without this guard, the ALWAYS_LOGIN_HOSTS coercion fired
+        // and forced a re-login (which failed with "account blocked"); the
+        // failed-login branch never copied the 93718ch back into
+        // details.pdfText, so the AI only saw 154ch of Mercell metadata.
+        // Symptom: scope filled but no qualifications.
+        //
+        // Mirror of the dtvp.de fix in Task #8 (same overwrite pattern).
+        const hasSubstantialSourceContent =
+          src.sourceFilesText && src.sourceFilesText.length > 1000;
+        if (hostRequiresLogin(src.sourceHost) && hasSubstantialSourceContent) {
+          console.log(
+            `    ✓ host ${src.sourceHost} normally forces login, but source handler ` +
+            `already extracted ${src.sourceFilesText.length}ch — skipping forced login ` +
+            `to preserve the content`
+          );
+        } else if (hostRequiresLogin(src.sourceHost) && (looksThinShell || !hasLoggedInMarker)) {
           const trigger = looksThinShell ? 'thin-shell' : 'no-logged-in-marker';
           console.log(`    🔐 host ${src.sourceHost} in ALWAYS_LOGIN_HOSTS (trigger=${trigger}, bodyLen=${bodyLen}) — forcing login`);
           src.loginGated = true;
@@ -10004,8 +10082,39 @@ async function runScraper() {
     if (!await clickRobust(page, 'button[data-testid="more-filters-toggle-button"]', { timeout: 15000 })) {
       throw new Error('clickRobust failed: more-filters-toggle-button (2nd)');
     }
-    await clickSpanContainsText(page, 'Location');
-    await page.waitForSelector('span.p-treenode-label', { timeout: 15000 });
+    const locClicked = await clickSpanContainsText(page, 'Location');
+    if (!locClicked) {
+      // Fallback — try clicking the location-dropdown div directly.
+      // Some Mercell UI variants render Location label as part of a
+      // div[data-testid="location-dropdown"] rather than a clickable span.
+      console.log('    ↪️  Location span click failed — trying location-dropdown div directly');
+      await clickRobust(page, 'div[data-testid="location-dropdown"]', { timeout: 5000 }).catch(() => false);
+    }
+    try {
+      await page.waitForSelector('span.p-treenode-label', { timeout: 15000 });
+    } catch (e) {
+      // Diagnostic dump so we know what DOM state we're in when the
+      // treenode never appears. Common causes: Location dropdown didn't
+      // open, Mercell UI restructured, network is slow.
+      const diag = await page.evaluate(() => {
+        const drop = document.querySelector('div[data-testid="location-dropdown"]');
+        const spans = Array.from(document.querySelectorAll('span'))
+          .map((s) => (s.textContent || '').trim())
+          .filter((t) => t && t.length < 40)
+          .slice(0, 30);
+        const ariaExpanded = drop?.getAttribute('aria-expanded');
+        return {
+          url: location.href,
+          dropdownFound: !!drop,
+          ariaExpanded,
+          dropdownClasses: drop?.className || '',
+          treenodeCount: document.querySelectorAll('span.p-treenode-label').length,
+          sampleSpans: spans,
+        };
+      }).catch(() => null);
+      console.log(`    ✗ p-treenode-label wait failed — diag: ${JSON.stringify(diag)}`);
+      throw e;
+    }
 
     await page.evaluate(() => {
       const btn = document.querySelector('button[data-testid="show-more-button"]');
