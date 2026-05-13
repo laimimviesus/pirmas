@@ -21,12 +21,24 @@ on:
         default: ''
         type: string
   schedule:
-    - cron: '0 0 * * *'
+    # 19:27 UTC = 21:27 Lithuanian time (winter, UTC+2) / 22:27 (summer, UTC+3).
+    # User intent: trigger AFTER 19:00 local time, when buyers have finished
+    # entering tender data into procurement databases for the day.
+    #
+    # The "0 0 * * *" (midnight UTC) cron used previously hit GitHub Actions'
+    # busiest scheduling slot and was routinely delayed 50-60+ minutes or
+    # skipped entirely. We use 19:27 — off the hour boundary, off-peak — to
+    # maximise on-time triggering. Avoiding :00, :15, :30, :45 minute marks
+    # too since those are also congested.
+    - cron: '27 19 * * *'
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 600
+    # GitHub-hosted runners enforce a HARD 360-minute (6h) cap regardless
+    # of timeout-minutes value. The previous 600 was ineffective. 350 keeps
+    # us safely below the cap while still allowing a slow full daily run.
+    timeout-minutes: 350
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
