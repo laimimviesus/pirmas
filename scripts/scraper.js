@@ -274,6 +274,54 @@ const LOGIN_URLS = {
   // tendsign.com keeps its login form on the tender URL via redirect,
   // so the default flow works — no override needed.
 };
+// ---------------------------------------------------------------------
+// normalizeSourceUrl
+// ---------------------------------------------------------------------
+// Apply early URL fixes BEFORE the URL is used by any consumer (source
+// fetch, login goto, deep-link resolver). Previously these fixes lived
+// only inside fetchSourcePageDetails — but downstream callers like
+// attemptPortalLogin received the original Mercell-provided URL and
+// hit ERR_NAME_NOT_RESOLVED on typo'd domains.
+//
+// Currently handles:
+//   - marchespublics.gouv.fr (no hyphen) → marches-publics.gouv.fr
+//   - http://marches-publics.gouv.fr     → https:// (forced HTTPS)
+//   - dtvp.de notice pages without /documents suffix → add /documents
+//
+// Safe to call repeatedly — operations are idempotent.
+function normalizeSourceUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
+  let u;
+  try { u = new URL(rawUrl.trim()); }
+  catch (_) { return rawUrl; }
+
+  let changed = false;
+
+  // marches-publics.gouv.fr typo fix (Mercell occasionally drops the hyphen)
+  if (u.hostname === 'www.marchespublics.gouv.fr' || u.hostname === 'marchespublics.gouv.fr') {
+    u.hostname = 'www.marches-publics.gouv.fr';
+    changed = true;
+  }
+  // Force HTTPS on marches-publics (it's a 301→https on the real domain anyway)
+  if (/(^|\.)marches-publics\.gouv\.fr$/i.test(u.hostname) && u.protocol === 'http:') {
+    u.protocol = 'https:';
+    changed = true;
+  }
+
+  // dtvp.de — rewrite any notice URL to its /documents endpoint
+  if (u.hostname === 'www.dtvp.de' || u.hostname === 'dtvp.de') {
+    const noticeMatch = u.pathname.match(/^\/Satellite\/notice\/([A-Z0-9]{6,40})(?:\/.*)?$/i);
+    if (noticeMatch && !/\/documents\/?$/i.test(u.pathname)) {
+      u.pathname = `/Satellite/notice/${noticeMatch[1]}/documents`;
+      u.search = '';
+      u.hash = '';
+      changed = true;
+    }
+  }
+
+  return changed ? u.toString() : rawUrl;
+}
+
 function getDedicatedLoginUrl(host, sourceUrl) {
   if (!host) return null;
   const h = String(host).trim().toLowerCase().replace(/^www\./, '');
@@ -2191,7 +2239,89 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
     page = await browser.newPage();
     page.setDefaultNavigationTimeout(15000);
     await page.goto(searchPage, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    await new Promise((r) => setTimeout(r, 1500));
+    // Longer wait — marches-publics is ASP.NET, takes 2-3s to render
+    // forms even on warm requests
+    await new Promise((r) => setTimeout(r, 3000));
+
+    // STEP 0 — landing diagnostic + Recherche avancée fallback.
+    //
+    // 2026-05-16: when the user is logged in, marches-publics often
+    // redirects /?page=Entreprise.EntrepriseAdvancedSearch&AllCons to
+    // the /entreprise/ DASHBOARD ("Bienvenue Mon compte Déconnexion ...
+    // Mon panier Consultations en cours") instead of rendering the
+    // advanced search form. The form has zero visible inputs because
+    // it's on a DIFFERENT page reachable via the "Recherche avancée"
+    // link in the side menu.
+    //
+    // Detect that we landed on dashboard (no text inputs visible) and
+    // click "Recherche avancée" link to reach the real search form.
+    const landing = await page.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
+      const visibleInputs = inputs.filter((i) => i.offsetParent !== null);
+      const links = Array.from(document.querySelectorAll('a'));
+      const advancedLink = links.find((a) => {
+        const t = (a.innerText || a.textContent || '').trim();
+        return /^\s*recherche\s+avanc[eé]e\s*$/i.test(t);
+      });
+      return {
+        url: location.href,
+        title: document.title,
+        visibleInputCount: visibleInputs.length,
+        hasAdvancedLink: !!advancedLink,
+      };
+    }).catch(() => null);
+    if (landing) {
+      console.log(
+        `    🔎 marches-publics landing: url=${(landing.url || '').slice(-80)} ` +
+        `title="${(landing.title || '').slice(0, 60)}" ` +
+        `visibleInputs=${landing.visibleInputCount} ` +
+        `hasAdvancedLink=${landing.hasAdvancedLink}`
+      );
+    }
+    if (landing && landing.visibleInputCount === 0 && landing.hasAdvancedLink) {
+      console.log(`    ↪️  no inputs on landing — clicking "Recherche avancée" link to reach search form`);
+      const clicked = await page.evaluate(() => {
+        const links = Array.from(document.querySelectorAll('a'));
+        const advancedLink = links.find((a) => {
+          const t = (a.innerText || a.textContent || '').trim();
+          return /^\s*recherche\s+avanc[eé]e\s*$/i.test(t);
+        });
+        if (!advancedLink) return false;
+        advancedLink.setAttribute('data-mx-rech-click', '1');
+        try { advancedLink.scrollIntoView({ block: 'center' }); } catch (_) {}
+        return true;
+      }).catch(() => false);
+      if (clicked) {
+        try {
+          await Promise.race([
+            page.click('[data-mx-rech-click="1"]'),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('click timeout')), 4000)),
+          ]);
+        } catch (_) {
+          // Fallback: DOM-click via evaluate
+          await page.evaluate(() => {
+            const el = document.querySelector('[data-mx-rech-click="1"]');
+            if (el) el.click();
+          }).catch(() => null);
+        }
+        await Promise.race([
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => null),
+          new Promise((r) => setTimeout(r, 3500)),
+        ]);
+        await new Promise((r) => setTimeout(r, 1500));
+        const afterClick = await page.evaluate(() => {
+          const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
+          return {
+            url: location.href,
+            visibleInputCount: inputs.filter((i) => i.offsetParent !== null).length,
+          };
+        }).catch(() => null);
+        if (afterClick) {
+          console.log(`    🔎 after Recherche avancée click: url=${(afterClick.url || '').slice(-80)} visibleInputs=${afterClick.visibleInputCount}`);
+        }
+      }
+    }
+
     // Step 1: find an input that looks like a reference/numéro de
     // consultation field. marches-publics uses ASP.NET-style ids
     // (`ctl0_CONTENU_PAGE_AdvancedSearch_reference`) so we match by
@@ -8361,7 +8491,16 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       if (fields.qualification) details.qualificationRequirements = fields.qualification;
       if (fields.requirements) details.requirementsForSupplier = fields.requirements;
       if (fields.description && !details.scopeOfAgreement) details.scopeOfAgreement = fields.description;
-      if (fields.sourceUrl) details.sourceUrl = fields.sourceUrl;
+      if (fields.sourceUrl) {
+        // Apply early URL normalisation so all downstream consumers
+        // (source fetch, login goto, deep-link resolver) see the
+        // corrected URL — not just fetchSourcePageDetails.
+        const normalized = normalizeSourceUrl(fields.sourceUrl);
+        if (normalized !== fields.sourceUrl) {
+          console.log(`    ↪️  normalised sourceUrl: ${fields.sourceUrl.slice(0, 60)} → ${normalized.slice(0, 80)}`);
+        }
+        details.sourceUrl = normalized;
+      }
       if (fields.cpvCodes && !details.cpvCodes) details.cpvCodes = fields.cpvCodes;
 
       // Logginam ką radom iš JSON'o, kad paprasta debugint kokie laukai buvo užpildyti
