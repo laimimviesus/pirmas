@@ -786,32 +786,29 @@ async function extractFieldsWithAI(text, meta = {}) {
   const trimmed = String(text).slice(0, 150000);
   const system =
     'You extract structured procurement tender fields from free-form notice text plus attached document text. ' +
-    'The user message has sections labeled TITLE / DESCRIPTION / MERCELL_PAGE / DOCUMENTS — the DOCUMENTS section, when present, contains the FULL TEXT of one or more attached PDF specifications and is usually where requirements, qualifications, and award criteria are spelled out. SCAN IT THOROUGHLY before deciding a field is empty. ' +
-    'Inside the DOCUMENTS section you may see one or more [STRUCTURED HINTS] … [/STRUCTURED HINTS] blocks: those contain ~1200-char windows centred on the SPECIFIC heading anchors ("Selection criteria", "Solvencia técnica", "Eignungskriterien", "Critères de sélection", etc.) where the qualification thresholds, certification names, and award-criteria weights live. Treat the text inside [STRUCTURED HINTS] as the PRIMARY source for `requirementsForSupplier`, `qualificationRequirements`, and `offerWeighingCriteria` — only fall back to scanning the surrounding flat text when the hints block is missing or doesn\'t cover a particular field. ' +
+    'The user message has sections labeled TITLE / DESCRIPTION / MERCELL_PAGE / DOCUMENTS. Scan ALL sections thoroughly. ' +
     'Return ONLY a JSON object (no prose, no markdown fences) with these keys: ' +
     'maxBudget, estimatedBudgetEur, duration, requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement, rejectReason, rejectCategory.\n' +
     'Rules:\n' +
-    '- maxBudget: total ceiling / max contract value AS STATED in the tender or attached docs (with currency code, ex-VAT if specified). Examples: "1,200,000 EUR (ex VAT)", "8 500 000 SEK". Empty string if not explicitly stated anywhere.\n' +
-    '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND the description/documents give enough basis (scope, deliverables, duration, country, complexity). Use realistic public-sector IT contract rates for that country. Output a plain integer like 850000 (no separators, no currency, no words). Empty string if you cannot estimate responsibly.\n' +
-    '- duration: contract length in months or years. Example: "36 months" or "2 years + 2 x 1 year option". Empty string if not stated.\n' +
-    '- requirementsForSupplier: concise bullet-style summary (≤600 chars) of MANDATORY supplier/bidder requirements. Include CONCRETE values verbatim where present (e.g. "ISO 27001 certificate", "minimum 3 years operation", "SARA-PdP accreditation", "Plan de Igualdad inscrito", "≥2% trabajadores con discapacidad", "Tier IV CPD certified"). Look in DOCUMENTS for: "Requirements", "Mandatory requirements", "Reikalavimai tiekėjui", "Wymagania", "Anforderungen an den Bieter", "Krav til leverandør", "Eisen aan inschrijver", "Exigences", "Requisitos", "Condiciones de admisión", "Requisitos de participación de los licitadores", "Aptitud para contratar". Empty string if truly absent.\n' +
-    '- qualificationRequirements: concise bullet-style summary (≤700 chars) of SELECTION / qualification criteria. Copy CONCRETE NUMBERS VERBATIM — turnover thresholds in EUR, technical-experience minimums in EUR/years, certification names (ISO 27001/27017/27018, ENS Alto, Eurprivacy, ENI, SARA-PdP), reference counts ("≥2 verifiable references"), team-size minimums. When the document gives PER-LOTE values (Lote 1/2/3), include all of them. Look for: "Selection criteria", "Qualification", "Kvalifikaciniai reikalavimai", "Kwalifikacja", "Eignungskriterien", "Kvalifikasjonskrav", "Solvencia económica, financiera y técnica", "Solvencia técnica o profesional", "Solvencia económica y financiera", "Criterio de Solvencia Técnica-Profesional", "Criterio de Solvencia Económica-Financiera", "Cláusula 11", "Cláusula 14", "Cláusula 15", "Apartado 15", "Cuadro de Características", "ANEXO 3", "Volumen anual de negocios", "Cifra anual de negocio", "Importe anual acumulado". The PLACSP / Spanish PCAP format puts the concrete numbers in ANEXO 3 (page 49–55 typically) under "SOLVENCIA ECONÓMICA Y FINANCIERA" and "SOLVENCIA TÉCNICA". Spanish German Vergabe puts them under "Eignungskriterien". Empty string if truly absent.\n' +
-    '- offerWeighingCriteria: award criteria with weights if present. Example: "Price 40%, Quality 35%, Delivery time 25%" or "MEAT — lowest price". Look for "Award criteria", "Evaluation", "Vertinimo kriterijai", "Kryteria oceny", "Zuschlagskriterien", "Tildelingskriterier", "Criterios de adjudicación", "Criterios evaluables mediante aplicación de fórmulas", "Criterios evaluables mediante un juicio de valor", "Apartado 21", "Ponderación". When weights add up to 100, list each named criterion with its weight. Empty string if truly absent.\n' +
+    '- maxBudget: total ceiling / max contract value AS STATED in the tender. Empty string if not explicitly stated.\n' +
+    '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND description gives enough basis.\n' +
+    '- duration: contract length in months or years. Empty string if not stated.\n' +
+    '- requirementsForSupplier: concise bullet-style summary. MUST EXTRACT EXACT METRICS: specific ISO certifications (e.g., ISO 27001, 9001), exact financial thresholds, and security/compliance standards. DO NOT invent or generalize.\n' +
+    '- qualificationRequirements: concise bullet-style summary. CRITICAL: You must extract EXACT MEASURABLE METRICS for company and experts. Include exact years of required experience (e.g., "minimum 2 years of Java"), exact number of required reference projects (e.g., "2 verifiable projects in 3 years"), credit ratings (e.g., "Rating Alfa"), turnover requirements (e.g., "€50,000 per fiscal year"), and specific named expert roles. DO NOT hallucinate. If metrics are not stated, do not invent them.\n' +
+    '- offerWeighingCriteria: award criteria with weights if present (e.g., "Price 40%, Quality 60%").\n' +
     '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English.\n' +
-    '- rejectReason: short English string (≤120 chars) explaining WHY this tender is a poor fit for our company, OR empty string if a good fit. We are a small custom-software development & consulting firm. We BUILD our own software from scratch and provide development/advisory services. We DO NOT resell licences, deliver hardware, install branded products, or do on-site work. Reject (set rejectReason) when ANY of these apply, with priority on the FIRST match found:\n' +
-    '   • License/reseller partnership required: tender wants an "authorized partner", "license partner", "licence reseller", "OEM partner", "channel partner", "official representative" of a named vendor (Microsoft, Oracle, SAP, Cisco, IBM, VMware, Adobe, Salesforce, Atlassian, ServiceNow, AWS, Azure, GCP, etc.). Set rejectReason="license_partner_required: <vendor>".\n' +
-    '   • Branded/named product supply or installation: tender procures specific named software/hardware (e.g. "supply and install Cisco switches", "Milestone XProtect maintenance", "SAP S/4HANA implementation", "Oracle DB licences"). Set rejectReason="branded_product_supply: <product>".\n' +
-    '   • SaaS development for a third party (we don\'t build SaaS platforms for others to resell). Set rejectReason="saas_development".\n' +
-    '   • Physical / on-site / contact-based work: equipment delivery, hardware installation, cabling, on-premises implementation requiring presence at client site, field service, biuro/objekto remontas. Set rejectReason="physical_onsite_work".\n' +
-    '   • Network / telecom infrastructure: LAN/WAN setup, switches/routers/firewalls, telephony, ISP services, network monitoring infrastructure. Set rejectReason="network_infrastructure".\n' +
-    '   • AI research projects (academic-style ML research, not applied AI integration). Set rejectReason="ai_research".\n' +
-    '   • Cybersecurity-only services (penetration testing, SOC, incident response, security audits as primary deliverable). Set rejectReason="cybersecurity_only".\n' +
-    '   • Helpdesk / end-user support (TIER-1 / first-level only). REJECT only if the tender CLEARLY requires staffing a call centre / ticket-triage queue for ordinary end-users — look for explicit signals: "atención a usuarios", "primer nivel de atención", "call centre", "ticket triage", "soporte de primera línea", "Anwenderbetreuung", "Helpdesk de usuarios". DO NOT REJECT if the tender mentions "soporte técnico" alongside "mantenimiento", "evolución", "desarrollo", "L2/L3", "soporte avanzado", "consultoría", or describes maintenance of CUSTOM systems (servicios de soporte y mantenimiento de sistemas) — that is application maintenance / dev-ops support and ACCEPTED. When in doubt, ACCEPT and let the human review. Set rejectReason="helpdesk_support" only on clear tier-1 cases.\n' +
-    '   • Authorized representation requirement: tender requires being an authorized agent / certified representative of a specific organization for the deliverable. Set rejectReason="authorized_representation".\n' +
-    '   AMBIGUOUS PROCUREMENT — when the tender says "procurement of a system" / "system implementation": look for clarifying signals. If documents indicate it\'s a NEW system being built from scratch, custom development, bespoke solution → ACCEPT (empty rejectReason). If it\'s installation of an existing finished product / off-the-shelf software / branded vendor product → REJECT with rejectReason="branded_product_supply: <product>". If unclear, default to ACCEPT and add rejectReason="ambiguous_procurement_check_manually" so the human can decide.\n' +
-    '   ACCEPT (empty rejectReason) when the tender is: custom software development, system development, application development, web/mobile app development, software consulting, advisory services, technical analysis, business analysis, requirements engineering, architecture design, software maintenance/evolution of custom systems, code-level support, agile delivery teams.\n' +
-    '- rejectCategory: short machine-readable category matching the rejectReason prefix (e.g. "license_partner_required", "branded_product_supply", "saas_development", "physical_onsite_work", "network_infrastructure", "ai_research", "cybersecurity_only", "helpdesk_support", "authorized_representation", "ambiguous_procurement_check_manually"). Empty string if not rejected.\n' +
-    'Write all field values in English even if the source is in another language. Never invent specifics — but DO synthesize when documents clearly imply requirements (e.g., "ISO 27001 certificate" listed under "Mandatory documents" → include in requirementsForSupplier). If a field is genuinely not present, use an empty string.';
+    '- rejectReason: short English string (≤120 chars) explaining WHY this tender is a poor fit, OR empty string if a good fit. We are a custom-software development firm that BUILDS systems from scratch. Reject (set rejectReason) when ANY of these apply:\n' +
+    '   • SaaS Provision/Creation: Tender procures a SaaS subscription, or asks to build a SaaS platform for them to resell. Set rejectReason="saas_provision_or_creation".\n' +
+    '   • Off-The-Shelf (COTS) Implementation: Tender is for deploying, configuring, maintaining or licensing an existing finished product/platform (e.g., Salesforce, SAP, Dynamics, ServiceNow, Oracle, standard CMS). Set rejectReason="cots_implementation_or_licenses".\n' +
+    '   • Helpdesk/Support Only: Primary scope is L1/L2 helpdesk, end-user support, client management, or continuous maintenance of systems we did not build. Set rejectReason="helpdesk_support_only".\n' +
+    '   • Training/Workshops: Scope is purely delivering educational courses, IT training, or workshops without software development. Set rejectReason="training_workshops_only".\n' +
+    '   • Non-IT / Construction: Construction, physical engineering, physical security, cleaning. Set rejectReason="non_it_construction".\n' +
+    '   • Surveys/Research: Conducting public surveys, sociological polling, non-IT market research. Set rejectReason="surveys_market_research".\n' +
+    '   • GIS / Geo-specific: Geographic Information Systems (GIS), geological mapping, spatial data systems requiring specific local geographical knowledge/access. Set rejectReason="gis_geospatial".\n' +
+    '   • Physical/Infrastructure: Hardware delivery, cabling, network/telecom infra. Set rejectReason="hardware_network_infra".\n' +
+    '   AMBIGUOUS PROCUREMENT: If it says "system implementation" but implies configuring an off-the-shelf product → REJECT. ACCEPT (empty rejectReason) ONLY if it is custom software development, web/mobile app dev from scratch, bespoke architecture, or maintenance/evolution of custom systems.\n' +
+    '- rejectCategory: short machine-readable category matching the rejectReason. Empty string if not rejected.\n' +
+    'Write all field values in English. Use exact numbers from the source.';
   const metaLine = [
     meta.title ? `Title: ${meta.title}` : '',
     meta.buyer ? `Buyer: ${meta.buyer}` : '',
@@ -10673,7 +10670,8 @@ async function runScraper() {
       'DATE OF WHEN ADDED TO THE LIST',
       'BIDDING ANNOUCEMENT DATE',
       'LINK TO THE PAGE TENDER WAS PUBLISHED ON',
-      'TENDER NAME',
+      'TENDER NAME (Original)',
+      'TENDER NAME (English)',
       'BIDDING ORGANISATION',
       'BIDDING DEADLINE DATE',
       'COUNTRY',
@@ -10688,271 +10686,30 @@ async function runScraper() {
       'Reference number',
       'KEYWORDS',
     ];
-
-    let existingIds = new Set();
-    try {
-      const existing = await sheets.spreadsheets.values.get({
-        spreadsheetId: SHEET_ID,
-        range: `${TAB_NAME}!A1:Q`,
-      });
-      const rows = existing.data.values || [];
-      const hasHeader = rows[0] && rows[0][0] === SHEET_HEADERS[0];
-
-      if (!hasHeader && rows.length === 0) {
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: SHEET_ID,
-          range: `${TAB_NAME}!A1`,
-          valueInputOption: 'RAW',
-          requestBody: { values: [SHEET_HEADERS] },
-        });
-        console.log('Header row inserted (empty sheet)');
-      }
-
-      for (let i = hasHeader ? 1 : 0; i < rows.length; i++) {
-        const link = rows[i][2] || rows[i][14] || '';
-        const id = extractTenderId(link);
-        if (id) existingIds.add(id);
-      }
-      console.log(`Existing tender IDs in sheet: ${existingIds.size}`);
-    } catch (e) {
-      console.log('WARN: could not read existing sheet:', e.message);
-    }
-
-    const newTenders = allTenders.filter(t => !existingIds.has(t.tenderId));
-    console.log(`New tenders: ${newTenders.length} (${allTenders.length - newTenders.length} already in sheet)`);
-
-    // ---- FETCH DETAILS + INCREMENTAL APPEND ----
-    // SVARBU: GitHub Actions job'as turi 6h cap. Per praėjusį pilną run'ą
-    // job'as buvo nutrauktas 6h 5m ribose, o visas `sheets.append` iškvie-
-    // timas vyko tik loop'o gale → niekas nespėjo būti įrašyta. Dabar
-    // flushinam kas `FLUSH_BATCH` tenderių, plus SIGTERM/SIGINT handler'is
-    // išsaugo likusias eilutes, kai runner'is bando nužudyti procesą.
-    const toFetch = newTenders.slice(0, DETAILS_LIMIT);
-    console.log(`--- FETCHING DETAILS (${toFetch.length}) with flush batch ${FLUSH_BATCH} ---`);
-
-    const nowIso = new Date().toISOString().slice(0, 10);
-
-    const fmtDate = (s) => {
-      if (!s) return '';
-      const str = String(s).trim();
-      const m = str.match(/^(\d{4}-\d{2}-\d{2})T/);
-      if (m) return m[1];
-      return str;
-    };
-    // HTML entity decoder — Mercell scope/requirements often contain
-    // `&#61;` (=), `&amp;`, `&#39;` ('), `&quot;`, `&lt;`, `&gt;`, `&nbsp;`
-    // and numeric entities like `&#8211;` (en-dash). Sheet rendered them
-    // raw, so we normalise here before handing the string to the sheet or AI.
-    const NAMED_ENTITIES = {
-      amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
-      laquo: '«', raquo: '»', hellip: '…', mdash: '—', ndash: '–',
-      lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”', bull: '•',
-      copy: '©', reg: '®', trade: '™', deg: '°', middot: '·',
-    };
-    const decodeHtmlEntities = (s) => {
-      if (!s) return '';
-      return String(s)
-        .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
-          const code = parseInt(hex, 16);
-          return Number.isFinite(code) ? String.fromCodePoint(code) : _;
-        })
-        .replace(/&#(\d+);/g, (_, num) => {
-          const code = parseInt(num, 10);
-          return Number.isFinite(code) ? String.fromCodePoint(code) : _;
-        })
-        .replace(/&([a-zA-Z]+);/g, (orig, name) =>
-          NAMED_ENTITIES[name.toLowerCase()] !== undefined
-            ? NAMED_ENTITIES[name.toLowerCase()]
-            : orig
-        );
-    };
-
-    const cleanDescription = (v) => {
-      if (!v) return '';
-      const s = String(v);
-      let out = s;
-      if (s.includes('languageCode') && s.includes('text')) {
-        try {
-          const arr = JSON.parse(s.startsWith('[') ? s : `[${s}]`);
-          if (Array.isArray(arr)) {
-            const en = arr.find((x) => x && x.languageCode === 'en');
-            const pick = en || arr[0];
-            if (pick && pick.text) out = String(pick.text);
-          }
-        } catch (_) {
-          const texts = [...s.matchAll(/"text"\s*:\s*"([^"]*(?:\\.[^"]*)*)"/g)]
-            .map((m) => m[1].replace(/\\"/g, '"').replace(/\\n/g, ' '));
-          if (texts.length) out = texts[0];
-        }
-      }
-      // Decode HTML entities (handles &#61;, &amp;, &#39;, &quot;, numeric
-      // decimal/hex, and common named entities). Safe to run repeatedly.
-      out = decodeHtmlEntities(out);
-      // Collapse whitespace runs (incl. NBSP leftovers) and trim.
-      out = out.replace(/[\u00A0\s]+/g, ' ').trim();
-      return out;
-    };
-    const cleanOrg = (v) => {
-      if (!v) return '';
-      const s = String(v).trim();
-      const first = s.split(/\n|\r/).map((x) => x.trim()).filter(Boolean)[0];
-      return first || s;
-    };
-
-    // --- KEYWORD TAGGING ------------------------------------------------
-    // Sales komanda nori matyti, kurie iš jų bendrai sekamų raktinių
-    // žodžių atitinka tender'į. Surinktus žodžius grąžinam kaip
-    // comma-separated list'ą paskutiniame sheet'o stulpelyje ("KEYWORDS").
-    // Match'as vykdomas regex'u ant EN tikro teksto (title + scope +
-    // requirements + qualifications + criteria + keywords iš CPV aprašymo).
-    const KEYWORD_PATTERNS = [
-      { label: 'software development', re: /\b(software\s*development|custom\s*software|bespoke\s*software)\b/i },
-      { label: 'project management',   re: /\b(project\s*management|programme\s*management|programme\s*manager|PMP|prince2)\b/i },
-      { label: 'Agile',                re: /\b(agile|scrum|kanban|SAFe|sprint\s*planning)\b/i },
-      { label: 'AI',                   re: /\b(AI|artificial\s*intelligence|machine\s*learning|\bML\b|LLM|generative\s*ai|genai|deep\s*learning|neural\s*network)\b/i },
-      { label: 'IT',                   re: /\b(IT\s*services?|ICT|information\s*technology|IT\s*systems?)\b/i },
-      { label: 'system support',       re: /\b(system\s*support|application\s*support|maintenance\s*and\s*support|technical\s*support)\b/i },
-      { label: 'application development', re: /\b(application\s*development|app\s*development|web\s*application|mobile\s*application)\b/i },
-      { label: 'JAVA',                 re: /\b(java|spring\s*boot|\bJVM\b|jakarta\s*ee|javaee)\b/i },
-      { label: 'Python',               re: /\b(python|django|flask|fastapi)\b/i },
-      { label: 'React',                re: /\b(react(?!\s*native)|reactjs|next\.?js)\b/i },
-      { label: 'React Native',         re: /\b(react\s*native)\b/i },
-      { label: 'IT system modernization', re: /\b(system\s*modernization|legacy\s*modernization|legacy\s*migration|modernisation|replatforming)\b/i },
-      { label: 'cloud-native development', re: /\b(cloud[-\s]*native|AWS|azure|GCP|kubernetes|\bK8s\b|microservices|serverless)\b/i },
-      { label: 'quality assurance',    re: /\b(quality\s*assurance|\bQA\b|test\s*automation)\b/i },
-      { label: 'testing',              re: /\b(testing|test\s*management|test\s*strategy|test\s*cases?)\b/i },
-      { label: 'user interface',       re: /\b(user\s*interface|\bUI\s*design|\bUI\b(?!\w))\b/i },
-      { label: 'system implementation', re: /\b(system\s*implementation|rollout|deployment|go[-\s]*live)\b/i },
-      { label: 'UX/UI',                re: /\b(UX\/UI|UI\/UX|UX\s*design|user\s*experience|\bUX\b(?!\w))\b/i },
-    ];
-    const matchKeywords = (texts) => {
-      const blob = (Array.isArray(texts) ? texts : [texts]).filter(Boolean).join(' \n ');
-      if (!blob.trim()) return '';
-      const matched = new Set();
-      for (const { label, re } of KEYWORD_PATTERNS) {
-        if (re.test(blob)) matched.add(label);
-      }
-      return Array.from(matched).join(', ');
-    };
-
-    // --- BUDGET PARSER (into EUR) --------------------------------------
-    // Grąžina { amount: number|null, known: boolean }. Palaiko:
-    //   "1,200,000 EUR", "1 200 000,00 €", "€1.5 million", "200k NOK",
-    //   "2,5 mln EUR", "no limit", "€30" (suspect — grąžinam kaip 30).
-    // Valiutos: EUR/€, NOK, SEK, DKK, GBP/£, USD/$ — verčiam į EUR pagal
-    // grubų kursą (užtenka "virš/po 500K" filtrui).
-    const FX_TO_EUR = {
-      EUR: 1, '€': 1,
-      NOK: 0.087, SEK: 0.088, DKK: 0.134,
-      GBP: 1.17, '£': 1.17,
-      USD: 0.92, '$': 0.92,
-      PLN: 0.23, CZK: 0.040, HUF: 0.0026,
-    };
-    const parseEurBudget = (raw) => {
-      if (!raw) return { amount: null, known: false };
-      let s = String(raw).trim();
-      if (!s) return { amount: null, known: false };
-      // Anything saying "no limit", "unknown", "not specified" — treat as unknown.
-      if (/\b(no\s*limit|unknown|not\s*specified|n\/?a|none)\b/i.test(s)) {
-        return { amount: null, known: false };
-      }
-      // Pick currency
-      let fx = 1;
-      let currencyMatched = null;
-      for (const code of ['EUR', 'NOK', 'SEK', 'DKK', 'GBP', 'USD', 'PLN', 'CZK', 'HUF']) {
-        const re = new RegExp('\\b' + code + '\\b', 'i');
-        if (re.test(s)) { fx = FX_TO_EUR[code]; currencyMatched = code; break; }
-      }
-      if (!currencyMatched) {
-        if (/€/.test(s)) fx = FX_TO_EUR['€'];
-        else if (/£/.test(s)) fx = FX_TO_EUR['£'];
-        else if (/\$/.test(s)) fx = FX_TO_EUR['$'];
-      }
-      // Multiplier (million / billion / k)
-      let mult = 1;
-      if (/\b(bln|bil(?:lion)?|mlrd|miljard)\b/i.test(s)) mult = 1e9;
-      else if (/\b(mln|mio|million|milj|miljoon)\b/i.test(s)) mult = 1e6;
-      else if (/\b(k|thousand|tuhat|tys)\b/i.test(s) && !/\bEUR\s*k\b/i.test(s)) mult = 1e3;
-      // Strip currency markers, whitespace, letters; keep digits/./,/-
-      let numStr = s
-        .replace(/(EUR|NOK|SEK|DKK|GBP|USD|PLN|CZK|HUF|€|£|\$)/gi, ' ')
-        .replace(/\b(mln|mio|million|milj|miljoon|bln|bil|billion|mlrd|miljard|k|thousand|tuhat|tys)\b/gi, ' ')
-        .replace(/[^0-9.,\s-]/g, ' ')
-        .trim();
-      // If both '.' and ',' present, assume comma = thousands (EU style uses
-      // comma as decimal but also common to see space/thousands), heuristika:
-      //   "1,200,000.50" → 1200000.50  (US)
-      //   "1.200.000,50" → 1200000.50  (EU)
-      if (numStr.includes('.') && numStr.includes(',')) {
-        if (numStr.lastIndexOf(',') > numStr.lastIndexOf('.')) {
-          // EU: dot = thousands, comma = decimal
-          numStr = numStr.replace(/\./g, '').replace(',', '.');
-        } else {
-          // US: comma = thousands, dot = decimal
-          numStr = numStr.replace(/,/g, '');
-        }
-      } else if (numStr.includes(',')) {
-        // Only comma: decide by position. If comma followed by 1-2 digits at
-        // end, treat as decimal; otherwise as thousands separator.
-        if (/,\d{1,2}$/.test(numStr)) numStr = numStr.replace(',', '.');
-        else numStr = numStr.replace(/,/g, '');
-      }
-      numStr = numStr.replace(/\s+/g, '').replace(/^0+(?=\d)/, '');
-      const firstMatch = numStr.match(/-?\d+(?:\.\d+)?/);
-      if (!firstMatch) return { amount: null, known: false };
-      const n = parseFloat(firstMatch[0]);
-      if (!Number.isFinite(n) || n <= 0) return { amount: null, known: false };
-      const eur = n * mult * fx;
-      return { amount: eur, known: true };
-    };
-    const formatEurBudget = (raw) => {
-      if (!raw) return '';
-      const rawStr = String(raw).trim();
-      // Preserve "EST" prefix produced by AI estimation fallback when no
-      // explicit budget exists. We re-format the inner number but keep the
-      // EST marker so the user can tell estimates from stated budgets.
-      const estMatch = rawStr.match(/^EST\s+(.+)$/i);
-      if (estMatch) {
-        const inner = formatEurBudget(estMatch[1]);
-        return inner ? `EST ${inner}` : rawStr;
-      }
-      const { amount, known } = parseEurBudget(rawStr);
-      if (!known || !Number.isFinite(amount)) return rawStr;
-      const rounded = Math.round(amount);
-      const formatted = rounded.toLocaleString('en-US');
-      const hadForeignCurrency = /\b(NOK|SEK|DKK|GBP|USD|PLN|CZK|HUF)\b|[£$]/i.test(rawStr);
-      if (hadForeignCurrency) {
-        return `EUR ${formatted} (${rawStr})`;
-      }
-      return `EUR ${formatted}`;
-    };
-    const buildRow = (t) => {
+const buildRow = (t) => {
       const d = t.details || {};
       const publishedUrl = d.sourceUrl || t.url;
-      // Pavadinimui ir scope — jei turim AI išverstą versiją, rodom ją
-      // (lengviau sales komandai dirbti angliškai). Jei AI išjungtas, rodom
-      // originalą.
       let titleOut = d.titleEn || cleanDescription(d.title || t.title || '');
-      let scopeOut = d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || '');
+      let titleOriginal = cleanDescription(d.title || t.title || ''); // Saugome originalą
 
-      // Surface ambiguous-procurement reviews in the sheet so the
-      // sales reviewer can spot them at a glance. We prefix the title
-      // with "[REVIEW]" and inject the AI's reason into the scope cell
-      // so they don't have to re-read the source notice.
       if (d.rejectCategory === 'ambiguous_procurement_check_manually' && d.rejectReason) {
         titleOut = `[REVIEW] ${titleOut}`;
-        scopeOut = `[NEEDS HUMAN REVIEW: ${d.rejectReason}] ${scopeOut}`;
       }
+      const scopeOut = d.rejectCategory === 'ambiguous_procurement_check_manually' && d.rejectReason
+        ? `[NEEDS HUMAN REVIEW: ${d.rejectReason}] ${d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || '')}`
+        : (d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || ''));
+
       const reqOut = cleanDescription(d.requirementsForSupplier || '');
       const qualOut = cleanDescription(d.qualificationRequirements || '');
       const critOut = cleanDescription(d.offerWeighingCriteria || '');
-      // Keyword'ai match'inami ant visko, ką turim anglų kalba.
       const keywords = matchKeywords([titleOut, scopeOut, reqOut, qualOut, critOut, d.technicalStack || '']);
+      
       return [
         nowIso,
         fmtDate(d.publicationDate || t.publicationDate || ''),
         publishedUrl,
         titleOut,
+        titleOriginal, // Įrašome originalų pavadinimą
         cleanOrg(d.organisation || t.organisation || ''),
         fmtDate(d.deadline || t.deadlineRaw || ''),
         d.country || t.country || '',
@@ -10968,38 +10725,93 @@ async function runScraper() {
         keywords,
       ];
     };
+let existingMap = new Map(); // tenderId -> eilutės numeris
+    try {
+      const existing = await sheets.spreadsheets.values.get({
+        spreadsheetId: SHEET_ID,
+        range: `${TAB_NAME}!A1:R`,
+      });
+      const rows = existing.data.values || [];
+      const hasHeader = rows[0] && rows[0][0] === SHEET_HEADERS[0];
 
-    // Pending buffer + totals shared su signal handler'iu.
+      if (!hasHeader && rows.length === 0) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: SHEET_ID,
+          range: `${TAB_NAME}!A1`,
+          valueInputOption: 'RAW',
+          requestBody: { values: [SHEET_HEADERS] },
+        });
+        console.log('Header row inserted (empty sheet)');
+      }
+
+      for (let i = hasHeader ? 1 : 0; i < rows.length; i++) {
+        // Link'as dažniausiai C stulpelyje (index 2) arba Source URL (P stulpelyje, index 15)
+        const link = rows[i][2] || rows[i][15] || '';
+        const refId = rows[i][16] || ''; // Reference number
+        const id = extractTenderId(link) || extractTenderId(refId) || refId;
+        if (id) existingMap.set(id.toString(), i + 1); // Google Sheets eilutės numeris (1-based)
+      }
+      console.log(`Existing tender IDs in sheet: ${existingMap.size}`);
+    } catch (e) {
+      console.log('WARN: could not read existing sheet:', e.message);
+    }
+
+    // Apdorosime ir naujus, ir egzistuojančius, jei jie pasirodė Mercell paieškos viršuje (atnaujinti)
+    const toFetch = allTenders.slice(0, DETAILS_LIMIT);
+    console.log(`--- FETCHING DETAILS (${toFetch.length}) with flush batch ${FLUSH_BATCH} ---`);
+
+    // ... (čia palikite formatavimo funkcijas, fmtDate, cleanDescription, matchKeywords, buildRow) ...
+
     const pendingRows = [];
+    const pendingUpdates = []; // Naujas masyvas atnaujinimams
     let totalAppended = 0;
+    let totalUpdated = 0;
     let flushInFlight = false;
 
     const flushPending = async (label) => {
-      if (pendingRows.length === 0) return;
-      if (flushInFlight) return; // viena flush operacija vienu metu
+      if (flushInFlight) return;
       flushInFlight = true;
-      const batch = pendingRows.splice(0, pendingRows.length);
+      
+      const batchAppend = pendingRows.splice(0, pendingRows.length);
+      const batchUpdate = pendingUpdates.splice(0, pendingUpdates.length);
+
       try {
-        const res = await sheets.spreadsheets.values.append({
-          spreadsheetId: SHEET_ID,
-          range: `${TAB_NAME}!A:Q`,
-          valueInputOption: 'RAW',
-          insertDataOption: 'INSERT_ROWS',
-          requestBody: { values: batch },
-        });
-        totalAppended += batch.length;
-        console.log(
-          `✓ ${label || 'Flush'}: +${batch.length} rows (cumulative ${totalAppended}) range=${res.data.updates?.updatedRange}`
-        );
+        // Vykdome Append
+        if (batchAppend.length > 0) {
+          const res = await sheets.spreadsheets.values.append({
+            spreadsheetId: SHEET_ID,
+            range: `${TAB_NAME}!A:R`,
+            valueInputOption: 'RAW',
+            insertDataOption: 'INSERT_ROWS',
+            requestBody: { values: batchAppend },
+          });
+          totalAppended += batchAppend.length;
+          console.log(`✓ ${label || 'Flush'}: +${batchAppend.length} rows appended.`);
+        }
+
+        // Vykdome Update (per batchUpdate)
+        if (batchUpdate.length > 0) {
+          await sheets.spreadsheets.values.batchUpdate({
+            spreadsheetId: SHEET_ID,
+            requestBody: {
+              valueInputOption: 'RAW',
+              data: batchUpdate
+            },
+          });
+          totalUpdated += batchUpdate.length;
+          console.log(`✓ ${label || 'Flush'}: ~${batchUpdate.length} rows updated.`);
+        }
       } catch (e) {
-        // Jei nepavyko — grąžinam eilutes atgal į buferį, kad neprarastume.
-        pendingRows.unshift(...batch);
-        console.log(`✗ Flush failed (${label}): ${e.message}; ${batch.length} rows kept in buffer`);
+        pendingRows.unshift(...batchAppend);
+        pendingUpdates.unshift(...batchUpdate);
+        console.log(`✗ Flush failed (${label}): ${e.message}; rows kept in buffer`);
         throw e;
       } finally {
         flushInFlight = false;
       }
     };
+
+    // Tolimesniame for cikle per `toFetch` pridedame logiką, ar tai Update ar Append:
 
     // SIGTERM/SIGINT — GitHub Actions cancel siunčia SIGTERM ir duoda ~10s
     // grace period'o. Spėjam flushinti buferį prieš SIGKILL.
@@ -11237,7 +11049,18 @@ async function runScraper() {
 
       // Build & buffer
       const row = buildRow(toFetch[i]);
-      pendingRows.push(row);
+      const existingRowNum = existingMap.get(toFetch[i].tenderId.toString());
+
+      if (existingRowNum) {
+        // Eilutė egzistuoja – atnaujiname
+        pendingUpdates.push({
+          range: `${TAB_NAME}!A${existingRowNum}:R${existingRowNum}`,
+          values: [row]
+        });
+      } else {
+        // Nauja eilutė
+        pendingRows.push(row);
+      }
 
       if (!sampleLogged) {
         console.log('Sample row:', JSON.stringify(row).slice(0, 500));
@@ -11245,11 +11068,10 @@ async function runScraper() {
       }
 
       // Flush batch
-      if (pendingRows.length >= FLUSH_BATCH) {
+      if ((pendingRows.length + pendingUpdates.length) >= FLUSH_BATCH) {
         try {
           await flushPending(`batch@${i + 1}`);
         } catch (e) {
-          // jei flush'as numiršta — eilutės liko buferyje, bandysim dar kartą vėliau
           await new Promise(r => setTimeout(r, 2000));
         }
       }
