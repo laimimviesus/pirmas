@@ -11250,17 +11250,17 @@ const SHEET_HEADERS = [
     }
 
     // Galutinis flush
-    if (pendingRows.length > 0) {
+    if (pendingRows.length > 0 || pendingUpdates.length > 0) {
       try { await flushPending('final'); }
       catch (e) { console.log('Final flush error:', e.message); }
-    } else if (totalAppended === 0) {
-      console.log('Nothing to append');
+    } else if (totalAppended === 0 && totalUpdated === 0) {
+      console.log('Nothing to append or update');
     }
 
     console.log('=== SCRAPER FINISHED ===');
     console.log(`Total tenders found: ${allTenders.length}`);
-    console.log(`New tenders: ${newTenders.length}`);
-    console.log(`Rows appended: ${totalAppended}`);
+    console.log(`Rows appended (new): ${totalAppended}`);
+    console.log(`Rows updated (existing): ${totalUpdated}`);
     console.log(`Budget-filtered (<500K EUR): ${budgetFilteredCount}`);
     console.log(`Content-filtered (poor fit):  ${contentFilteredCount}`);
     if (contentFilteredCount > 0) {
@@ -11271,13 +11271,17 @@ const SHEET_HEADERS = [
       console.log(`  Content filter breakdown: ${breakdown}`);
     }
 
-    return { ok: true, tendersFound: allTenders.length, rowsAppended: totalAppended };
+    return { 
+      ok: true, 
+      tendersFound: allTenders.length, 
+      rowsAppended: totalAppended,
+      rowsUpdated: totalUpdated
+    };
 
   } finally {
     try { await browser.close(); } catch (_) {}
   }
 }
-
 // --- MAIN ENTRY POINT --------------------------------------------------
 
 (async () => {
