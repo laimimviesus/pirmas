@@ -11141,20 +11141,11 @@ const SHEET_HEADERS = [
         }
 
         // --- POST-AI CONTENT FILTER --------------------------------
-        // Reject tenders whose scope/requirements indicate poor fit:
-        // license partnerships, branded product supply, on-site work,
-        // pure cybersecurity, helpdesk, network infra, etc. The AI
-        // prompt populates dd.rejectReason / dd.rejectCategory based
-        // on the rules. Ambiguous procurement cases are NOT rejected
-        // by default — they pass through with rejectReason set to
-        // "ambiguous_procurement_check_manually" so a human can review
-        // them in the sheet.
-        //
-        // Escape hatch: set CONTENT_FILTER_DISABLED=1 to force-include
-        // every tender (useful when comparing what the filter would
-        // strip vs. raw output).
         const CONTENT_FILTER_DISABLED = process.env.CONTENT_FILTER_DISABLED === '1';
-        const isAmbiguous = (dd.rejectCategory || '') === 'ambiguous_procurement_check_manually';
+        
+        // Pataisytas filtras: praleidžia bet kokią kategoriją, turinčią žodį "ambiguous"
+        const isAmbiguous = (dd.rejectCategory || '').toLowerCase().includes('ambiguous');
+        
         if (!CONTENT_FILTER_DISABLED && dd.rejectReason && !isAmbiguous) {
           contentFilteredCount++;
           const catKey = dd.rejectCategory || 'uncategorized';
