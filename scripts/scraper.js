@@ -10665,8 +10665,7 @@ async function runScraper() {
     const sheets = google.sheets({ version: 'v4', auth: jwt });
     const SHEET_ID = process.env.GOOGLE_SHEET_ID;
     const TAB_NAME = process.env.SHEET_TAB_NAME || 'Sheet1';
-
-    const SHEET_HEADERS = [
+const SHEET_HEADERS = [
       'DATE OF WHEN ADDED TO THE LIST',
       'BIDDING ANNOUCEMENT DATE',
       'LINK TO THE PAGE TENDER WAS PUBLISHED ON',
@@ -10686,46 +10685,8 @@ async function runScraper() {
       'Reference number',
       'KEYWORDS',
     ];
-const buildRow = (t) => {
-      const d = t.details || {};
-      const publishedUrl = d.sourceUrl || t.url;
-      let titleOut = d.titleEn || cleanDescription(d.title || t.title || '');
-      let titleOriginal = cleanDescription(d.title || t.title || ''); // Saugome originalą
 
-      if (d.rejectCategory === 'ambiguous_procurement_check_manually' && d.rejectReason) {
-        titleOut = `[REVIEW] ${titleOut}`;
-      }
-      const scopeOut = d.rejectCategory === 'ambiguous_procurement_check_manually' && d.rejectReason
-        ? `[NEEDS HUMAN REVIEW: ${d.rejectReason}] ${d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || '')}`
-        : (d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || ''));
-
-      const reqOut = cleanDescription(d.requirementsForSupplier || '');
-      const qualOut = cleanDescription(d.qualificationRequirements || '');
-      const critOut = cleanDescription(d.offerWeighingCriteria || '');
-      const keywords = matchKeywords([titleOut, scopeOut, reqOut, qualOut, critOut, d.technicalStack || '']);
-      
-      return [
-        nowIso,
-        fmtDate(d.publicationDate || t.publicationDate || ''),
-        publishedUrl,
-        titleOut,
-        titleOriginal, // Įrašome originalų pavadinimą
-        cleanOrg(d.organisation || t.organisation || ''),
-        fmtDate(d.deadline || t.deadlineRaw || ''),
-        d.country || t.country || '',
-        formatEurBudget(d.maxBudget),
-        d.duration || '',
-        reqOut,
-        qualOut,
-        critOut,
-        scopeOut,
-        d.technicalStack || '',
-        d.sourceUrl || '',
-        d.referenceNumber || t.tenderId || '',
-        keywords,
-      ];
-    };
-let existingMap = new Map(); // tenderId -> eilutės numeris
+    let existingMap = new Map(); // tenderId -> eilutės numeris
     try {
       const existing = await sheets.spreadsheets.values.get({
         spreadsheetId: SHEET_ID,
@@ -10756,13 +10717,222 @@ let existingMap = new Map(); // tenderId -> eilutės numeris
       console.log('WARN: could not read existing sheet:', e.message);
     }
 
-    // Apdorosime ir naujus, ir egzistuojančius, jei jie pasirodė Mercell paieškos viršuje (atnaujinti)
     const toFetch = allTenders.slice(0, DETAILS_LIMIT);
     console.log(`--- FETCHING DETAILS (${toFetch.length}) with flush batch ${FLUSH_BATCH} ---`);
 
-    // ... (čia palikite formatavimo funkcijas, fmtDate, cleanDescription, matchKeywords, buildRow) ...
+    // --- VISOS PAGALBINĖS FUNKCIJOS ---
+    const nowIso = new Date().toISOString().slice(0, 10);
+
+    const fmtDate = (s) => {
+      if (!s) return '';
+      const str = String(s).trim();
+      const m = str.match(/^(\d{4}-\d{2}-\d{2})T/);
+      if (m) return m[1];
+      return str;
+    };
+
+    const NAMED_ENTITIES = {
+      amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+      laquo: '«', raquo: '»', hellip: '…', mdash: '—', ndash: '–',
+      lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”', bull: '•',
+      copy: '©', reg: '®', trade: '™', deg: '°', middot: '·',
+    };
+
+    const decodeHtmlEntities = (s) => {
+      if (!s) return '';
+      return String(s)
+        .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+          const code = parseInt(hex, 16);
+          return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+        })
+        .replace(/&#(\d+);/g, (_, num) => {
+          const code = parseInt(num, 10);
+          return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+        })
+        .replace(/&([a-zA-Z]+);/g, (orig, name) =>
+          NAMED_ENTITIES[name.toLowerCase()] !== undefined
+            ? NAMED_ENTITIES[name.toLowerCase()]
+            : orig
+        );
+    };
+
+    const cleanDescription = (v) => {
+      if (!v) return '';
+      const s = String(v);
+      let out = s;
+      if (s.includes('languageCode') && s.includes('text')) {
+        try {
+          const arr = JSON.parse(s.startsWith('[') ? s : `[${s}]`);
+          if (Array.isArray(arr)) {
+            const en = arr.find((x) => x && x.languageCode === 'en');
+            const pick = en || arr[0];
+            if (pick && pick.text) out = String(pick.text);
+          }
+        } catch (_) {
+          const texts = [...s.matchAll(/"text"\s*:\s*"([^"]*(?:\\.[^"]*)*)"/g)]
+            .map((m) => m[1].replace(/\\"/g, '"').replace(/\\n/g, ' '));
+          if (texts.length) out = texts[0];
+        }
+      }
+      out = decodeHtmlEntities(out);
+      out = out.replace(/[\u00A0\s]+/g, ' ').trim();
+      return out;
+    };
+
+    const cleanOrg = (v) => {
+      if (!v) return '';
+      const s = String(v).trim();
+      const first = s.split(/\n|\r/).map((x) => x.trim()).filter(Boolean)[0];
+      return first || s;
+    };
+
+    const KEYWORD_PATTERNS = [
+      { label: 'software development', re: /\b(software\s*development|custom\s*software|bespoke\s*software)\b/i },
+      { label: 'project management',   re: /\b(project\s*management|programme\s*management|programme\s*manager|PMP|prince2)\b/i },
+      { label: 'Agile',                re: /\b(agile|scrum|kanban|SAFe|sprint\s*planning)\b/i },
+      { label: 'AI',                   re: /\b(AI|artificial\s*intelligence|machine\s*learning|\bML\b|LLM|generative\s*ai|genai|deep\s*learning|neural\s*network)\b/i },
+      { label: 'IT',                   re: /\b(IT\s*services?|ICT|information\s*technology|IT\s*systems?)\b/i },
+      { label: 'system support',       re: /\b(system\s*support|application\s*support|maintenance\s*and\s*support|technical\s*support)\b/i },
+      { label: 'application development', re: /\b(application\s*development|app\s*development|web\s*application|mobile\s*application)\b/i },
+      { label: 'JAVA',                 re: /\b(java|spring\s*boot|\bJVM\b|jakarta\s*ee|javaee)\b/i },
+      { label: 'Python',               re: /\b(python|django|flask|fastapi)\b/i },
+      { label: 'React',                re: /\b(react(?!\s*native)|reactjs|next\.?js)\b/i },
+      { label: 'React Native',         re: /\b(react\s*native)\b/i },
+      { label: 'IT system modernization', re: /\b(system\s*modernization|legacy\s*modernization|legacy\s*migration|modernisation|replatforming)\b/i },
+      { label: 'cloud-native development', re: /\b(cloud[-\s]*native|AWS|azure|GCP|kubernetes|\bK8s\b|microservices|serverless)\b/i },
+      { label: 'quality assurance',    re: /\b(quality\s*assurance|\bQA\b|test\s*automation)\b/i },
+      { label: 'testing',              re: /\b(testing|test\s*management|test\s*strategy|test\s*cases?)\b/i },
+      { label: 'user interface',       re: /\b(user\s*interface|\bUI\s*design|\bUI\b(?!\w))\b/i },
+      { label: 'system implementation', re: /\b(system\s*implementation|rollout|deployment|go[-\s]*live)\b/i },
+      { label: 'UX/UI',                re: /\b(UX\/UI|UI\/UX|UX\s*design|user\s*experience|\bUX\b(?!\w))\b/i },
+    ];
+
+    const matchKeywords = (texts) => {
+      const blob = (Array.isArray(texts) ? texts : [texts]).filter(Boolean).join(' \n ');
+      if (!blob.trim()) return '';
+      const matched = new Set();
+      for (const { label, re } of KEYWORD_PATTERNS) {
+        if (re.test(blob)) matched.add(label);
+      }
+      return Array.from(matched).join(', ');
+    };
+
+    const FX_TO_EUR = {
+      EUR: 1, '€': 1,
+      NOK: 0.087, SEK: 0.088, DKK: 0.134,
+      GBP: 1.17, '£': 1.17,
+      USD: 0.92, '$': 0.92,
+      PLN: 0.23, CZK: 0.040, HUF: 0.0026,
+    };
+
+    const parseEurBudget = (raw) => {
+      if (!raw) return { amount: null, known: false };
+      let s = String(raw).trim();
+      if (!s) return { amount: null, known: false };
+      if (/\b(no\s*limit|unknown|not\s*specified|n\/?a|none)\b/i.test(s)) {
+        return { amount: null, known: false };
+      }
+      let fx = 1;
+      let currencyMatched = null;
+      for (const code of ['EUR', 'NOK', 'SEK', 'DKK', 'GBP', 'USD', 'PLN', 'CZK', 'HUF']) {
+        const re = new RegExp('\\b' + code + '\\b', 'i');
+        if (re.test(s)) { fx = FX_TO_EUR[code]; currencyMatched = code; break; }
+      }
+      if (!currencyMatched) {
+        if (/€/.test(s)) fx = FX_TO_EUR['€'];
+        else if (/£/.test(s)) fx = FX_TO_EUR['£'];
+        else if (/\$/.test(s)) fx = FX_TO_EUR['$'];
+      }
+      let mult = 1;
+      if (/\b(bln|bil(?:lion)?|mlrd|miljard)\b/i.test(s)) mult = 1e9;
+      else if (/\b(mln|mio|million|milj|miljoon)\b/i.test(s)) mult = 1e6;
+      else if (/\b(k|thousand|tuhat|tys)\b/i.test(s) && !/\bEUR\s*k\b/i.test(s)) mult = 1e3;
+      let numStr = s
+        .replace(/(EUR|NOK|SEK|DKK|GBP|USD|PLN|CZK|HUF|€|£|\$)/gi, ' ')
+        .replace(/\b(mln|mio|million|milj|miljoon|bln|bil|billion|mlrd|miljard|k|thousand|tuhat|tys)\b/gi, ' ')
+        .replace(/[^0-9.,\s-]/g, ' ')
+        .trim();
+      if (numStr.includes('.') && numStr.includes(',')) {
+        if (numStr.lastIndexOf(',') > numStr.lastIndexOf('.')) {
+          numStr = numStr.replace(/\./g, '').replace(',', '.');
+        } else {
+          numStr = numStr.replace(/,/g, '');
+        }
+      } else if (numStr.includes(',')) {
+        if (/,\d{1,2}$/.test(numStr)) numStr = numStr.replace(',', '.');
+        else numStr = numStr.replace(/,/g, '');
+      }
+      numStr = numStr.replace(/\s+/g, '').replace(/^0+(?=\d)/, '');
+      const firstMatch = numStr.match(/-?\d+(?:\.\d+)?/);
+      if (!firstMatch) return { amount: null, known: false };
+      const n = parseFloat(firstMatch[0]);
+      if (!Number.isFinite(n) || n <= 0) return { amount: null, known: false };
+      const eur = n * mult * fx;
+      return { amount: eur, known: true };
+    };
+
+    const formatEurBudget = (raw) => {
+      if (!raw) return '';
+      const rawStr = String(raw).trim();
+      const estMatch = rawStr.match(/^EST\s+(.+)$/i);
+      if (estMatch) {
+        const inner = formatEurBudget(estMatch[1]);
+        return inner ? `EST ${inner}` : rawStr;
+      }
+      const { amount, known } = parseEurBudget(rawStr);
+      if (!known || !Number.isFinite(amount)) return rawStr;
+      const rounded = Math.round(amount);
+      const formatted = rounded.toLocaleString('en-US');
+      const hadForeignCurrency = /\b(NOK|SEK|DKK|GBP|USD|PLN|CZK|HUF)\b|[£$]/i.test(rawStr);
+      if (hadForeignCurrency) {
+        return `EUR ${formatted} (${rawStr})`;
+      }
+      return `EUR ${formatted}`;
+    };
+
+    const buildRow = (t) => {
+      const d = t.details || {};
+      const publishedUrl = d.sourceUrl || t.url;
+      let titleOut = d.titleEn || cleanDescription(d.title || t.title || '');
+      let titleOriginal = cleanDescription(d.title || t.title || '');
+
+      if (d.rejectCategory === 'ambiguous_procurement_check_manually' && d.rejectReason) {
+        titleOut = `[REVIEW] ${titleOut}`;
+      }
+      const scopeOut = d.rejectCategory === 'ambiguous_procurement_check_manually' && d.rejectReason
+        ? `[NEEDS HUMAN REVIEW: ${d.rejectReason}] ${d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || '')}`
+        : (d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || ''));
+
+      const reqOut = cleanDescription(d.requirementsForSupplier || '');
+      const qualOut = cleanDescription(d.qualificationRequirements || '');
+      const critOut = cleanDescription(d.offerWeighingCriteria || '');
+      const keywords = matchKeywords([titleOut, scopeOut, reqOut, qualOut, critOut, d.technicalStack || '']);
+      
+      return [
+        nowIso,
+        fmtDate(d.publicationDate || t.publicationDate || ''),
+        publishedUrl,
+        titleOut,
+        titleOriginal,
+        cleanOrg(d.organisation || t.organisation || ''),
+        fmtDate(d.deadline || t.deadlineRaw || ''),
+        d.country || t.country || '',
+        formatEurBudget(d.maxBudget),
+        d.duration || '',
+        reqOut,
+        qualOut,
+        critOut,
+        scopeOut,
+        d.technicalStack || '',
+        d.sourceUrl || '',
+        d.referenceNumber || t.tenderId || '',
+        keywords,
+      ];
+    };
 
     const pendingRows = [];
+
+    
     const pendingUpdates = []; // Naujas masyvas atnaujinimams
     let totalAppended = 0;
     let totalUpdated = 0;
