@@ -199,6 +199,17 @@ const ALWAYS_LOGIN_HOSTS = [
   'tendsign.com',
   'kommersannons.se',      // Swedish FMV — Kommers Annons shell
   'tarjouspalvelu.fi',     // Finnish — Cloudia-fronted (SSO via login.cloudia.net)
+  // evergabe-online.de — German federal procurement portal (cosinex
+  // platform). Anonymous /tenderdetails.html?id=X pages render a small
+  // summary (~10-25k bodyLen) but tender DOCUMENTS are behind a login
+  // wall (Wicket-based "AnA-Web user account"). User registered an
+  // account 2026-05-16 and added creds to PORTAL_CREDS_JSON. The login
+  // modal trigger has misleading "Register" text — handled by a
+  // per-host pre-trigger in attemptPortalLogin (see comment block
+  // there). Adding to ALWAYS_LOGIN_HOSTS so even when the anonymous
+  // summary renders successfully (and thus is not flagged login-gated
+  // by default heuristics), we still force login to reach the docs.
+  'evergabe-online.de',
   // dtvp.de — REMOVED 2026-05-14 (briefly added then reverted same day).
   //
   // The Germany run revealed two facts that make forced-login a NET
@@ -266,6 +277,15 @@ const LOGIN_URLS = {
   // Credentials look up via PORTAL_HOST_ALIASES (tarjouspalvelu.fi
   // → cloudia.net).
   'tarjouspalvelu.fi':        'https://login.cloudia.net/user/login',
+  // evergabe-online.de — login modal is opened by clicking the
+  // confusingly-named "Register" button on the main start page. We
+  // navigate to /start.html so the per-host pre-trigger (in
+  // attemptPortalLogin) can find and click that button to open the
+  // Wicket AJAX login modal. Form fields:
+  //   input[name="usernameFormGroup:usernameTextField"]
+  //   input[name="passwordFormGroup:passwordTextField"]
+  //   button[name="submitButton"] (text also says "Register" — misleading)
+  'evergabe-online.de':       'https://www.evergabe-online.de/start.html',
   // marches-publics.gouv.fr — the source URL itself has a "Login" button
   // in the corner; clicking it pops up a form whose fields are
   // form[_username] / form[_password] (action=/entreprise/login). The
@@ -1536,6 +1556,61 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         return true;
       }
     } catch (_) { /* fall through to normal login flow */ }
+
+    // PER-HOST PRE-TRIGGER: evergabe-online.de
+    //
+    // evergabe-online.de uses a confusing UI: the button that OPENS the
+    // login modal is labeled "Register" (with text content literally
+    // "Register"), and its href points to an AJAX Wicket behavior URL
+    // (...openLoginModalAjaxLink). The generic trigger scorer below
+    // explicitly REJECTS any element with "register" text via SKIP_TEXT
+    // — that rule is correct for ~99% of portals (where "Register"
+    // means new-account signup) but wrong for this outlier.
+    //
+    // Strategy: detect the host, click the openLoginModalAjaxLink anchor
+    // directly BEFORE the generic scorer runs. Once the modal opens
+    // (Wicket AJAX re-renders), the login form's password input becomes
+    // visible — the generic flow's early-return then triggers and
+    // proceeds to fill the form with our credentials.
+    //
+    // User-confirmed 2026-05-16 modal form structure:
+    //   <input name="usernameFormGroup:usernameTextField"
+    //          data-evid="login_user_name" placeholder="user name">
+    //   <input name="passwordFormGroup:passwordTextField"
+    //          data-evid="login_password" type="password">
+    //   <button name="submitButton" data-evid="login_submit_button">
+    //
+    // PORTAL_CREDS_JSON must include an entry keyed
+    // "evergabe-online.de" (user added 2026-05-16).
+    if (hostLabel && /(^|\.)evergabe-online\.de$/i.test(hostLabel)) {
+      const ergClick = await page.evaluate(() => {
+        // Prefer the specific AJAX link (most stable signal); fall
+        // back to a strict "Register"-text match if the href pattern
+        // changes.
+        const byHref = document.querySelector('a[href*="openLoginModalAjaxLink"]');
+        const link = byHref || Array.from(document.querySelectorAll('a, button')).find((el) => {
+          const text = (el.innerText || el.textContent || el.value || '').trim();
+          return /^\s*register\s*$/i.test(text);
+        });
+        if (!link) return false;
+        try { link.scrollIntoView({ block: 'center' }); } catch (_) {}
+        link.click();
+        return true;
+      }).catch(() => false);
+      if (ergClick) {
+        console.log(`    ↪️  evergabe-online.de: clicked "Register" trigger to open login modal (per-host override — generic scorer would reject this text)`);
+        // Wait for Wicket AJAX to render the modal form. The form's
+        // username/password inputs use Wicket-namespaced names that
+        // are stable across page versions.
+        await page.waitForSelector(
+          'input[name*="usernameTextField"], input[name*="passwordTextField"], input[data-evid="login_user_name"]',
+          { timeout: 8000 }
+        ).catch(() => null);
+        await new Promise((r) => setTimeout(r, 700));
+      } else {
+        console.log(`    ⚠️  evergabe-online.de: per-host pre-trigger could not find "Register" link or openLoginModalAjaxLink anchor`);
+      }
+    }
 
     // Some portals (e-avrop.com, marches-publics.gouv.fr, certain
     // TendSign / Cloudia variants) land on a page whose login form is
@@ -6141,6 +6216,350 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
   }
 }
 
+// =====================================================================
+// fetchMarchesPublicsInfoDocuments
+// ---------------------------------------------------------------------
+// French marches-publics.info (and sibling awsolutions.fr / e-marches-
+// publics.com / private.e-marchespublics.com) host their procurement
+// workflow as a multi-step wizard:
+//
+//   1 - CGU (Conditions Générales d'Utilisation — terms acceptance)
+//   2 - Lots
+//   3 - Documents   ← the step we want
+//   4 - Récapitulatif
+//
+// (Some variants have 6 steps: 1-CGU, 2-Lots, 3-Répondants,
+//  4-Questionnaires, 5-Documents, 6-Récapitulatif.)
+//
+// After a successful login (handled by attemptPortalLogin), the user is
+// redirected from the marches-publics.info tender URL to
+//   https://awsolutions.fr/apr/depot/<uuid>
+// where the CGU step is active. To reach the Documents step we must:
+//   1. Tick the "I have read and accept the General Terms" checkbox
+//   2. Click "Following" (the English label for "Suivant") to advance
+//   3. Repeat clicking "Following" through intermediate steps (Lots,
+//      Répondants, Questionnaires) until the Documents step renders
+//   4. Harvest the PDF / DOCX / ZIP anchors that appear on that step
+//
+// User confirmed 2026-05-16 DOM facts:
+//   - Source URL: https://www.marches-publics.info/mpiaws/index.cfm?
+//                 fuseaction=demat.termes&IDM=<tender_id>
+//   - Post-login redirect: https://awsolutions.fr/apr/depot/<uuid>
+//   - CGU checkbox label: "We have read the General Terms and Conditions
+//                          and accept all of these terms and conditions"
+//   - Advance button label: "Following" (likely localized "Suivant")
+//
+// Heuristics in this handler are defensive — we don't have the full
+// awsolutions.fr DOM yet, so each step uses multiple selector and text
+// strategies. If a step fails, we log the page state for next-iteration
+// diagnosis instead of throwing.
+// =====================================================================
+async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
+  try {
+    const u = new URL(sourceUrl);
+    // Trigger on the whole awsolutions / marches-publics.info family.
+    // marches-publics.info redirects to awsolutions.fr after login, and
+    // private.e-marchespublics.com / e-marchespublics.com are sibling
+    // domains under the same awsolutions platform.
+    if (!/(^|\.)marches-publics\.info$|(^|\.)awsolutions\.fr$|(^|\.)e-marchespublics\.com$/i.test(u.hostname)) {
+      return [];
+    }
+  } catch (_) { return []; }
+
+  let pdfParseLib = null, mammothLib = null, admZipLib = null;
+  try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(25000);
+    page.setDefaultTimeout(25000);
+    try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
+    try {
+      const ua = await page.browser().userAgent();
+      await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'languages', { get: () => ['fr-FR', 'fr', 'en-US', 'en'] });
+      });
+    } catch (_) {}
+
+    try {
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    } catch (e) {
+      console.log(`    🇫🇷 marches-publics.info: nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // STEP-WALKER LOOP
+    //
+    // Loop up to 6 iterations to advance through the wizard. Each
+    // iteration:
+    //   - Detect if the current step renders a meaningful number of
+    //     downloadable doc anchors → if yes, break and harvest.
+    //   - Else: tick any visible CGU-style checkbox, then click the
+    //     advance button ("Following" / "Suivant" / "Next").
+    //   - Wait for the next step to render.
+    const MAX_STEPS = 6;
+    let reachedDocsStep = false;
+    let lastStepUrl = '';
+    for (let step = 1; step <= MAX_STEPS; step++) {
+      const stepState = await page.evaluate(() => {
+        const anchors = Array.from(document.querySelectorAll('a[href]'));
+        const docAnchors = anchors.filter((a) => {
+          const href = (a.getAttribute('href') || '').toLowerCase();
+          const text = (a.innerText || a.textContent || '').trim();
+          // Match downloadable patterns OR download-like text
+          return (
+            /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:\?|#|$)/i.test(href) ||
+            /\b(t[ée]l[ée]charger|download)\b/i.test(text) ||
+            /(?:^|\/)(?:download|t[ée]l[ée]chargement|file|fichier|telecharger)[^/]*$/i.test(href)
+          );
+        });
+        // Detect step indicators (e.g., "5 - Documents" / "3 - Documents")
+        const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ');
+        const stepLabels = bodyText.match(/\b[1-6]\s*-\s*(?:CGU|Lots|Documents|R[eé]pondants|Questionnaires|R[eé]capitulatif)\b/gi) || [];
+        return {
+          url: location.href,
+          docAnchorCount: docAnchors.length,
+          stepLabels: stepLabels.slice(0, 6),
+          firstDocTexts: docAnchors.slice(0, 4).map((a) => (a.innerText || a.textContent || '').trim().slice(0, 60)),
+        };
+      }).catch(() => null);
+
+      if (!stepState) {
+        console.log(`    🇫🇷 marches-publics.info step ${step}: evaluate failed`);
+        break;
+      }
+      lastStepUrl = stepState.url;
+      console.log(
+        `    🇫🇷 marches-publics.info step ${step}: url=${(stepState.url || '').slice(-70)} ` +
+        `docAnchors=${stepState.docAnchorCount} ` +
+        `steps=[${(stepState.stepLabels || []).join(' | ')}]`
+      );
+
+      // Heuristic: if we see ≥2 downloadable anchors with file extensions,
+      // assume we're on Documents step. (1 anchor could be a "User
+      // guide" howto; ≥2 means the actual tender PDFs are loaded.)
+      if (stepState.docAnchorCount >= 2) {
+        console.log(`    🇫🇷 marches-publics.info: reached Documents step (${stepState.docAnchorCount} anchors visible)`);
+        reachedDocsStep = true;
+        break;
+      }
+
+      // Tick visible CGU acceptance checkbox
+      const cbChecked = await page.evaluate(() => {
+        const cbs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+        let any = 0;
+        for (const cb of cbs) {
+          if (cb.disabled || cb.checked) continue;
+          if (cb.offsetParent === null) continue;
+          // Build context text from label, parent, grandparent
+          const labelEl = cb.labels && cb.labels[0];
+          const parent = cb.parentElement;
+          const grand = parent?.parentElement;
+          const ctx = (
+            (labelEl?.innerText || labelEl?.textContent || '') + ' ' +
+            (parent?.innerText || '') + ' ' +
+            (grand?.innerText || '')
+          ).toLowerCase().slice(0, 600);
+          // Match CGU / Terms acceptance phrases (FR/EN)
+          const matchesCGU = /conditions\s*g[ée]n[ée]rales|terms\s*and\s*conditions|terms\s*of\s*(?:use|service)|cgu\b|we\s*have\s*read|j['']?\s*accepte|i\s*(?:have\s*)?read|i\s*accept/i.test(ctx);
+          if (matchesCGU) {
+            try {
+              cb.checked = true;
+              cb.dispatchEvent(new Event('change', { bubbles: true }));
+              cb.dispatchEvent(new Event('click', { bubbles: true }));
+              any++;
+            } catch (_) {}
+          }
+        }
+        return any;
+      }).catch(() => 0);
+      if (cbChecked) {
+        console.log(`    🇫🇷 marches-publics.info: ticked ${cbChecked} CGU acceptance checkbox(es)`);
+      }
+
+      // Click "Following" / "Suivant" / "Next" advance button
+      const clicked = await page.evaluate(() => {
+        const candidates = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a.btn, a[role="button"]'));
+        const target = candidates.find((el) => {
+          if (el.disabled || el.offsetParent === null) return false;
+          const text = (el.innerText || el.value || el.textContent || '').trim();
+          // Match the wizard's NEXT-step button. "Following" is the
+          // English translation evergabe etc. use for "Suivant".
+          return /^\s*(following|suivant|continuer|continue|next|étape\s+suivante|valider\s+et\s+(?:continuer|suivre))\s*$/i.test(text);
+        });
+        if (!target) return null;
+        try { target.scrollIntoView({ block: 'center' }); } catch (_) {}
+        target.click();
+        return (target.innerText || target.value || '').trim().slice(0, 40);
+      }).catch(() => null);
+
+      if (!clicked) {
+        console.log(`    🇫🇷 marches-publics.info step ${step}: no advance button found — stopping wizard walk`);
+        break;
+      }
+      console.log(`    🇫🇷 marches-publics.info: clicked "${clicked}" — advancing to next step`);
+
+      // Wait for step transition (navigation OR in-place DOM update)
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 6000 }).catch(() => null),
+        new Promise((r) => setTimeout(r, 3500)),
+      ]);
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    if (!reachedDocsStep) {
+      console.log(`    ⚠️  marches-publics.info: wizard walk ended without reaching Documents step (last URL: ${lastStepUrl.slice(-80)})`);
+      return [];
+    }
+
+    // STEP — extract document URLs (final Documents step)
+    const docs = await page.evaluate(() => {
+      const RX_DL_EXT = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:\?|#|$)/i;
+      const RX_DL_TEXT = /\b(t[ée]l[ée]charger|download)\b/i;
+      const out = [];
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      const seen = new Set();
+      for (const a of anchors) {
+        const hrefRaw = a.getAttribute('href') || '';
+        if (!hrefRaw || /^javascript:/i.test(hrefRaw) || hrefRaw === '#') continue;
+        let abs;
+        try { abs = new URL(hrefRaw, location.href).toString(); }
+        catch (_) { continue; }
+        const text = (a.innerText || a.textContent || '').trim();
+        const isDl = RX_DL_EXT.test(abs) || RX_DL_TEXT.test(text);
+        if (!isDl) continue;
+        if (seen.has(abs)) continue;
+        seen.add(abs);
+        let filename = '';
+        try {
+          const u2 = new URL(abs);
+          filename = u2.pathname.split('/').pop() || '';
+          if (filename) filename = decodeURIComponent(filename.replace(/\+/g, ' '));
+        } catch (_) {}
+        out.push({ url: abs, text: text.slice(0, 200), filename: filename || text });
+      }
+      return out;
+    }).catch(() => []);
+
+    if (!docs.length) {
+      console.log(`    ⚠️  marches-publics.info: Documents step reached but no doc anchors extracted`);
+      return [];
+    }
+    console.log(`    🇫🇷 marches-publics.info: collected ${docs.length} doc anchor(s)`);
+
+    // Score docs — same multilingual qualification vocab as kommersannons
+    const SCORE_RULES = [
+      { rx: /CCAP|cahier\s+des\s+clauses\s+administratives\s+particuli[èe]res|r[èe]glement\s+de\s+(?:la\s+)?consultation|RC\s*\.?\s*pdf|CCTP|cahier\s+des\s+clauses\s+techniques\s+particuli[èe]res/i, score: 30 },
+      { rx: /candidature|DC[12]|DUME|attestation|qualifications?|crit[èe]res?\s+de\s+s[ée]lection/i, score: 25 },
+      { rx: /AE\b|acte\s+d'engagement|bordereau\s+de\s+prix|annexe\s+financi[èe]re/i, score: 18 },
+      { rx: /annexe|bilan|justificatif/i, score: 8 },
+    ];
+    for (const d of docs) {
+      d.score = 0;
+      const targets = [d.text || '', d.filename || '', d.url || ''];
+      for (const r of SCORE_RULES) {
+        for (const t of targets) {
+          if (r.rx.test(t)) { d.score = Math.max(d.score, r.score); break; }
+        }
+      }
+    }
+    docs.sort((a, b) => b.score - a.score);
+    const topDocs = docs.slice(0, 6);
+    console.log(
+      `    🇫🇷 marches-publics.info: priority docs: ` +
+      topDocs.map((d) => `${(d.filename || d.text || d.url.split('/').pop()).slice(0, 40)}[s=${d.score}]`).join(' | ')
+    );
+
+    // Fetch + parse top docs (same pattern as kommersannons)
+    const detectFormat = (buf) => {
+      if (!buf || buf.length < 4) return 'unknown';
+      const b0 = buf[0], b1 = buf[1], b2 = buf[2], b3 = buf[3];
+      if (b0 === 0x25 && b1 === 0x50 && b2 === 0x44 && b3 === 0x46) return 'pdf';
+      if (b0 === 0x50 && b1 === 0x4B && (b2 === 0x03 || b2 === 0x05 || b2 === 0x07)) return 'zip';
+      if (b0 === 0xD0 && b1 === 0xCF && b2 === 0x11 && b3 === 0xE0) return 'cfb';
+      const head = buf.slice(0, 64).toString('utf8').trim().toLowerCase();
+      if (head.startsWith('<!doctype') || head.startsWith('<html')) return 'html';
+      return 'unknown';
+    };
+
+    const texts = [];
+    for (const doc of topDocs) {
+      const labelName = (doc.filename || doc.text || doc.url.split('/').pop()).slice(0, 100);
+      const result = await page.evaluate(async (url) => {
+        try {
+          const resp = await fetch(url, { credentials: 'include', redirect: 'follow' });
+          if (!resp.ok) return { ok: false, status: resp.status };
+          const ct = resp.headers.get('content-type') || '';
+          const ab = await resp.arrayBuffer();
+          return { ok: true, status: resp.status, ct, url: resp.url || url, data: Array.from(new Uint8Array(ab)) };
+        } catch (e) {
+          return { ok: false, error: String(e).slice(0, 200) };
+        }
+      }, doc.url).catch((e) => ({ ok: false, error: e.message }));
+
+      if (!result || !result.ok || !result.data || result.data.length < 500) {
+        const status = result?.status || result?.error || '?';
+        console.log(`    ⚠️  marches-publics.info: fetch failed "${labelName.slice(0, 40)}" (status=${status})`);
+        continue;
+      }
+      const buf = Buffer.from(result.data);
+      const fmt = detectFormat(buf);
+      console.log(`    🇫🇷 marches-publics.info: fetched "${labelName.slice(0, 40)}" (${buf.length}B, magic=${fmt})`);
+
+      let text = '';
+      try {
+        if (fmt === 'pdf' && pdfParseLib) {
+          const parsed = await pdfParseLib(buf);
+          text = (parsed && parsed.text ? parsed.text : '').trim();
+        } else if (fmt === 'zip' && admZipLib) {
+          const zip = new admZipLib(buf);
+          const entries = zip.getEntries().filter((e) => !e.isDirectory).slice(0, 5);
+          const parts = [];
+          for (const z of entries) {
+            const innerBytes = z.getData();
+            const ext = (z.entryName.match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '';
+            try {
+              if (ext.toLowerCase() === 'pdf' && pdfParseLib) {
+                const p = await pdfParseLib(innerBytes);
+                if (p?.text) parts.push(`--- ${z.entryName} ---\n${p.text.slice(0, 30000)}`);
+              } else if (['docx', 'odt'].includes(ext.toLowerCase()) && mammothLib) {
+                const out = await mammothLib.extractRawText({ buffer: innerBytes });
+                if (out?.value) parts.push(`--- ${z.entryName} ---\n${out.value.slice(0, 30000)}`);
+              }
+            } catch (_) {}
+          }
+          text = parts.join('\n\n');
+        } else if ((fmt === 'cfb' || /\.docx?$/i.test(labelName)) && mammothLib) {
+          const out = await mammothLib.extractRawText({ buffer: buf });
+          text = (out?.value || '').trim();
+        }
+      } catch (e) {
+        console.log(`    ⚠️  marches-publics.info: parse failed "${labelName}": ${e.message}`);
+        continue;
+      }
+      if (text && text.length > 50) {
+        const clipped = text.slice(0, 50000);
+        texts.push(`--- (source) ${labelName} ---\n${clipped}`);
+        console.log(`    🇫🇷 marches-publics.info: parsed "${labelName.slice(0, 40)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+      } else {
+        console.log(`    ⚠️  marches-publics.info: "${labelName.slice(0, 40)}" extracted no usable text`);
+      }
+    }
+    return texts;
+  } catch (e) {
+    console.log(`    ⚠️  marches-publics.info handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
 async function fetchSourcePageDetails(browser, sourceUrl) {
   // URL scheme normalisation — Mercell sometimes returns sourceUrl
   // values like "www.conselleriadefacenda.es/silex" without an
@@ -7571,6 +7990,27 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     } catch (e) {
       console.log(`    ⚠️ PLACSP handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // marches-publics.info / awsolutions.fr Documents handler — French
+    // multi-step wizard (1-CGU → 2-Lots → 3-Documents → 4-Récapitulatif,
+    // or 6-step variant with Répondants/Questionnaires). Auto-ticks the
+    // CGU acceptance checkbox and clicks "Following" / "Suivant" until
+    // the Documents step renders, then harvests PDF/DOCX/ZIP anchors.
+    // No-op for non-marches-publics.info sources. Requires logged-in
+    // session (handled by attemptPortalLogin pre-step).
+    try {
+      const mpiTexts = await fetchMarchesPublicsInfoDocuments(browser, sourceUrl);
+      if (mpiTexts && mpiTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + mpiTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇫🇷 marches-publics.info: appended ${mpiTexts.length} doc(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ marches-publics.info handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     srcPage.off('request', blockHandler);
@@ -10665,12 +11105,12 @@ async function runScraper() {
     const sheets = google.sheets({ version: 'v4', auth: jwt });
     const SHEET_ID = process.env.GOOGLE_SHEET_ID;
     const TAB_NAME = process.env.SHEET_TAB_NAME || 'Sheet1';
-const SHEET_HEADERS = [
+
+    const SHEET_HEADERS = [
       'DATE OF WHEN ADDED TO THE LIST',
       'BIDDING ANNOUCEMENT DATE',
       'LINK TO THE PAGE TENDER WAS PUBLISHED ON',
-      'TENDER NAME (Original)',
-      'TENDER NAME (English)',
+      'TENDER NAME',
       'BIDDING ORGANISATION',
       'BIDDING DEADLINE DATE',
       'COUNTRY',
@@ -10686,11 +11126,11 @@ const SHEET_HEADERS = [
       'KEYWORDS',
     ];
 
-    let existingMap = new Map(); // tenderId -> eilutės numeris
+    let existingIds = new Set();
     try {
       const existing = await sheets.spreadsheets.values.get({
         spreadsheetId: SHEET_ID,
-        range: `${TAB_NAME}!A1:R`,
+        range: `${TAB_NAME}!A1:Q`,
       });
       const rows = existing.data.values || [];
       const hasHeader = rows[0] && rows[0][0] === SHEET_HEADERS[0];
@@ -10706,21 +11146,27 @@ const SHEET_HEADERS = [
       }
 
       for (let i = hasHeader ? 1 : 0; i < rows.length; i++) {
-        // Link'as dažniausiai C stulpelyje (index 2) arba Source URL (P stulpelyje, index 15)
-        const link = rows[i][2] || rows[i][15] || '';
-        const refId = rows[i][16] || ''; // Reference number
-        const id = extractTenderId(link) || extractTenderId(refId) || refId;
-        if (id) existingMap.set(id.toString(), i + 1); // Google Sheets eilutės numeris (1-based)
+        const link = rows[i][2] || rows[i][14] || '';
+        const id = extractTenderId(link);
+        if (id) existingIds.add(id);
       }
-      console.log(`Existing tender IDs in sheet: ${existingMap.size}`);
+      console.log(`Existing tender IDs in sheet: ${existingIds.size}`);
     } catch (e) {
       console.log('WARN: could not read existing sheet:', e.message);
     }
 
-    const toFetch = allTenders.slice(0, DETAILS_LIMIT);
+    const newTenders = allTenders.filter(t => !existingIds.has(t.tenderId));
+    console.log(`New tenders: ${newTenders.length} (${allTenders.length - newTenders.length} already in sheet)`);
+
+    // ---- FETCH DETAILS + INCREMENTAL APPEND ----
+    // SVARBU: GitHub Actions job'as turi 6h cap. Per praėjusį pilną run'ą
+    // job'as buvo nutrauktas 6h 5m ribose, o visas `sheets.append` iškvie-
+    // timas vyko tik loop'o gale → niekas nespėjo būti įrašyta. Dabar
+    // flushinam kas `FLUSH_BATCH` tenderių, plus SIGTERM/SIGINT handler'is
+    // išsaugo likusias eilutes, kai runner'is bando nužudyti procesą.
+    const toFetch = newTenders.slice(0, DETAILS_LIMIT);
     console.log(`--- FETCHING DETAILS (${toFetch.length}) with flush batch ${FLUSH_BATCH} ---`);
 
-    // --- VISOS PAGALBINĖS FUNKCIJOS ---
     const nowIso = new Date().toISOString().slice(0, 10);
 
     const fmtDate = (s) => {
@@ -10730,14 +11176,16 @@ const SHEET_HEADERS = [
       if (m) return m[1];
       return str;
     };
-
+    // HTML entity decoder — Mercell scope/requirements often contain
+    // `&#61;` (=), `&amp;`, `&#39;` ('), `&quot;`, `&lt;`, `&gt;`, `&nbsp;`
+    // and numeric entities like `&#8211;` (en-dash). Sheet rendered them
+    // raw, so we normalise here before handing the string to the sheet or AI.
     const NAMED_ENTITIES = {
       amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
       laquo: '«', raquo: '»', hellip: '…', mdash: '—', ndash: '–',
       lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”', bull: '•',
       copy: '©', reg: '®', trade: '™', deg: '°', middot: '·',
     };
-
     const decodeHtmlEntities = (s) => {
       if (!s) return '';
       return String(s)
@@ -10774,11 +11222,13 @@ const SHEET_HEADERS = [
           if (texts.length) out = texts[0];
         }
       }
+      // Decode HTML entities (handles &#61;, &amp;, &#39;, &quot;, numeric
+      // decimal/hex, and common named entities). Safe to run repeatedly.
       out = decodeHtmlEntities(out);
+      // Collapse whitespace runs (incl. NBSP leftovers) and trim.
       out = out.replace(/[\u00A0\s]+/g, ' ').trim();
       return out;
     };
-
     const cleanOrg = (v) => {
       if (!v) return '';
       const s = String(v).trim();
@@ -10786,6 +11236,12 @@ const SHEET_HEADERS = [
       return first || s;
     };
 
+    // --- KEYWORD TAGGING ------------------------------------------------
+    // Sales komanda nori matyti, kurie iš jų bendrai sekamų raktinių
+    // žodžių atitinka tender'į. Surinktus žodžius grąžinam kaip
+    // comma-separated list'ą paskutiniame sheet'o stulpelyje ("KEYWORDS").
+    // Match'as vykdomas regex'u ant EN tikro teksto (title + scope +
+    // requirements + qualifications + criteria + keywords iš CPV aprašymo).
     const KEYWORD_PATTERNS = [
       { label: 'software development', re: /\b(software\s*development|custom\s*software|bespoke\s*software)\b/i },
       { label: 'project management',   re: /\b(project\s*management|programme\s*management|programme\s*manager|PMP|prince2)\b/i },
@@ -10806,7 +11262,6 @@ const SHEET_HEADERS = [
       { label: 'system implementation', re: /\b(system\s*implementation|rollout|deployment|go[-\s]*live)\b/i },
       { label: 'UX/UI',                re: /\b(UX\/UI|UI\/UX|UX\s*design|user\s*experience|\bUX\b(?!\w))\b/i },
     ];
-
     const matchKeywords = (texts) => {
       const blob = (Array.isArray(texts) ? texts : [texts]).filter(Boolean).join(' \n ');
       if (!blob.trim()) return '';
@@ -10817,6 +11272,12 @@ const SHEET_HEADERS = [
       return Array.from(matched).join(', ');
     };
 
+    // --- BUDGET PARSER (into EUR) --------------------------------------
+    // Grąžina { amount: number|null, known: boolean }. Palaiko:
+    //   "1,200,000 EUR", "1 200 000,00 €", "€1.5 million", "200k NOK",
+    //   "2,5 mln EUR", "no limit", "€30" (suspect — grąžinam kaip 30).
+    // Valiutos: EUR/€, NOK, SEK, DKK, GBP/£, USD/$ — verčiam į EUR pagal
+    // grubų kursą (užtenka "virš/po 500K" filtrui).
     const FX_TO_EUR = {
       EUR: 1, '€': 1,
       NOK: 0.087, SEK: 0.088, DKK: 0.134,
@@ -10824,14 +11285,15 @@ const SHEET_HEADERS = [
       USD: 0.92, '$': 0.92,
       PLN: 0.23, CZK: 0.040, HUF: 0.0026,
     };
-
     const parseEurBudget = (raw) => {
       if (!raw) return { amount: null, known: false };
       let s = String(raw).trim();
       if (!s) return { amount: null, known: false };
+      // Anything saying "no limit", "unknown", "not specified" — treat as unknown.
       if (/\b(no\s*limit|unknown|not\s*specified|n\/?a|none)\b/i.test(s)) {
         return { amount: null, known: false };
       }
+      // Pick currency
       let fx = 1;
       let currencyMatched = null;
       for (const code of ['EUR', 'NOK', 'SEK', 'DKK', 'GBP', 'USD', 'PLN', 'CZK', 'HUF']) {
@@ -10843,22 +11305,32 @@ const SHEET_HEADERS = [
         else if (/£/.test(s)) fx = FX_TO_EUR['£'];
         else if (/\$/.test(s)) fx = FX_TO_EUR['$'];
       }
+      // Multiplier (million / billion / k)
       let mult = 1;
       if (/\b(bln|bil(?:lion)?|mlrd|miljard)\b/i.test(s)) mult = 1e9;
       else if (/\b(mln|mio|million|milj|miljoon)\b/i.test(s)) mult = 1e6;
       else if (/\b(k|thousand|tuhat|tys)\b/i.test(s) && !/\bEUR\s*k\b/i.test(s)) mult = 1e3;
+      // Strip currency markers, whitespace, letters; keep digits/./,/-
       let numStr = s
         .replace(/(EUR|NOK|SEK|DKK|GBP|USD|PLN|CZK|HUF|€|£|\$)/gi, ' ')
         .replace(/\b(mln|mio|million|milj|miljoon|bln|bil|billion|mlrd|miljard|k|thousand|tuhat|tys)\b/gi, ' ')
         .replace(/[^0-9.,\s-]/g, ' ')
         .trim();
+      // If both '.' and ',' present, assume comma = thousands (EU style uses
+      // comma as decimal but also common to see space/thousands), heuristika:
+      //   "1,200,000.50" → 1200000.50  (US)
+      //   "1.200.000,50" → 1200000.50  (EU)
       if (numStr.includes('.') && numStr.includes(',')) {
         if (numStr.lastIndexOf(',') > numStr.lastIndexOf('.')) {
+          // EU: dot = thousands, comma = decimal
           numStr = numStr.replace(/\./g, '').replace(',', '.');
         } else {
+          // US: comma = thousands, dot = decimal
           numStr = numStr.replace(/,/g, '');
         }
       } else if (numStr.includes(',')) {
+        // Only comma: decide by position. If comma followed by 1-2 digits at
+        // end, treat as decimal; otherwise as thousands separator.
         if (/,\d{1,2}$/.test(numStr)) numStr = numStr.replace(',', '.');
         else numStr = numStr.replace(/,/g, '');
       }
@@ -10870,10 +11342,12 @@ const SHEET_HEADERS = [
       const eur = n * mult * fx;
       return { amount: eur, known: true };
     };
-
     const formatEurBudget = (raw) => {
       if (!raw) return '';
       const rawStr = String(raw).trim();
+      // Preserve "EST" prefix produced by AI estimation fallback when no
+      // explicit budget exists. We re-format the inner number but keep the
+      // EST marker so the user can tell estimates from stated budgets.
       const estMatch = rawStr.match(/^EST\s+(.+)$/i);
       if (estMatch) {
         const inner = formatEurBudget(estMatch[1]);
@@ -10889,31 +11363,33 @@ const SHEET_HEADERS = [
       }
       return `EUR ${formatted}`;
     };
-
     const buildRow = (t) => {
       const d = t.details || {};
       const publishedUrl = d.sourceUrl || t.url;
+      // Pavadinimui ir scope — jei turim AI išverstą versiją, rodom ją
+      // (lengviau sales komandai dirbti angliškai). Jei AI išjungtas, rodom
+      // originalą.
       let titleOut = d.titleEn || cleanDescription(d.title || t.title || '');
-      let titleOriginal = cleanDescription(d.title || t.title || '');
+      let scopeOut = d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || '');
 
+      // Surface ambiguous-procurement reviews in the sheet so the
+      // sales reviewer can spot them at a glance. We prefix the title
+      // with "[REVIEW]" and inject the AI's reason into the scope cell
+      // so they don't have to re-read the source notice.
       if (d.rejectCategory === 'ambiguous_procurement_check_manually' && d.rejectReason) {
         titleOut = `[REVIEW] ${titleOut}`;
+        scopeOut = `[NEEDS HUMAN REVIEW: ${d.rejectReason}] ${scopeOut}`;
       }
-      const scopeOut = d.rejectCategory === 'ambiguous_procurement_check_manually' && d.rejectReason
-        ? `[NEEDS HUMAN REVIEW: ${d.rejectReason}] ${d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || '')}`
-        : (d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || ''));
-
       const reqOut = cleanDescription(d.requirementsForSupplier || '');
       const qualOut = cleanDescription(d.qualificationRequirements || '');
       const critOut = cleanDescription(d.offerWeighingCriteria || '');
+      // Keyword'ai match'inami ant visko, ką turim anglų kalba.
       const keywords = matchKeywords([titleOut, scopeOut, reqOut, qualOut, critOut, d.technicalStack || '']);
-      
       return [
         nowIso,
         fmtDate(d.publicationDate || t.publicationDate || ''),
         publishedUrl,
         titleOut,
-        titleOriginal,
         cleanOrg(d.organisation || t.organisation || ''),
         fmtDate(d.deadline || t.deadlineRaw || ''),
         d.country || t.country || '',
@@ -10930,58 +11406,37 @@ const SHEET_HEADERS = [
       ];
     };
 
+    // Pending buffer + totals shared su signal handler'iu.
     const pendingRows = [];
-
-    
-    const pendingUpdates = []; // Naujas masyvas atnaujinimams
     let totalAppended = 0;
-    let totalUpdated = 0;
     let flushInFlight = false;
 
     const flushPending = async (label) => {
-      if (flushInFlight) return;
+      if (pendingRows.length === 0) return;
+      if (flushInFlight) return; // viena flush operacija vienu metu
       flushInFlight = true;
-      
-      const batchAppend = pendingRows.splice(0, pendingRows.length);
-      const batchUpdate = pendingUpdates.splice(0, pendingUpdates.length);
-
+      const batch = pendingRows.splice(0, pendingRows.length);
       try {
-        // Vykdome Append
-        if (batchAppend.length > 0) {
-          const res = await sheets.spreadsheets.values.append({
-            spreadsheetId: SHEET_ID,
-            range: `${TAB_NAME}!A:R`,
-            valueInputOption: 'RAW',
-            insertDataOption: 'INSERT_ROWS',
-            requestBody: { values: batchAppend },
-          });
-          totalAppended += batchAppend.length;
-          console.log(`✓ ${label || 'Flush'}: +${batchAppend.length} rows appended.`);
-        }
-
-        // Vykdome Update (per batchUpdate)
-        if (batchUpdate.length > 0) {
-          await sheets.spreadsheets.values.batchUpdate({
-            spreadsheetId: SHEET_ID,
-            requestBody: {
-              valueInputOption: 'RAW',
-              data: batchUpdate
-            },
-          });
-          totalUpdated += batchUpdate.length;
-          console.log(`✓ ${label || 'Flush'}: ~${batchUpdate.length} rows updated.`);
-        }
+        const res = await sheets.spreadsheets.values.append({
+          spreadsheetId: SHEET_ID,
+          range: `${TAB_NAME}!A:Q`,
+          valueInputOption: 'RAW',
+          insertDataOption: 'INSERT_ROWS',
+          requestBody: { values: batch },
+        });
+        totalAppended += batch.length;
+        console.log(
+          `✓ ${label || 'Flush'}: +${batch.length} rows (cumulative ${totalAppended}) range=${res.data.updates?.updatedRange}`
+        );
       } catch (e) {
-        pendingRows.unshift(...batchAppend);
-        pendingUpdates.unshift(...batchUpdate);
-        console.log(`✗ Flush failed (${label}): ${e.message}; rows kept in buffer`);
+        // Jei nepavyko — grąžinam eilutes atgal į buferį, kad neprarastume.
+        pendingRows.unshift(...batch);
+        console.log(`✗ Flush failed (${label}): ${e.message}; ${batch.length} rows kept in buffer`);
         throw e;
       } finally {
         flushInFlight = false;
       }
     };
-
-    // Tolimesniame for cikle per `toFetch` pridedame logiką, ar tai Update ar Append:
 
     // SIGTERM/SIGINT — GitHub Actions cancel siunčia SIGTERM ir duoda ~10s
     // grace period'o. Spėjam flushinti buferį prieš SIGKILL.
@@ -11141,11 +11596,20 @@ const SHEET_HEADERS = [
         }
 
         // --- POST-AI CONTENT FILTER --------------------------------
+        // Reject tenders whose scope/requirements indicate poor fit:
+        // license partnerships, branded product supply, on-site work,
+        // pure cybersecurity, helpdesk, network infra, etc. The AI
+        // prompt populates dd.rejectReason / dd.rejectCategory based
+        // on the rules. Ambiguous procurement cases are NOT rejected
+        // by default — they pass through with rejectReason set to
+        // "ambiguous_procurement_check_manually" so a human can review
+        // them in the sheet.
+        //
+        // Escape hatch: set CONTENT_FILTER_DISABLED=1 to force-include
+        // every tender (useful when comparing what the filter would
+        // strip vs. raw output).
         const CONTENT_FILTER_DISABLED = process.env.CONTENT_FILTER_DISABLED === '1';
-        
-        // Pataisytas filtras: praleidžia bet kokią kategoriją, turinčią žodį "ambiguous"
-        const isAmbiguous = (dd.rejectCategory || '').toLowerCase().includes('ambiguous');
-        
+        const isAmbiguous = (dd.rejectCategory || '') === 'ambiguous_procurement_check_manually';
         if (!CONTENT_FILTER_DISABLED && dd.rejectReason && !isAmbiguous) {
           contentFilteredCount++;
           const catKey = dd.rejectCategory || 'uncategorized';
@@ -11210,18 +11674,7 @@ const SHEET_HEADERS = [
 
       // Build & buffer
       const row = buildRow(toFetch[i]);
-      const existingRowNum = existingMap.get(toFetch[i].tenderId.toString());
-
-      if (existingRowNum) {
-        // Eilutė egzistuoja – atnaujiname
-        pendingUpdates.push({
-          range: `${TAB_NAME}!A${existingRowNum}:R${existingRowNum}`,
-          values: [row]
-        });
-      } else {
-        // Nauja eilutė
-        pendingRows.push(row);
-      }
+      pendingRows.push(row);
 
       if (!sampleLogged) {
         console.log('Sample row:', JSON.stringify(row).slice(0, 500));
@@ -11229,10 +11682,11 @@ const SHEET_HEADERS = [
       }
 
       // Flush batch
-      if ((pendingRows.length + pendingUpdates.length) >= FLUSH_BATCH) {
+      if (pendingRows.length >= FLUSH_BATCH) {
         try {
           await flushPending(`batch@${i + 1}`);
         } catch (e) {
+          // jei flush'as numiršta — eilutės liko buferyje, bandysim dar kartą vėliau
           await new Promise(r => setTimeout(r, 2000));
         }
       }
@@ -11241,17 +11695,17 @@ const SHEET_HEADERS = [
     }
 
     // Galutinis flush
-    if (pendingRows.length > 0 || pendingUpdates.length > 0) {
+    if (pendingRows.length > 0) {
       try { await flushPending('final'); }
       catch (e) { console.log('Final flush error:', e.message); }
-    } else if (totalAppended === 0 && totalUpdated === 0) {
-      console.log('Nothing to append or update');
+    } else if (totalAppended === 0) {
+      console.log('Nothing to append');
     }
 
     console.log('=== SCRAPER FINISHED ===');
     console.log(`Total tenders found: ${allTenders.length}`);
-    console.log(`Rows appended (new): ${totalAppended}`);
-    console.log(`Rows updated (existing): ${totalUpdated}`);
+    console.log(`New tenders: ${newTenders.length}`);
+    console.log(`Rows appended: ${totalAppended}`);
     console.log(`Budget-filtered (<500K EUR): ${budgetFilteredCount}`);
     console.log(`Content-filtered (poor fit):  ${contentFilteredCount}`);
     if (contentFilteredCount > 0) {
@@ -11262,17 +11716,13 @@ const SHEET_HEADERS = [
       console.log(`  Content filter breakdown: ${breakdown}`);
     }
 
-    return { 
-      ok: true, 
-      tendersFound: allTenders.length, 
-      rowsAppended: totalAppended,
-      rowsUpdated: totalUpdated
-    };
+    return { ok: true, tendersFound: allTenders.length, rowsAppended: totalAppended };
 
   } finally {
     try { await browser.close(); } catch (_) {}
   }
 }
+
 // --- MAIN ENTRY POINT --------------------------------------------------
 
 (async () => {
