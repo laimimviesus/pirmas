@@ -2414,6 +2414,134 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
       console.log(`       body[0..400]: ${found.bodySnip}`);
       return null;
     }
+
+    // 2026-05-19 — DOWNLOAD-URL SHORT-CIRCUIT.
+    //
+    // marches-publics result rows on the keyWord page expose ONLY
+    // `EntrepriseDownloadReglement` (RC PDF) and `EntrepriseTelechargerDce`
+    // (DCE ZIP) anchors — there's no detail-page link inside the result
+    // card in this layout. If we return the RC URL as a string and let
+    // the generic fetchSourcePageDetails refetch via page.goto(), Chrome
+    // doesn't navigate — it starts a download — and Puppeteer reports
+    // net::ERR_ABORTED. Result: source dead, RC content lost.
+    //
+    // Empirical confirmation 2026-05-19 (FR test run, 5/6 tenders):
+    //   ✅ keyWord found 1 result
+    //   ❌ source nav warn: net::ERR_ABORTED at .../EntrepriseDownloadReglement
+    //   ❌ source dead — Chrome error page — skipping
+    //
+    // Fix: when the deep-link URL is a download endpoint, fetch the
+    // bytes via in-page fetch (cookies inherited = authenticated),
+    // detect PDF/ZIP magic bytes, parse with pdf-parse (RC) or adm-zip
+    // recurse (DCE). Return a synthesized result object that the caller
+    // can use directly without a second navigation.
+    const isDownloadUrl = /EntrepriseDownloadReglement|EntrepriseTelechargerDce/i.test(tenderUrl);
+    if (isDownloadUrl) {
+      console.log(`    📥 marches-publics: detected download URL — fetching binary directly`);
+      let pdfParseLib = null;
+      let AdmZipLib = null;
+      let mammothLib = null;
+      let XLSXLib = null;
+      try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+      try { AdmZipLib = require('adm-zip'); } catch (_) {}
+      try { mammothLib = require('mammoth'); } catch (_) {}
+      try { XLSXLib = require('xlsx'); } catch (_) {}
+
+      // Fetch binary via in-page fetch (uses Mercell-publics login cookies).
+      const fetchResult = await page.evaluate(async (url) => {
+        try {
+          const r = await fetch(url, { credentials: 'include' });
+          if (!r.ok) return { ok: false, status: r.status };
+          const ct = r.headers.get('content-type') || '';
+          const cd = r.headers.get('content-disposition') || '';
+          const buf = await r.arrayBuffer();
+          return { ok: true, status: r.status, ct, cd, bytes: Array.from(new Uint8Array(buf)) };
+        } catch (e) {
+          return { ok: false, error: String(e && e.message || e) };
+        }
+      }, tenderUrl).catch(() => ({ ok: false, error: 'evaluate-failed' }));
+
+      if (!fetchResult || !fetchResult.ok) {
+        console.log(`    ⚠️  marches-publics: download fetch failed (status=${fetchResult?.status || '?'}, err=${fetchResult?.error || '?'})`);
+        return null;
+      }
+      const buf = Buffer.from(fetchResult.bytes);
+      console.log(`    📥 marches-publics: downloaded ${buf.length}B (ct=${fetchResult.ct}, cd=${(fetchResult.cd || '').slice(0, 80)})`);
+
+      // Magic-byte sniff.
+      const isPdf = buf.length > 4 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
+      const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4B && buf[2] === 0x03 && buf[3] === 0x04;
+
+      let extractedText = '';
+      try {
+        if (isPdf && pdfParseLib) {
+          const parsed = await pdfParseLib(buf);
+          extractedText = (parsed && parsed.text ? parsed.text : '').trim();
+          console.log(`    📄 marches-publics: parsed RC PDF → ${extractedText.length}ch`);
+        } else if (isZip && AdmZipLib) {
+          // DCE ZIP — recurse into PDFs/DOCXs inside.
+          const z = new AdmZipLib(buf);
+          const parts = [];
+          for (const ent of z.getEntries().slice(0, 20)) {
+            if (ent.isDirectory) continue;
+            const en = ent.entryName.toLowerCase();
+            const inner = ent.getData();
+            if (/\.pdf$/i.test(en) && pdfParseLib) {
+              try {
+                const p = await pdfParseLib(inner);
+                const txt = (p && p.text ? p.text : '').trim();
+                if (txt) parts.push(`# ${ent.entryName}\n${txt.slice(0, 25000)}`);
+              } catch (_) {}
+            } else if (/\.docx$/i.test(en) && mammothLib) {
+              try {
+                const m = await mammothLib.extractRawText({ buffer: inner });
+                const txt = (m && m.value ? m.value : '').trim();
+                if (txt) parts.push(`# ${ent.entryName}\n${txt.slice(0, 25000)}`);
+              } catch (_) {}
+            } else if (/\.xlsx?$/i.test(en) && XLSXLib) {
+              try {
+                const wb = XLSXLib.read(inner, { type: 'buffer' });
+                const subParts = [];
+                for (const s of wb.SheetNames) {
+                  const csv = XLSXLib.utils.sheet_to_csv(wb.Sheets[s]);
+                  if (csv && csv.trim()) subParts.push(`## Sheet: ${s}\n${csv}`);
+                }
+                if (subParts.length) parts.push(`# ${ent.entryName}\n${subParts.join('\n\n').slice(0, 25000)}`);
+              } catch (_) {}
+            }
+            if (parts.join('').length > 100000) break;
+          }
+          extractedText = parts.join('\n\n');
+          console.log(`    📦 marches-publics: parsed DCE ZIP (${z.getEntries().length} entries) → ${extractedText.length}ch`);
+        } else {
+          console.log(`    ⚠️  marches-publics: download is neither PDF nor ZIP (first 4 bytes: ${Array.from(buf.slice(0, 4)).map(b => b.toString(16)).join(' ')})`);
+          return null;
+        }
+      } catch (e) {
+        console.log(`    ⚠️  marches-publics: parse error: ${(e.message || '').slice(0, 100)}`);
+        return null;
+      }
+
+      if (!extractedText || extractedText.length < 100) {
+        console.log(`    ⚠️  marches-publics: extracted text too short (${extractedText.length}ch) — skipping`);
+        return null;
+      }
+
+      // Return a synthesized result object (NOT a URL string).
+      // The caller at line 10525+ checks for object vs string and uses
+      // this directly without a second fetchSourcePageDetails roundtrip.
+      const tagged = `--- (marches-publics ${isPdf ? 'RC PDF' : 'DCE ZIP'}) ---\n${extractedText.slice(0, 50000)}`;
+      return {
+        __direct: true,                            // sentinel for caller
+        url: tenderUrl,
+        sourceHost: 'www.marches-publics.gouv.fr',
+        sourceFilesText: tagged,
+        bodyTextPreview: extractedText.slice(0, 5000),
+        error: null,
+        skipped: null,
+      };
+    }
+
     return tenderUrl;
   } catch (e) {
     console.log(`    ⚠️  marches-publics search error: ${(e.message || String(e)).slice(0, 120)}`);
@@ -10690,7 +10818,23 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           const deepLink = await resolveMarchesPublicsDeepLink(
             browser, searchRef, src.sourceHost
           );
-          if (deepLink) {
+          if (deepLink && typeof deepLink === 'object' && deepLink.__direct) {
+            // Direct result — resolver already downloaded & parsed the
+            // RC PDF (or DCE ZIP). Use immediately, no second fetch.
+            const before = src.sourceFilesText?.length || 0;
+            const after = deepLink.sourceFilesText?.length || 0;
+            console.log(`    ✓ marches-publics deep-link (direct download): source content ${before}ch → ${after}ch`);
+            src = {
+              ...src,
+              sourceHost: deepLink.sourceHost,
+              sourceFilesText: deepLink.sourceFilesText,
+              bodyTextPreview: deepLink.bodyTextPreview,
+              error: null,
+              skipped: null,
+            };
+            details.sourceFallbackFrom = details.sourceUrl;
+            details.sourceFallbackTo = deepLink.url;
+          } else if (deepLink && typeof deepLink === 'string') {
             console.log(`    🔁 marches-publics: refetching on deep-link URL`);
             const t1 = Date.now();
             const src2 = await fetchSourcePageDetails(browser, deepLink);
@@ -10816,13 +10960,29 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
               const deepLink = await resolveMarchesPublicsDeepLink(
                 browser, postLoginSearchRef, src.sourceHost
               );
-              if (deepLink) {
+              if (deepLink && typeof deepLink === 'object' && deepLink.__direct) {
+                // Direct download path — resolver already fetched RC PDF.
+                // Use as postLoginSrc directly, skip the fetchSourcePageDetails.
+                console.log(`    ↪️  marches-publics: post-login direct RC download (${(deepLink.sourceFilesText || '').length}ch)`);
+                postLoginSrc = {
+                  sourceHost: deepLink.sourceHost,
+                  sourceFilesText: deepLink.sourceFilesText,
+                  bodyTextPreview: deepLink.bodyTextPreview,
+                  loginGated: false,
+                  error: null,
+                  skipped: null,
+                };
+              } else if (deepLink && typeof deepLink === 'string') {
                 refetchUrl = deepLink;
                 console.log(`    ↪️  marches-publics: using deep-link for post-login fetch instead of root URL`);
               }
             }
             const t1 = Date.now();
-            postLoginSrc = await fetchSourcePageDetails(browser, refetchUrl);
+            // If direct-download already populated postLoginSrc above, skip
+            // the fetchSourcePageDetails roundtrip entirely.
+            if (!postLoginSrc) {
+              postLoginSrc = await fetchSourcePageDetails(browser, refetchUrl);
+            }
             console.log(
               `    🔁 post-login source fetch: ${Date.now() - t1}ms ` +
               `(gated=${!!postLoginSrc?.loginGated}, err=${postLoginSrc?.error || 'none'})`
