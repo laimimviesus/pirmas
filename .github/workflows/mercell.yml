@@ -20,7 +20,7 @@ on:
         required: false
         default: ''
         type: string
-  schedule:
+ # schedule:
     # 19:27 UTC = 21:27 Lithuanian time (winter, UTC+2) / 22:27 (summer, UTC+3).
     # User intent: trigger AFTER 19:00 local time, when buyers have finished
     # entering tender data into procurement databases for the day.
