@@ -6560,6 +6560,332 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
   }
 }
 
+// =====================================================================
+// fetchRiigihankedDocuments
+// ---------------------------------------------------------------------
+// Estonian public procurement portal (riigihanked.riik.ee) — Angular
+// SPA with hash-based routing. Sidebar exposes named sub-pages:
+//
+//   #/procurement/<id>/general-info
+//   #/procurement/<id>/procurers
+//   #/procurement/<id>/additional-data
+//   #/procurement/<id>/procurement-passport       ← "Grounds for exclusion + qualification conditions"
+//   #/procurement/<id>/qualification-conditions   ← "Eligibility criteria"
+//   #/procurement/<id>/evaluation                 ← "Evaluation criteria + indicators"
+//   #/procurement/<id>/subcontractor-passport
+//   #/procurement/<id>/notices
+//   #/procurement/<id>/procurement-versions
+//   #/procurement/<id>/documents?group=B          ← THE DOCS PAGE
+//
+// User-confirmed 2026-05-17 DOM facts:
+//   - Documents page renders a list "Documents:" with items like
+//     "Eligibility criteria"
+//   - Clicking an item reveals "Document file: <fname>.pdf (<size>)"
+//     as a download anchor pointing back into /rhr-web/
+//
+// Strategy (defensive — full DOM not yet inspected):
+//   1. Navigate to source URL; wait for Angular to settle
+//   2. Force navigation to #/procurement/<id>/documents?group=B (the
+//      group=B variant — most common; also try ?group=A as fallback)
+//   3. Wait for Angular digest + render
+//   4. Scan for downloadable file anchors (PDF/DOC/XLS extensions or
+//      href patterns matching /file/, /download/, /attachment/,
+//      /document/<id>)
+//   5. If zero anchors visible, click each ITEM HEADER in the
+//      Documents list to expand its "Document file" anchor, then scan again
+//   6. Fetch + parse top docs (same magic-byte detection as other handlers)
+//
+// Hash-routing quirk: Angular's $location strips reload-on-hashchange.
+// We use page.goto for first nav, then page.evaluate(window.location.hash = ...)
+// for SPA-internal jumps to avoid Angular detection issues.
+// =====================================================================
+async function fetchRiigihankedDocuments(browser, sourceUrl) {
+  try {
+    const u = new URL(sourceUrl);
+    if (!/(^|\.)riigihanked\.riik\.ee$/i.test(u.hostname)) return [];
+  } catch (_) { return []; }
+
+  let pdfParseLib = null, mammothLib = null, admZipLib = null;
+  try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(25000);
+    page.setDefaultTimeout(25000);
+    try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
+    try {
+      const ua = await page.browser().userAgent();
+      await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'et'] });
+      });
+    } catch (_) {}
+
+    // Extract procurement ID from URL — works for both
+    //   /rhr-web/#/procurement/<id>/...
+    // and short variants without hash routing yet.
+    const procurementId = (sourceUrl.match(/\/procurement\/(\d+)(?:[/?]|$)/i) || [])[1];
+    console.log(`    🇪🇪 riigihanked: procurementId=${procurementId || '(unknown)'} from ${sourceUrl.slice(-80)}`);
+
+    // STEP 1 — initial load
+    try {
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    } catch (e) {
+      console.log(`    🇪🇪 riigihanked: nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    try { await page.waitForNetworkIdle({ idleTime: 1500, timeout: 10000 }); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 2500));
+
+    // STEP 2 — force navigation to documents tab if procurementId known
+    if (procurementId) {
+      const docsUrl = `https://riigihanked.riik.ee/rhr-web/#/procurement/${procurementId}/documents?group=B`;
+      try {
+        await page.evaluate((target) => {
+          // Use SPA-friendly hash routing
+          window.location.href = target;
+        }, docsUrl);
+      } catch (_) {}
+      await new Promise((r) => setTimeout(r, 2500));
+      try { await page.waitForNetworkIdle({ idleTime: 1500, timeout: 8000 }); } catch (_) {}
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    // STEP 3 — diagnostic snapshot
+    const snapshot = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"], a.btn'));
+      // Visible doc-shaped anchors
+      const RX_FILE_EXT = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:\?|#|$)/i;
+      const RX_DL_PATH = /\/(?:file|files|document|documents|download|attachment|attachments|asset)\/[^/]+/i;
+      const docAnchors = anchors.filter((a) => {
+        if (a.offsetParent === null) return false;
+        const href = a.getAttribute('href') || '';
+        return RX_FILE_EXT.test(href) || RX_DL_PATH.test(href);
+      });
+      // Possible expandable items (each list entry in "Documents:" panel)
+      const listItems = Array.from(document.querySelectorAll('li, .document-item, [class*="document"]'));
+      const expandable = listItems.filter((li) => {
+        if (li.offsetParent === null) return false;
+        const text = (li.innerText || '').trim();
+        return text.length > 0 && text.length < 200 &&
+          /eligibility|qualification|tender|notice|criteria|terms|conditions/i.test(text);
+      });
+      return {
+        url: location.href,
+        title: document.title,
+        totalAnchors: anchors.length,
+        docAnchorCount: docAnchors.length,
+        docAnchorSamples: docAnchors.slice(0, 6).map((a) => ({
+          href: (a.getAttribute('href') || '').slice(0, 120),
+          text: (a.innerText || a.textContent || '').trim().slice(0, 80),
+        })),
+        expandableCount: expandable.length,
+        expandableSamples: expandable.slice(0, 6).map((el) => (el.innerText || '').trim().split('\n')[0].slice(0, 80)),
+      };
+    }).catch(() => null);
+
+    if (snapshot) {
+      console.log(
+        `    🇪🇪 riigihanked snapshot: url=${(snapshot.url || '').slice(-70)} ` +
+        `title="${(snapshot.title || '').slice(0, 40)}" ` +
+        `totalAnchors=${snapshot.totalAnchors} ` +
+        `docAnchors=${snapshot.docAnchorCount} ` +
+        `expandable=${snapshot.expandableCount}`
+      );
+      if (snapshot.docAnchorCount > 0) {
+        console.log(`    🇪🇪 riigihanked doc samples: ${JSON.stringify(snapshot.docAnchorSamples.slice(0, 3))}`);
+      }
+      if (snapshot.expandableCount > 0 && snapshot.docAnchorCount === 0) {
+        console.log(`    🇪🇪 riigihanked expandable items: ${JSON.stringify(snapshot.expandableSamples)}`);
+      }
+    }
+
+    // STEP 4 — if no doc anchors yet, click each expandable item to
+    // try revealing them. This handles the "expand to see Document file"
+    // user flow.
+    if (snapshot && snapshot.docAnchorCount === 0 && snapshot.expandableCount > 0) {
+      console.log(`    🇪🇪 riigihanked: 0 doc anchors visible — trying to expand list items`);
+      const expandResults = await page.evaluate(async () => {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const items = Array.from(document.querySelectorAll('li, .document-item, [class*="document"]'));
+        const candidates = items.filter((li) => {
+          if (li.offsetParent === null) return false;
+          const text = (li.innerText || '').trim();
+          return text.length > 0 && text.length < 200 &&
+            /eligibility|qualification|tender|notice|criteria|terms|conditions/i.test(text);
+        });
+        let clickedCount = 0;
+        for (const item of candidates.slice(0, 8)) {
+          // Click the LI itself or its first clickable child
+          let target = item.querySelector('a, button, [role="button"], .clickable, [ng-click]') || item;
+          try {
+            target.click();
+            clickedCount++;
+            await sleep(400);
+          } catch (_) {}
+        }
+        return clickedCount;
+      }).catch(() => 0);
+      console.log(`    🇪🇪 riigihanked: clicked ${expandResults} list item(s) to expand`);
+      try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 6000 }); } catch (_) {}
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    // STEP 5 — final harvest: scan all anchors for downloadable files
+    const docs = await page.evaluate(() => {
+      const RX_FILE_EXT = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:\?|#|$)/i;
+      const RX_DL_PATH = /\/(?:file|files|document|documents|download|attachment|attachments|asset)\/[^/]+|\/rhr-web\/.*\/[0-9]+(?:[?&]|$)/i;
+      const out = [];
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      const seen = new Set();
+      for (const a of anchors) {
+        const hrefRaw = a.getAttribute('href') || '';
+        if (!hrefRaw || /^javascript:/i.test(hrefRaw) || hrefRaw === '#') continue;
+        let abs;
+        try { abs = new URL(hrefRaw, location.href).toString(); } catch (_) { continue; }
+        // Same-origin guard
+        try { if (new URL(abs).host !== location.host) continue; } catch (_) { continue; }
+        if (seen.has(abs)) continue;
+        const isDl = RX_FILE_EXT.test(abs) || RX_DL_PATH.test(abs);
+        if (!isDl) continue;
+        seen.add(abs);
+        const text = (a.innerText || a.textContent || '').trim();
+        // Walk siblings/parents to find a richer label (the section
+        // header text — e.g. "Eligibility criteria" — sits in the
+        // parent <li> above the anchor)
+        let contextLabel = '';
+        let cur = a.parentElement;
+        for (let i = 0; i < 4 && cur; i++) {
+          const ct = (cur.innerText || cur.textContent || '').trim();
+          if (ct && ct.length < 200 && ct.length > text.length) {
+            contextLabel = ct.split('\n')[0].slice(0, 100);
+            break;
+          }
+          cur = cur.parentElement;
+        }
+        out.push({ url: abs, text: text.slice(0, 200), contextLabel });
+      }
+      return out;
+    }).catch(() => []);
+
+    if (!docs.length) {
+      console.log(`    ⚠️  riigihanked: no document download anchors found after navigation/expansion`);
+      return [];
+    }
+    console.log(`    🇪🇪 riigihanked: collected ${docs.length} doc anchor(s)`);
+
+    // Score docs by context (Estonian + English keywords)
+    const SCORE_RULES = [
+      { rx: /eligibility|qualification|kvalifikatsioon|sobivus/i, score: 30 },
+      { rx: /tender\s+document|hankedokumendid|hanke\s+dokument/i, score: 25 },
+      { rx: /criteria|kriteerium|hindamiskriteerium/i, score: 18 },
+      { rx: /terms|conditions|tingimused|t[üu]vesisaldused/i, score: 12 },
+      { rx: /annex|lisa\s+\d+/i, score: 8 },
+    ];
+    for (const d of docs) {
+      d.score = 0;
+      const targets = [d.contextLabel || '', d.text || '', d.url || ''];
+      for (const r of SCORE_RULES) {
+        for (const t of targets) {
+          if (r.rx.test(t)) { d.score = Math.max(d.score, r.score); break; }
+        }
+      }
+    }
+    docs.sort((a, b) => b.score - a.score);
+    const topDocs = docs.slice(0, 6);
+    console.log(
+      `    🇪🇪 riigihanked: priority docs: ` +
+      topDocs.map((d) => `${(d.contextLabel || d.text || d.url.split('/').pop()).slice(0, 40)}[s=${d.score}]`).join(' | ')
+    );
+
+    // Fetch + parse top docs
+    const detectFormat = (buf) => {
+      if (!buf || buf.length < 4) return 'unknown';
+      const b0 = buf[0], b1 = buf[1], b2 = buf[2], b3 = buf[3];
+      if (b0 === 0x25 && b1 === 0x50 && b2 === 0x44 && b3 === 0x46) return 'pdf';
+      if (b0 === 0x50 && b1 === 0x4B && (b2 === 0x03 || b2 === 0x05 || b2 === 0x07)) return 'zip';
+      if (b0 === 0xD0 && b1 === 0xCF && b2 === 0x11 && b3 === 0xE0) return 'cfb';
+      const head = buf.slice(0, 64).toString('utf8').trim().toLowerCase();
+      if (head.startsWith('<!doctype') || head.startsWith('<html')) return 'html';
+      return 'unknown';
+    };
+
+    const texts = [];
+    for (const doc of topDocs) {
+      const labelName = (doc.contextLabel || doc.text || doc.url.split('/').pop()).slice(0, 100);
+      const result = await page.evaluate(async (url) => {
+        try {
+          const resp = await fetch(url, { credentials: 'include', redirect: 'follow' });
+          if (!resp.ok) return { ok: false, status: resp.status };
+          const ct = resp.headers.get('content-type') || '';
+          const ab = await resp.arrayBuffer();
+          return { ok: true, status: resp.status, ct, url: resp.url || url, data: Array.from(new Uint8Array(ab)) };
+        } catch (e) {
+          return { ok: false, error: String(e).slice(0, 200) };
+        }
+      }, doc.url).catch((e) => ({ ok: false, error: e.message }));
+
+      if (!result || !result.ok || !result.data || result.data.length < 500) {
+        const status = result?.status || result?.error || '?';
+        console.log(`    ⚠️  riigihanked: fetch failed "${labelName.slice(0, 40)}" (status=${status})`);
+        continue;
+      }
+      const buf = Buffer.from(result.data);
+      const fmt = detectFormat(buf);
+      console.log(`    🇪🇪 riigihanked: fetched "${labelName.slice(0, 40)}" (${buf.length}B, magic=${fmt})`);
+
+      let text = '';
+      try {
+        if (fmt === 'pdf' && pdfParseLib) {
+          const parsed = await pdfParseLib(buf);
+          text = (parsed && parsed.text ? parsed.text : '').trim();
+        } else if (fmt === 'zip' && admZipLib) {
+          const zip = new admZipLib(buf);
+          const entries = zip.getEntries().filter((e) => !e.isDirectory).slice(0, 5);
+          const parts = [];
+          for (const z of entries) {
+            const innerBytes = z.getData();
+            const ext = (z.entryName.match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '';
+            try {
+              if (ext.toLowerCase() === 'pdf' && pdfParseLib) {
+                const p = await pdfParseLib(innerBytes);
+                if (p?.text) parts.push(`--- ${z.entryName} ---\n${p.text.slice(0, 30000)}`);
+              } else if (['docx', 'odt'].includes(ext.toLowerCase()) && mammothLib) {
+                const out = await mammothLib.extractRawText({ buffer: innerBytes });
+                if (out?.value) parts.push(`--- ${z.entryName} ---\n${out.value.slice(0, 30000)}`);
+              }
+            } catch (_) {}
+          }
+          text = parts.join('\n\n');
+        } else if ((fmt === 'cfb' || /\.docx?$/i.test(labelName)) && mammothLib) {
+          const out = await mammothLib.extractRawText({ buffer: buf });
+          text = (out?.value || '').trim();
+        }
+      } catch (e) {
+        console.log(`    ⚠️  riigihanked: parse failed "${labelName}": ${e.message}`);
+        continue;
+      }
+      if (text && text.length > 50) {
+        const clipped = text.slice(0, 50000);
+        texts.push(`--- (source) ${labelName} ---\n${clipped}`);
+        console.log(`    🇪🇪 riigihanked: parsed "${labelName.slice(0, 40)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+      } else {
+        console.log(`    ⚠️  riigihanked: "${labelName.slice(0, 40)}" extracted no usable text`);
+      }
+    }
+    return texts;
+  } catch (e) {
+    console.log(`    ⚠️  riigihanked handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
 async function fetchSourcePageDetails(browser, sourceUrl) {
   // URL scheme normalisation — Mercell sometimes returns sourceUrl
   // values like "www.conselleriadefacenda.es/silex" without an
@@ -8011,6 +8337,25 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     } catch (e) {
       console.log(`    ⚠️ marches-publics.info handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // riigihanked.riik.ee Documents handler — Estonian public procurement
+    // portal. Angular SPA with hash routing. Navigates to
+    // #/procurement/<id>/documents?group=B, waits for Angular render,
+    // expands list items if needed, and harvests PDF/DOCX download
+    // anchors. No-op for non-riigihanked sources.
+    try {
+      const rhTexts = await fetchRiigihankedDocuments(browser, sourceUrl);
+      if (rhTexts && rhTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + rhTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇪🇪 riigihanked: appended ${rhTexts.length} doc(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ riigihanked handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     srcPage.off('request', blockHandler);
@@ -10436,7 +10781,9 @@ async function runRetranslateStale(sheets, SHEET_ID, TAB_NAME) {
   }
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: `${TAB_NAME}!A1:Q`,
+    // 2026-05-17: extended to A1:S to read 19-col schema (incl. E=Original
+    // title and S=Scope of agreement EN). Backfill writes to D and S.
+    range: `${TAB_NAME}!A1:S`,
   });
   const rows = resp.data.values || [];
   if (rows.length === 0) {
@@ -10484,11 +10831,20 @@ async function runRetranslateStale(sheets, SHEET_ID, TAB_NAME) {
     if (!r) continue;
     scanned++;
     const sheetRow = i + 1; // Sheets API rows are 1-indexed
-    const title = (r[3] || '').toString();   // col D — TENDER NAME
-    const scope = (r[12] || '').toString();  // col M — SCOPE OF AGREEMENT
+    // 2026-05-17 column-restructure update:
+    //   col D = TENDER NAME (English)   ← write target
+    //   col E = TENDER NAME (Original)  ← source of truth for translation
+    //   col N = SCOPE OF AGREEMENT (orig) ← scope translation source
+    //   col S = Scope of agreement (EN) ← scope translation target
+    const titleEnExisting   = (r[3]  || '').toString();   // col D
+    const titleOriginal     = (r[4]  || '').toString();   // col E
+    const scopeOriginal     = (r[13] || '').toString();   // col N
+    const scopeEnExisting   = (r[18] || '').toString();   // col S
 
-    const titleStale = looksNonEnglish(title);
-    const scopeStale = looksNonEnglish(scope);
+    // Stale = English target is empty OR looks non-English (untranslated).
+    // Source must exist for us to translate from.
+    const titleStale = titleOriginal && (!titleEnExisting.trim() || looksNonEnglish(titleEnExisting));
+    const scopeStale = scopeOriginal && (!scopeEnExisting.trim() || looksNonEnglish(scopeEnExisting));
     if (!titleStale && !scopeStale) continue;
     candidates++;
 
@@ -10497,14 +10853,14 @@ async function runRetranslateStale(sheets, SHEET_ID, TAB_NAME) {
     _lastAiNonRetryableError = null;
 
     if (titleStale) {
-      const titleEn = await translateToEnglish(title, {
+      const titleEn = await translateToEnglish(titleOriginal, {
         hint: 'Public tender title',
         skipHeuristic: true,
       });
-      if (titleEn && titleEn.trim() !== title.trim()) {
+      if (titleEn && titleEn.trim() !== titleOriginal.trim()) {
         updates.push({ range: `${TAB_NAME}!D${sheetRow}`, values: [[titleEn]] });
         translated++;
-        console.log(`  [${sheetRow}] D: "${title.slice(0, 50)}" → "${titleEn.slice(0, 50)}"`);
+        console.log(`  [${sheetRow}] D: "${titleOriginal.slice(0, 50)}" → "${titleEn.slice(0, 50)}"`);
       } else {
         console.log(`  [${sheetRow}] D: no change (echoed/empty)`);
       }
@@ -10517,13 +10873,13 @@ async function runRetranslateStale(sheets, SHEET_ID, TAB_NAME) {
     }
 
     if (scopeStale) {
-      const scopeEn = await translateToEnglish(scope, { hint: 'Public tender scope of agreement' });
-      if (scopeEn && scopeEn.trim() !== scope.trim()) {
-        updates.push({ range: `${TAB_NAME}!M${sheetRow}`, values: [[scopeEn]] });
+      const scopeEn = await translateToEnglish(scopeOriginal, { hint: 'Public tender scope of agreement' });
+      if (scopeEn && scopeEn.trim() !== scopeOriginal.trim()) {
+        updates.push({ range: `${TAB_NAME}!S${sheetRow}`, values: [[scopeEn]] });
         translated++;
-        console.log(`  [${sheetRow}] M: scope translated (${scope.length}ch → ${scopeEn.length}ch)`);
+        console.log(`  [${sheetRow}] S: scope translated (${scopeOriginal.length}ch → ${scopeEn.length}ch)`);
       } else {
-        console.log(`  [${sheetRow}] M: no change (echoed/empty)`);
+        console.log(`  [${sheetRow}] S: no change (echoed/empty)`);
       }
     }
 
@@ -11107,23 +11463,25 @@ async function runScraper() {
     const TAB_NAME = process.env.SHEET_TAB_NAME || 'Sheet1';
 
     const SHEET_HEADERS = [
-      'DATE OF WHEN ADDED TO THE LIST',
-      'BIDDING ANNOUCEMENT DATE',
-      'LINK TO THE PAGE TENDER WAS PUBLISHED ON',
-      'TENDER NAME',
-      'BIDDING ORGANISATION',
-      'BIDDING DEADLINE DATE',
-      'COUNTRY',
-      'MAX BUDGET EUR without VAT',
-      'DURATION OF AGREEMENT (months)',
-      'REQUIREMENTS FOR SUPPLIER',
-      'QUALIFICATION REQUIREMENTS',
-      'OFFER WEIGHING CRITERIA',
-      'SCOPE OF AGREEMENT',
-      'TECHNICAL STACK',
-      'Source URL',
-      'Reference number',
-      'KEYWORDS',
+      'DATE OF WHEN ADDED TO THE LIST',  // A
+      'BIDDING ANNOUCEMENT DATE',        // B
+      'LINK TO THE PAGE TENDER WAS PUBLISHED ON', // C
+      'TENDER NAME (English)',           // D — AI EN translation
+      'TENDER NAME (Original)',          // E — source language verbatim
+      'BIDDING ORGANISATION',            // F
+      'BIDDING DEADLINE DATE',           // G
+      'COUNTRY',                         // H
+      'MAX BUDGET EUR without VAT',      // I
+      'DURATION OF AGREEMENT (months)',  // J
+      'REQUIREMENTS FOR SUPPLIER',       // K
+      'QUALIFICATION REQUIREMENTS',      // L
+      'OFFER WEIGHING CRITERIA',         // M
+      'SCOPE OF AGREEMENT',              // N
+      'TECHNICAL STACK',                 // O
+      'Source URL',                      // P
+      'Reference number',                // Q
+      'KEYWORDS',                        // R
+      'Scope of agreement (EN)',         // S
     ];
 
     let existingIds = new Set();
@@ -11366,43 +11724,72 @@ async function runScraper() {
     const buildRow = (t) => {
       const d = t.details || {};
       const publishedUrl = d.sourceUrl || t.url;
-      // Pavadinimui ir scope — jei turim AI išverstą versiją, rodom ją
-      // (lengviau sales komandai dirbti angliškai). Jei AI išjungtas, rodom
-      // originalą.
-      let titleOut = d.titleEn || cleanDescription(d.title || t.title || '');
-      let scopeOut = d.scopeOfAgreementEn || cleanDescription(d.scopeOfAgreement || '');
+      // 2026-05-17 column-shift fix:
+      //
+      // User's sheet has TWO title/scope columns:
+      //   - col 4 ("TENDER NAME")     → ORIGINAL (Swedish/French/German/...)
+      //   - col 18 ("Tender name (EN)") → English translation
+      //   - col 13 ("SCOPE OF AGREEMENT") → ORIGINAL
+      //   - col 19 ("Scope of agreement (EN)") → English translation
+      //
+      // Previously buildRow wrote d.titleEn to col 4 (English) and left
+      // cols 18/19 blank, which made the user's manually-renamed sheet
+      // look "shifted" — original-language column was filled with EN
+      // text.
+      //
+      // Now: col 4/13 get the ORIGINAL Mercell-provided text. Cols 18/19
+      // get the AI-translated EN versions. Append range expanded to A:S.
+      const titleOrig = cleanDescription(d.title || t.title || '');
+      const scopeOrig = cleanDescription(d.scopeOfAgreement || '');
+      const titleEn = d.titleEn ? cleanDescription(d.titleEn) : '';
+      const scopeEn = d.scopeOfAgreementEn ? cleanDescription(d.scopeOfAgreementEn) : '';
 
       // Surface ambiguous-procurement reviews in the sheet so the
-      // sales reviewer can spot them at a glance. We prefix the title
-      // with "[REVIEW]" and inject the AI's reason into the scope cell
-      // so they don't have to re-read the source notice.
+      // sales reviewer can spot them at a glance. We prefix BOTH the
+      // original and EN titles with "[REVIEW]" so it's visible whichever
+      // column the reviewer looks at; the human-review note is injected
+      // into both scope cells.
+      let titleOrigOut = titleOrig;
+      let scopeOrigOut = scopeOrig;
+      let titleEnOut = titleEn;
+      let scopeEnOut = scopeEn;
       if (d.rejectCategory === 'ambiguous_procurement_check_manually' && d.rejectReason) {
-        titleOut = `[REVIEW] ${titleOut}`;
-        scopeOut = `[NEEDS HUMAN REVIEW: ${d.rejectReason}] ${scopeOut}`;
+        if (titleOrigOut) titleOrigOut = `[REVIEW] ${titleOrigOut}`;
+        if (titleEnOut) titleEnOut = `[REVIEW] ${titleEnOut}`;
+        if (scopeOrigOut) scopeOrigOut = `[NEEDS HUMAN REVIEW: ${d.rejectReason}] ${scopeOrigOut}`;
+        if (scopeEnOut) scopeEnOut = `[NEEDS HUMAN REVIEW: ${d.rejectReason}] ${scopeEnOut}`;
       }
       const reqOut = cleanDescription(d.requirementsForSupplier || '');
       const qualOut = cleanDescription(d.qualificationRequirements || '');
       const critOut = cleanDescription(d.offerWeighingCriteria || '');
-      // Keyword'ai match'inami ant visko, ką turim anglų kalba.
-      const keywords = matchKeywords([titleOut, scopeOut, reqOut, qualOut, critOut, d.technicalStack || '']);
+      // Keyword'ai match'inami ant visko, ką turim anglų kalba (EN versija
+      // jei yra, originalas kaip fallback). Reviewer'iams angliški
+      // raktažodžiai aiškesni.
+      const keywords = matchKeywords([
+        titleEnOut || titleOrigOut,
+        scopeEnOut || scopeOrigOut,
+        reqOut, qualOut, critOut, d.technicalStack || ''
+      ]);
       return [
-        nowIso,
-        fmtDate(d.publicationDate || t.publicationDate || ''),
-        publishedUrl,
-        titleOut,
-        cleanOrg(d.organisation || t.organisation || ''),
-        fmtDate(d.deadline || t.deadlineRaw || ''),
-        d.country || t.country || '',
-        formatEurBudget(d.maxBudget),
-        d.duration || '',
-        reqOut,
-        qualOut,
-        critOut,
-        scopeOut,
-        d.technicalStack || '',
-        d.sourceUrl || '',
-        d.referenceNumber || t.tenderId || '',
-        keywords,
+        nowIso,                                                  // A — DATE ADDED
+        fmtDate(d.publicationDate || t.publicationDate || ''),   // B — BIDDING ANNOUCEMENT DATE
+        publishedUrl,                                            // C — LINK
+        titleEnOut,                                              // D — TENDER NAME (English) ★ AI translation
+        titleOrigOut,                                            // E — TENDER NAME (Original)
+        cleanOrg(d.organisation || t.organisation || ''),        // F — BIDDING ORGANISATION
+        fmtDate(d.deadline || t.deadlineRaw || ''),              // G — BIDDING DEADLINE
+        d.country || t.country || '',                            // H — COUNTRY
+        formatEurBudget(d.maxBudget),                            // I — MAX BUDGET EUR
+        d.duration || '',                                        // J — DURATION
+        reqOut,                                                  // K — REQUIREMENTS FOR SUPPLIER
+        qualOut,                                                 // L — QUALIFICATION REQUIREMENTS
+        critOut,                                                 // M — OFFER WEIGHING CRITERIA
+        scopeOrigOut,                                            // N — SCOPE OF AGREEMENT (original)
+        d.technicalStack || '',                                  // O — TECHNICAL STACK
+        d.sourceUrl || '',                                       // P — Source URL
+        d.referenceNumber || t.tenderId || '',                   // Q — Reference number
+        keywords,                                                // R — KEYWORDS
+        scopeEnOut,                                              // S — Scope of agreement (EN)
       ];
     };
 
@@ -11419,7 +11806,12 @@ async function runScraper() {
       try {
         const res = await sheets.spreadsheets.values.append({
           spreadsheetId: SHEET_ID,
-          range: `${TAB_NAME}!A:Q`,
+          // 2026-05-17: expanded from A:Q (17 cols) to A:S (19 cols)
+          // to include EN-translated columns 18 (Tender name (EN))
+          // and 19 (Scope of agreement (EN)) — keeps col 4/13 free
+          // for the ORIGINAL-language title/scope as the sheet
+          // header expects.
+          range: `${TAB_NAME}!A:S`,
           valueInputOption: 'RAW',
           insertDataOption: 'INSERT_ROWS',
           requestBody: { values: batch },
