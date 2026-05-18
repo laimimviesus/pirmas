@@ -2305,219 +2305,119 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
   if (!referenceNumber || typeof referenceNumber !== 'string') return null;
   const ref = referenceNumber.trim();
   if (ref.length < 3 || ref.length > 60) return null;
-  const searchPage = `https://www.marches-publics.gouv.fr/?page=Entreprise.EntrepriseAdvancedSearch&AllCons`;
+  // 2026-05-18 — REWRITE.
+  //
+  // The previous version filled the advanced-search "Reference" form
+  // field (id `ctl0_CONTENU_PAGE_AdvancedSearch_reference`) and clicked
+  // "Lancer la recherche". That ALWAYS returned zero matches even for
+  // tenders whose reference clearly exists on the portal. Empirical
+  // test (user-confirmed 2026-05-18): typing the same value into the
+  // form's Reference field returns 0 results, while a free-text search
+  // via the URL parameter `keyWord=<ref>` returns the correct tender.
+  //
+  // Reason: the form's "Reference" field is a strict equality match
+  // against the portal's INTERNAL consultation id (a base64 token like
+  // "Mjk1NjQ2OA==" used in the document download URLs), NOT the
+  // buyer-issued reference Mercell hands us ("Shom_26AC07",
+  // "B26-01823-MP", etc.). `keyWord` does a free-text search across
+  // reference + title + body, which is what we actually want.
+  //
+  // So we skip the form entirely and navigate directly to the URL.
+  // Confirmed 2026-05-18 with user manual inspection: search URL
+  //   ?page=Entreprise.EntrepriseAdvancedSearch&searchAnnCons
+  //   &keyWord=Shom_26AC07&categorie=0&localisations=
+  // returns "Number of results: 1" with the right row, including the
+  // RC download button (a[href*="EntrepriseDownloadReglement"]) and a
+  // detail link.
+  const searchUrl =
+    `https://www.marches-publics.gouv.fr/?page=Entreprise.EntrepriseAdvancedSearch` +
+    `&searchAnnCons&keyWord=${encodeURIComponent(ref)}&categorie=0&localisations=`;
   let page = null;
   try {
     page = await browser.newPage();
     page.setDefaultNavigationTimeout(15000);
-    await page.goto(searchPage, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    // Longer wait — marches-publics is ASP.NET, takes 2-3s to render
-    // forms even on warm requests
-    await new Promise((r) => setTimeout(r, 3000));
+    console.log(`    🔎 marches-publics keyWord search: ...${searchUrl.slice(-120)}`);
+    await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    // marches-publics is ASP.NET, takes 2-3s to render result lists
+    await new Promise((r) => setTimeout(r, 2500));
 
-    // STEP 0 — landing diagnostic + Recherche avancée fallback.
-    //
-    // 2026-05-16: when the user is logged in, marches-publics often
-    // redirects /?page=Entreprise.EntrepriseAdvancedSearch&AllCons to
-    // the /entreprise/ DASHBOARD ("Bienvenue Mon compte Déconnexion ...
-    // Mon panier Consultations en cours") instead of rendering the
-    // advanced search form. The form has zero visible inputs because
-    // it's on a DIFFERENT page reachable via the "Recherche avancée"
-    // link in the side menu.
-    //
-    // Detect that we landed on dashboard (no text inputs visible) and
-    // click "Recherche avancée" link to reach the real search form.
-    const landing = await page.evaluate(() => {
-      const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
-      const visibleInputs = inputs.filter((i) => i.offsetParent !== null);
-      const links = Array.from(document.querySelectorAll('a'));
-      const advancedLink = links.find((a) => {
-        const t = (a.innerText || a.textContent || '').trim();
-        return /^\s*recherche\s+avanc[eé]e\s*$/i.test(t);
-      });
-      return {
-        url: location.href,
-        title: document.title,
-        visibleInputCount: visibleInputs.length,
-        hasAdvancedLink: !!advancedLink,
-      };
-    }).catch(() => null);
-    if (landing) {
-      console.log(
-        `    🔎 marches-publics landing: url=${(landing.url || '').slice(-80)} ` +
-        `title="${(landing.title || '').slice(0, 60)}" ` +
-        `visibleInputs=${landing.visibleInputCount} ` +
-        `hasAdvancedLink=${landing.hasAdvancedLink}`
-      );
-    }
-    if (landing && landing.visibleInputCount === 0 && landing.hasAdvancedLink) {
-      console.log(`    ↪️  no inputs on landing — clicking "Recherche avancée" link to reach search form`);
-      const clicked = await page.evaluate(() => {
-        const links = Array.from(document.querySelectorAll('a'));
-        const advancedLink = links.find((a) => {
-          const t = (a.innerText || a.textContent || '').trim();
-          return /^\s*recherche\s+avanc[eé]e\s*$/i.test(t);
-        });
-        if (!advancedLink) return false;
-        advancedLink.setAttribute('data-mx-rech-click', '1');
-        try { advancedLink.scrollIntoView({ block: 'center' }); } catch (_) {}
-        return true;
-      }).catch(() => false);
-      if (clicked) {
-        try {
-          await Promise.race([
-            page.click('[data-mx-rech-click="1"]'),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('click timeout')), 4000)),
-          ]);
-        } catch (_) {
-          // Fallback: DOM-click via evaluate
-          await page.evaluate(() => {
-            const el = document.querySelector('[data-mx-rech-click="1"]');
-            if (el) el.click();
-          }).catch(() => null);
-        }
-        await Promise.race([
-          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => null),
-          new Promise((r) => setTimeout(r, 3500)),
-        ]);
-        await new Promise((r) => setTimeout(r, 1500));
-        const afterClick = await page.evaluate(() => {
-          const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
-          return {
-            url: location.href,
-            visibleInputCount: inputs.filter((i) => i.offsetParent !== null).length,
-          };
-        }).catch(() => null);
-        if (afterClick) {
-          console.log(`    🔎 after Recherche avancée click: url=${(afterClick.url || '').slice(-80)} visibleInputs=${afterClick.visibleInputCount}`);
-        }
-      }
-    }
-
-    // Step 1: find an input that looks like a reference/numéro de
-    // consultation field. marches-publics uses ASP.NET-style ids
-    // (`ctl0_CONTENU_PAGE_AdvancedSearch_reference`) so we match by
-    // id/name/placeholder/label-text substrings.
-    const filled = await page.evaluate((refVal) => {
-      const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
-      const visible = inputs.filter((i) => i.offsetParent !== null);
-      // Score each visible input — higher = more likely the reference field.
-      const score = (el) => {
-        const id = (el.id || '').toLowerCase();
-        const name = (el.name || '').toLowerCase();
-        const ph = (el.placeholder || '').toLowerCase();
-        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
-        const blob = `${id} ${name} ${ph} ${aria}`;
-        let s = 0;
-        if (/\breference\b|\bréférence\b|\bref$|numero(_)?cons|num(_)?cons|numéro\s*de\s*consultation/i.test(blob)) s += 10;
-        if (/intitul[eé]|object|libell[eé]/i.test(blob)) s += 1; // weaker — title-by-keyword field
-        // Adjacent <label> text gives strong evidence
-        try {
-          const lbl = (el.labels && el.labels[0]) || document.querySelector(`label[for="${el.id}"]`);
-          if (lbl) {
-            const lt = (lbl.innerText || '').toLowerCase();
-            if (/référence|reference|numéro\s*de\s*consultation|consultation/.test(lt)) s += 8;
-          }
-        } catch (_) {}
-        return s;
-      };
-      const scored = visible.map((el) => ({ el, s: score(el) })).filter((x) => x.s > 0);
-      if (scored.length === 0) {
-        // Fallback: return diagnostic listing so we can refine selectors.
-        const sample = visible.slice(0, 8).map((el) => ({
-          id: el.id || '',
-          name: el.name || '',
-          placeholder: el.placeholder || '',
-        }));
-        return { ok: false, sample };
-      }
-      scored.sort((a, b) => b.s - a.s);
-      const target = scored[0].el;
-      try {
-        target.focus();
-        target.value = refVal;
-        target.dispatchEvent(new Event('input', { bubbles: true }));
-        target.dispatchEvent(new Event('change', { bubbles: true }));
-        return { ok: true, used: target.id || target.name || target.placeholder, score: scored[0].s };
-      } catch (e) {
-        return { ok: false, error: String(e && e.message || e) };
-      }
-    }, ref).catch((e) => ({ ok: false, error: String(e && e.message || e) }));
-    if (!filled || !filled.ok) {
-      const sampleStr = filled && filled.sample
-        ? ` (visible inputs: ${JSON.stringify(filled.sample.slice(0, 6))})`
-        : '';
-      console.log(`    ⚠️  marches-publics search: no reference field matched${sampleStr}`);
-      return null;
-    }
-    console.log(`    ↪️  marches-publics search: filled "${filled.used}" (score=${filled.score}) with reference "${ref}"`);
-    // Step 2: submit the form. Prefer the actual reference field's
-    // parent form's submit button to avoid hitting the global header
-    // search bar.
-    const submitted = await page.evaluate((refVal) => {
-      const inputs = Array.from(document.querySelectorAll('input'));
-      const refInput = inputs.find((i) => i.value === refVal && i.offsetParent !== null);
-      const form = refInput ? refInput.closest('form') : null;
-      const candidates = form
-        ? Array.from(form.querySelectorAll('input[type="submit"], button[type="submit"], button:not([type])'))
-        : Array.from(document.querySelectorAll('input[type="submit"], button[type="submit"]'));
-      const visible = candidates.filter((b) => b.offsetParent !== null);
-      // Prefer button with "rechercher" / "search" text
-      const byText = visible.find((b) => {
-        const t = (b.innerText || b.value || '').trim().toLowerCase();
-        return /rechercher|search|valider|lancer\s*la\s*recherche/.test(t);
-      });
-      const target = byText || visible[0];
-      if (!target) return null;
-      try { target.click(); return (target.innerText || target.value || target.id || 'submit').toString().slice(0, 30); }
-      catch (_) { return null; }
-    }, ref).catch(() => null);
-    if (!submitted) {
-      console.log(`    ⚠️  marches-publics search: no submit button found`);
-      return null;
-    }
-    console.log(`    ↪️  marches-publics search: submitted ("${submitted}")`);
-    // Step 3: wait for navigation OR network idle (the page may post
-    // and re-render in-place without changing URL).
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => null),
-      new Promise((r) => setTimeout(r, 4000)),
-    ]);
-    await new Promise((r) => setTimeout(r, 1500));
-    // Step 4: find a link in the results matching the reference.
-    const tenderUrl = await page.evaluate((refVal) => {
-      const refLow = refVal.toLowerCase();
-      // Most marches-publics result rows are <tr> with the reference in
-      // one cell and a link in another. Look for any <tr> containing the
-      // reference text, then return the first <a href> inside.
+    // Find the result row matching the reference and extract any
+    // navigable links inside. Prefer:
+    //   1. Detail link (EntrepriseDetailsConsultation) — gives the full
+    //      tender description + all document buttons (RC + DCE + ...).
+    //   2. RC link (EntrepriseDownloadReglement) — direct PDF of the
+    //      regulation document, contains qualification + criteria.
+    //   3. Any non-mailto anchor in the row, as last-resort.
+    const found = await page.evaluate((refLow) => {
       const rows = Array.from(document.querySelectorAll('tr, .ligne, .consultation, .resultat'));
+      // Match by row text. Use case-insensitive substring.
       for (const row of rows) {
         const text = (row.innerText || '').toLowerCase();
-        if (text.includes(refLow)) {
-          const link = row.querySelector('a[href]:not([href*="mailto"])');
-          if (link && link.href) return link.href;
-        }
+        if (!text.includes(refLow)) continue;
+        const rcLink = row.querySelector('a[href*="EntrepriseDownloadReglement"]');
+        // Detail link selectors — marches-publics has shipped multiple
+        // variants over the years; cover the most common.
+        const detailLink =
+          row.querySelector('a[href*="EntrepriseDetailsConsultation"]') ||
+          row.querySelector('a[href*="EntrepriseDetailConsultation"]') ||
+          row.querySelector('a[href*="entreprise.entreprisedetailsconsultation" i]') ||
+          row.querySelector('a[href*="DetailsConsultation"]');
+        const anyLink = row.querySelector(
+          'a[href]:not([href*="mailto"]):not([href*="EntrepriseDownload"])'
+        );
+        return {
+          rowText: (row.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 220),
+          detailHref: detailLink ? detailLink.href : null,
+          rcHref: rcLink ? rcLink.href : null,
+          anyHref: anyLink ? anyLink.href : null,
+        };
       }
-      // Fallback 1: anchor whose own text includes the reference
-      const allLinks = Array.from(document.querySelectorAll('a[href]'));
-      const byTextLink = allLinks.find((a) => {
-        const t = (a.innerText || '').toLowerCase();
-        return t.includes(refLow);
-      });
-      if (byTextLink && byTextLink.href) return byTextLink.href;
-      // Fallback 2: anchor whose href includes the reference (some
-      // portals encode the reference into the URL).
-      const byHrefLink = allLinks.find((a) => {
-        const h = (a.href || '').toLowerCase();
-        return h.includes(refLow);
-      });
-      return byHrefLink ? byHrefLink.href : null;
-    }, ref).catch(() => null);
-    if (!tenderUrl) {
-      console.log(`    ⚠️  marches-publics search: no result link matched reference "${ref}"`);
+      return null;
+    }, ref.toLowerCase()).catch(() => null);
+
+    if (!found) {
+      console.log(`    ⚠️  marches-publics keyWord: no result row matched "${ref}"`);
+      // Diagnostic dump — show what's actually on the page so we can
+      // refine the matcher next iteration.
+      try {
+        const diag = await page.evaluate(() => {
+          const rows = Array.from(document.querySelectorAll('tr, .ligne, .consultation, .resultat'));
+          const sampleRows = rows.slice(0, 6).map((r) =>
+            (r.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 220)
+          );
+          const bodyTxt = (document.body && document.body.innerText) || '';
+          const hasNoResults = /aucune?\s+consultation|aucun?\s+résultat|aucun?\s+resultat|0\s+résultat|0\s+resultat|pas\s+de\s+résultat|number\s+of\s+results\s*:\s*0/i.test(bodyTxt);
+          return {
+            url: location.href,
+            rowCount: rows.length,
+            sampleRows,
+            hasNoResults,
+            bodyHead: bodyTxt.replace(/\n/g, ' | ').slice(0, 400),
+          };
+        }).catch(() => null);
+        if (diag) {
+          console.log(`    🔎 keyWord diag: url=${diag.url.slice(-80)} rows=${diag.rowCount} hasNoResults=${diag.hasNoResults}`);
+          for (let i = 0; i < diag.sampleRows.length; i++) {
+            console.log(`       row[${i}]: ${diag.sampleRows[i]}`);
+          }
+          console.log(`       body[0..400]: ${diag.bodyHead}`);
+        }
+      } catch (_) { /* best-effort */ }
       return null;
     }
-    console.log(`    ✅ marches-publics search → tender URL: ${tenderUrl.slice(0, 100)}`);
+
+    console.log(`    ✅ marches-publics keyWord match: ${found.rowText.slice(0, 120)}`);
+    if (found.detailHref) console.log(`       detail: ${found.detailHref.slice(0, 110)}`);
+    if (found.rcHref) console.log(`       RC:     ${found.rcHref.slice(0, 110)}`);
+
+    // Prefer the detail page — richer (description + all docs). Fall
+    // back to RC if no detail link is in the row (PDF will be parsed by
+    // the generic source-fetch via pdf-parse magic-byte detection).
+    const tenderUrl = found.detailHref || found.rcHref || found.anyHref;
+    if (!tenderUrl) {
+      console.log(`    ⚠️  marches-publics keyWord: matched row had no navigable link`);
+      return null;
+    }
     return tenderUrl;
   } catch (e) {
     console.log(`    ⚠️  marches-publics search error: ${(e.message || String(e)).slice(0, 120)}`);
