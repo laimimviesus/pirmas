@@ -30,7 +30,7 @@ on:
     # skipped entirely. We use 19:27 — off the hour boundary, off-peak — to
     # maximise on-time triggering. Avoiding :00, :15, :30, :45 minute marks
     # too since those are also congested.
-    - cron: '27 19 * * *'
+    # - cron: '27 19 * * *'
 
 jobs:
   scrape:
