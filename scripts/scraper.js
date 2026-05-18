@@ -2380,15 +2380,40 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
       const rcLink = document.querySelector('a[href*="EntrepriseDownloadReglement"]');
       const dceLink = document.querySelector('a[href*="EntrepriseTelechargerDce"]')
         || document.querySelector('a[href*="DownloadDce"]');
+      // Broader fallback: any "EntrepriseDownload*" or "EntrepriseTelecharger*"
+      // anchor. Some result cards expose only "EntrepriseDownloadAvis"
+      // (Avis de publicité PDF — the notice itself) when no RC has been
+      // uploaded yet. Better than nothing — the notice contains lot
+      // descriptions, deadlines, and partial criteria.
+      const anyDownloadLink =
+        document.querySelector('a[href*="EntrepriseDownload"]') ||
+        document.querySelector('a[href*="EntrepriseTelecharger"]');
+      // Even broader: any anchor whose href has fileReference/orgAcronyme
+      // parameters (marches-publics tender-scoped URL pattern).
+      const tenderScopedLink = (() => {
+        const all = Array.from(document.querySelectorAll('a[href]'));
+        return all.find((a) => {
+          const h = a.href || '';
+          return /orgAcronyme=|EntrepriseAffichConsultation|EntrepriseAffichSommaire/i.test(h);
+        });
+      })();
       // Capture a snippet of body around "Nombre de résultats" for diagnostics
       const bodySnip = bodyTxt.replace(/\n/g, ' | ').slice(0, 400);
+      // Diagnostic — list all Entreprise* anchors we found, for when
+      // none of the patterns above matched.
+      const entrepriseAnchors = Array.from(document.querySelectorAll('a[href*="Entreprise"]'))
+        .slice(0, 10)
+        .map((a) => (a.href || '').slice(0, 130));
       return {
         resultCount: resultCount ?? -1,
         noResults: false,
         detailHref: detailLink ? detailLink.href : null,
         rcHref: rcLink ? rcLink.href : null,
         dceHref: dceLink ? dceLink.href : null,
+        otherDownloadHref: anyDownloadLink ? anyDownloadLink.href : null,
+        tenderScopedHref: tenderScopedLink ? tenderScopedLink.href : null,
         bodySnip,
+        entrepriseAnchors,
       };
     }).catch(() => null);
 
@@ -2408,10 +2433,23 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
     // Prefer the detail page — richer (description + all docs). Fall
     // back to RC PDF (parsed by generic source-fetch via pdf-parse
     // magic-byte detection) or DCE ZIP (parsed via adm-zip recurse).
-    const tenderUrl = found.detailHref || found.rcHref || found.dceHref;
+    const tenderUrl =
+      found.detailHref ||
+      found.rcHref ||
+      found.dceHref ||
+      found.otherDownloadHref ||      // EntrepriseDownloadAvis (notice PDF)
+      found.tenderScopedHref;         // tender-scoped page (orgAcronyme=...)
     if (!tenderUrl) {
       console.log(`    ⚠️  marches-publics keyWord: ${found.resultCount} result(s) but no detail/RC/DCE anchor found`);
       console.log(`       body[0..400]: ${found.bodySnip}`);
+      // Diagnostic: dump all Entreprise* anchors so we can refine
+      // selectors on edge cases (e.g. tenders with no RC published yet).
+      if (found.entrepriseAnchors && found.entrepriseAnchors.length) {
+        console.log(`       Entreprise* anchors (${found.entrepriseAnchors.length}):`);
+        for (const h of found.entrepriseAnchors) console.log(`         ${h}`);
+      } else {
+        console.log(`       (no Entreprise* anchors anywhere on page)`);
+      }
       return null;
     }
 
@@ -2435,7 +2473,7 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
     // detect PDF/ZIP magic bytes, parse with pdf-parse (RC) or adm-zip
     // recurse (DCE). Return a synthesized result object that the caller
     // can use directly without a second navigation.
-    const isDownloadUrl = /EntrepriseDownloadReglement|EntrepriseTelechargerDce/i.test(tenderUrl);
+    const isDownloadUrl = /EntrepriseDownloadReglement|EntrepriseTelechargerDce|EntrepriseDownloadAvis|EntrepriseDownload(?!.*Search)|EntrepriseTelecharger(?!.*Search)/i.test(tenderUrl);
     if (isDownloadUrl) {
       console.log(`    📥 marches-publics: detected download URL — fetching binary directly`);
       let pdfParseLib = null;
