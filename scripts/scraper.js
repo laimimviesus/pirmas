@@ -2341,81 +2341,77 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
     // marches-publics is ASP.NET, takes 2-3s to render result lists
     await new Promise((r) => setTimeout(r, 2500));
 
-    // Find the result row matching the reference and extract any
-    // navigable links inside. Prefer:
-    //   1. Detail link (EntrepriseDetailsConsultation) — gives the full
-    //      tender description + all document buttons (RC + DCE + ...).
-    //   2. RC link (EntrepriseDownloadReglement) — direct PDF of the
-    //      regulation document, contains qualification + criteria.
-    //   3. Any non-mailto anchor in the row, as last-resort.
-    const found = await page.evaluate((refLow) => {
-      const rows = Array.from(document.querySelectorAll('tr, .ligne, .consultation, .resultat'));
-      // Match by row text. Use case-insensitive substring.
-      for (const row of rows) {
-        const text = (row.innerText || '').toLowerCase();
-        if (!text.includes(refLow)) continue;
-        const rcLink = row.querySelector('a[href*="EntrepriseDownloadReglement"]');
-        // Detail link selectors — marches-publics has shipped multiple
-        // variants over the years; cover the most common.
-        const detailLink =
-          row.querySelector('a[href*="EntrepriseDetailsConsultation"]') ||
-          row.querySelector('a[href*="EntrepriseDetailConsultation"]') ||
-          row.querySelector('a[href*="entreprise.entreprisedetailsconsultation" i]') ||
-          row.querySelector('a[href*="DetailsConsultation"]');
-        const anyLink = row.querySelector(
-          'a[href]:not([href*="mailto"]):not([href*="EntrepriseDownload"])'
-        );
-        return {
-          rowText: (row.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 220),
-          detailHref: detailLink ? detailLink.href : null,
-          rcHref: rcLink ? rcLink.href : null,
-          anyHref: anyLink ? anyLink.href : null,
-        };
+    // 2026-05-18 — REWRITE #2 (broader matcher).
+    //
+    // First attempt used row-scoped match (find a <tr>/.ligne/.consultation
+    // containing the reference text, then anchor in that scope). Test log
+    // showed all 7 marches-publics search runs returned a valid result
+    // ("Nombre de résultats : 1" in body) but row-scoped matcher found
+    // rows=3 with EMPTY innerText. The new layout uses div-grid cards, not
+    // table rows — so the reference text is in <div> siblings of the
+    // anchors, not inside the same <tr>.
+    //
+    // New strategy:
+    //   1. Read "Nombre de résultats : N" from body text — that's the
+    //      authoritative indicator of how many tenders matched.
+    //   2. If N == 0 (or "Aucun résultat"), bail with no-results.
+    //   3. If N >= 1, search the ENTIRE page (not row-scoped) for the
+    //      first detail link / RC link. Since this is a keyWord search
+    //      that returned 1 hit, the only such anchor on the page is the
+    //      one we want.
+    const found = await page.evaluate(() => {
+      const bodyTxt = (document.body && document.body.innerText) || '';
+      // The portal uses both "Nombre de résultats" (FR) and "Number of
+      // results" (EN) depending on user's UI language.
+      const countMatch = bodyTxt.match(/(?:Nombre\s+de\s+r[ée]sultats|Number\s+of\s+results)\s*:\s*(\d+)/i);
+      const resultCount = countMatch ? parseInt(countMatch[1], 10) : null;
+      // Detect explicit "no results" too — defensive in case the count
+      // line is laid out differently on some pages.
+      const hasNoResults = /aucun(e)?\s*r[eé]sultat\s+trouv[eé]|aucune?\s+consultation|0\s+r[ée]sultats?|no\s+results\s+found/i.test(bodyTxt);
+      if (resultCount === 0 || hasNoResults) {
+        return { resultCount: resultCount ?? 0, noResults: true };
       }
-      return null;
-    }, ref.toLowerCase()).catch(() => null);
+      // Page-wide anchor search (not row-scoped). Prefer detail page
+      // first, then RC PDF download.
+      const detailLink =
+        document.querySelector('a[href*="EntrepriseDetailsConsultation"]') ||
+        document.querySelector('a[href*="EntrepriseDetailConsultation"]') ||
+        document.querySelector('a[href*="DetailsConsultation"]');
+      const rcLink = document.querySelector('a[href*="EntrepriseDownloadReglement"]');
+      const dceLink = document.querySelector('a[href*="EntrepriseTelechargerDce"]')
+        || document.querySelector('a[href*="DownloadDce"]');
+      // Capture a snippet of body around "Nombre de résultats" for diagnostics
+      const bodySnip = bodyTxt.replace(/\n/g, ' | ').slice(0, 400);
+      return {
+        resultCount: resultCount ?? -1,
+        noResults: false,
+        detailHref: detailLink ? detailLink.href : null,
+        rcHref: rcLink ? rcLink.href : null,
+        dceHref: dceLink ? dceLink.href : null,
+        bodySnip,
+      };
+    }).catch(() => null);
 
     if (!found) {
-      console.log(`    ⚠️  marches-publics keyWord: no result row matched "${ref}"`);
-      // Diagnostic dump — show what's actually on the page so we can
-      // refine the matcher next iteration.
-      try {
-        const diag = await page.evaluate(() => {
-          const rows = Array.from(document.querySelectorAll('tr, .ligne, .consultation, .resultat'));
-          const sampleRows = rows.slice(0, 6).map((r) =>
-            (r.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 220)
-          );
-          const bodyTxt = (document.body && document.body.innerText) || '';
-          const hasNoResults = /aucune?\s+consultation|aucun?\s+résultat|aucun?\s+resultat|0\s+résultat|0\s+resultat|pas\s+de\s+résultat|number\s+of\s+results\s*:\s*0/i.test(bodyTxt);
-          return {
-            url: location.href,
-            rowCount: rows.length,
-            sampleRows,
-            hasNoResults,
-            bodyHead: bodyTxt.replace(/\n/g, ' | ').slice(0, 400),
-          };
-        }).catch(() => null);
-        if (diag) {
-          console.log(`    🔎 keyWord diag: url=${diag.url.slice(-80)} rows=${diag.rowCount} hasNoResults=${diag.hasNoResults}`);
-          for (let i = 0; i < diag.sampleRows.length; i++) {
-            console.log(`       row[${i}]: ${diag.sampleRows[i]}`);
-          }
-          console.log(`       body[0..400]: ${diag.bodyHead}`);
-        }
-      } catch (_) { /* best-effort */ }
+      console.log(`    ⚠️  marches-publics keyWord: page evaluate failed for "${ref}"`);
       return null;
     }
-
-    console.log(`    ✅ marches-publics keyWord match: ${found.rowText.slice(0, 120)}`);
+    if (found.noResults || found.resultCount === 0) {
+      console.log(`    ⚠️  marches-publics keyWord: 0 results for "${ref}" (count=${found.resultCount})`);
+      return null;
+    }
+    console.log(`    ✅ marches-publics keyWord: ${found.resultCount} result(s) for "${ref}"`);
     if (found.detailHref) console.log(`       detail: ${found.detailHref.slice(0, 110)}`);
-    if (found.rcHref) console.log(`       RC:     ${found.rcHref.slice(0, 110)}`);
+    if (found.rcHref)     console.log(`       RC:     ${found.rcHref.slice(0, 110)}`);
+    if (found.dceHref)    console.log(`       DCE:    ${found.dceHref.slice(0, 110)}`);
 
     // Prefer the detail page — richer (description + all docs). Fall
-    // back to RC if no detail link is in the row (PDF will be parsed by
-    // the generic source-fetch via pdf-parse magic-byte detection).
-    const tenderUrl = found.detailHref || found.rcHref || found.anyHref;
+    // back to RC PDF (parsed by generic source-fetch via pdf-parse
+    // magic-byte detection) or DCE ZIP (parsed via adm-zip recurse).
+    const tenderUrl = found.detailHref || found.rcHref || found.dceHref;
     if (!tenderUrl) {
-      console.log(`    ⚠️  marches-publics keyWord: matched row had no navigable link`);
+      console.log(`    ⚠️  marches-publics keyWord: ${found.resultCount} result(s) but no detail/RC/DCE anchor found`);
+      console.log(`       body[0..400]: ${found.bodySnip}`);
       return null;
     }
     return tenderUrl;
@@ -6786,6 +6782,289 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
   }
 }
 
+// =====================================================================
+// fetchMercellTenderDocuments
+// ---------------------------------------------------------------------
+// When Mercell's "Go to source" points to permalink.mercell.com/<id>.aspx
+// (or app.mercell.com/tender/<id>), the previous behavior was to skip
+// the URL as "Mercell-internal" — leaving us with only the 803-byte XML
+// notice stubs from the search-service-api JSON. Result: pdfText was
+// effectively zero, AI made content-filter decisions from title +
+// description alone.
+//
+// permalink.mercell.com is actually a redirect to Mercell's Next.js
+// tender page on app.mercell.com. The page contains the full tender
+// description, buyer info, and a list of procurement document download
+// links. Since the scraper is already authenticated to Mercell (Monika's
+// session cookies are on the browser context), we can simply navigate
+// to the URL, wait for hydration, and scrape both the rendered text and
+// the document anchors.
+//
+// Strategy:
+//   1. Open new page in same browser context (inherits Mercell auth).
+//   2. Capture ALL JSON XHR responses during navigation — Mercell's SPA
+//      may load documents from an undocumented endpoint and we want to
+//      learn it via diagnostic logs.
+//   3. After page render, scan DOM for document anchors:
+//        a) <a href="/files/<id>/download">
+//        b) <a href*="EntrepriseDownloadReglement"> (carry-over from
+//           portal-aggregated tenders)
+//        c) Any anchor whose text matches /document|specifikacij|
+//           specification|reglement|pliego|annexe|anexo|kvalifik/i
+//   4. Download each via page.evaluate fetch (inherits cookies →
+//      authenticated). Convert ArrayBuffer → Buffer in Node.
+//   5. Sniff magic bytes, parse PDF/DOCX/XLSX/ZIP into text.
+//   6. Return { sourceFilesText, bodyTextPreview, sourceHost, ... }
+//      shape compatible with fetchSourcePageDetails.
+// =====================================================================
+async function fetchMercellTenderDocuments(browser, sourceUrl) {
+  const u = new URL(sourceUrl);
+  const hostLabel = u.host;
+  const t0 = Date.now();
+  let page = null;
+  // Lazy-load parser libs — same pattern as the generic source-fetch.
+  let pdfParseLib = null;
+  let mammothLib = null;
+  let XLSXLib = null;
+  let AdmZipLib = null;
+  try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+  try { mammothLib = require('mammoth'); } catch (_) {}
+  try { XLSXLib = require('xlsx'); } catch (_) {}
+  try { AdmZipLib = require('adm-zip'); } catch (_) {}
+
+  const capturedJson = []; // diagnostic: { url, keys[] }
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(15000);
+
+    // Capture all JSON responses for diagnostic — helps identify the
+    // documents endpoint if/when Mercell exposes one we don't know.
+    page.on('response', async (res) => {
+      try {
+        const url = res.url();
+        if (!/\.mercell\.com\//i.test(url)) return;
+        if (!res.ok()) return;
+        const ct = (res.headers()['content-type'] || '');
+        if (!/application\/json/i.test(ct)) return;
+        const txt = await res.text();
+        try {
+          const j = JSON.parse(txt);
+          const keys = Array.isArray(j) ? ['(array)'] : Object.keys(j || {}).slice(0, 8);
+          capturedJson.push({ url: url.slice(0, 120), keys });
+        } catch (_) {}
+      } catch (_) {}
+    });
+
+    console.log(`    🟦 mercell-tender: navigating to ${sourceUrl.slice(0, 100)}`);
+    try {
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    } catch (e) {
+      console.log(`    ⚠️  mercell-tender: navigation error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // Wait for Next.js hydration — typically 1-3s for Mercell tender page.
+    // Look for a heading with substantial text as our "page ready" signal.
+    await page.waitForFunction(() => {
+      const h1 = document.querySelector('h1');
+      if (h1 && (h1.innerText || '').trim().length > 5) return true;
+      const body = (document.body.innerText || '').length;
+      return body > 1500;
+    }, { timeout: 8000 }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 1500));
+
+    const finalUrl = page.url();
+    console.log(`    🟦 mercell-tender: landed on ${finalUrl.slice(0, 100)}`);
+    if (capturedJson.length) {
+      // Log up to 5 unique-prefix endpoints — helps us learn the API
+      // surface over multiple runs without spamming logs.
+      const seen = new Set();
+      for (const c of capturedJson) {
+        const prefix = c.url.replace(/\/\d+\??.*$/, '/');
+        if (seen.has(prefix)) continue;
+        seen.add(prefix);
+        if (seen.size > 5) break;
+        console.log(`       json XHR: ${c.url.slice(0, 100)} keys=${JSON.stringify(c.keys)}`);
+      }
+    }
+
+    // Extract body text + document anchors. Mercell tender pages render
+    // body text into ~5-20kb of meaningful description, and document
+    // links into anchor elements with paths like /files/<id>/download or
+    // /api/v1/files/<id>.
+    const pageState = await page.evaluate(() => {
+      const bodyTxt = (document.body && document.body.innerText) || '';
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      // Filter to plausible document download anchors.
+      const docAnchors = anchors
+        .map((a) => ({
+          text: (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim(),
+          href: a.href,
+          host: (() => { try { return new URL(a.href).host; } catch (_) { return ''; } })(),
+          path: (() => { try { return new URL(a.href).pathname; } catch (_) { return ''; } })(),
+        }))
+        .filter((a) => {
+          if (!a.href || /^javascript:/i.test(a.href) || /^mailto:/i.test(a.href)) return false;
+          const h = a.href.toLowerCase();
+          const t = a.text.toLowerCase();
+          // path-based: /files/, /download, /documents, /api/files, etc.
+          if (/\/files?\/|\/download(\/|$|\?)|\/documents?\/|\/api\/.*files?\/|filereference|fileid/.test(h)) return true;
+          // ext-based — anchor href ends with a known doc extension
+          if (/\.(pdf|docx?|xlsx?|zip|rtf|odt|ods)(\?|#|$)/.test(h)) return true;
+          // text-based — anchor text mentions document type
+          if (t && /\b(pdf|specifikacij|specification|reglement|pliego|annexe|anexo|kvalifik|kravspec|requirement|contract\s*notice|tender\s*doc)/i.test(t)) return true;
+          return false;
+        });
+      return {
+        url: location.href,
+        title: document.title || '',
+        bodyText: bodyTxt,
+        bodyLen: bodyTxt.length,
+        anchorCount: anchors.length,
+        docAnchors,
+      };
+    }).catch(() => null);
+
+    if (!pageState) {
+      console.log(`    ⚠️  mercell-tender: page.evaluate failed`);
+      return null;
+    }
+    console.log(`    🟦 mercell-tender: bodyLen=${pageState.bodyLen} anchors=${pageState.anchorCount} docAnchors=${pageState.docAnchors.length}`);
+    if (pageState.docAnchors.length) {
+      for (const a of pageState.docAnchors.slice(0, 8)) {
+        console.log(`       doc anchor: "${a.text.slice(0, 60)}" → ${a.href.slice(0, 90)}`);
+      }
+    }
+
+    // --- magic-byte sniff + parse helpers (local copies)
+    const detectFmt = (buf) => {
+      if (!buf || buf.length < 4) return 'unknown';
+      const b = buf;
+      // %PDF-
+      if (b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) return 'pdf';
+      // PK\x03\x04 — ZIP (incl. DOCX/XLSX which are OOXML zips)
+      if (b[0] === 0x50 && b[1] === 0x4B && b[2] === 0x03 && b[3] === 0x04) return 'zip';
+      // D0 CF 11 E0 — old MS Office CFB
+      if (b[0] === 0xD0 && b[1] === 0xCF && b[2] === 0x11 && b[3] === 0xE0) return 'cfb';
+      // {\rtf
+      if (b[0] === 0x7B && b[1] === 0x5C && b[2] === 0x72 && b[3] === 0x74) return 'rtf';
+      // <?xml or <
+      if (b[0] === 0x3C) return 'html-or-xml';
+      return 'unknown';
+    };
+    const parseBuffer = async (name, buf) => {
+      const fmt = detectFmt(buf);
+      try {
+        if (fmt === 'pdf' && pdfParseLib) {
+          const r = await pdfParseLib(buf);
+          return (r && r.text ? r.text : '').trim();
+        }
+        if (fmt === 'zip') {
+          // OOXML (DOCX/XLSX) detection — peek at ZIP central directory.
+          // If it contains word/document.xml → DOCX; xl/workbook.xml → XLSX.
+          if (AdmZipLib) {
+            try {
+              const z = new AdmZipLib(buf);
+              const entries = z.getEntries().map((e) => e.entryName).slice(0, 50);
+              if (entries.some((e) => /^word\//i.test(e)) && mammothLib) {
+                const r = await mammothLib.extractRawText({ buffer: buf });
+                return (r && r.value ? r.value : '').trim();
+              }
+              if (entries.some((e) => /^xl\//i.test(e)) && XLSXLib) {
+                const wb = XLSXLib.read(buf, { type: 'buffer' });
+                const parts = [];
+                for (const s of wb.SheetNames) {
+                  const csv = XLSXLib.utils.sheet_to_csv(wb.Sheets[s]);
+                  if (csv && csv.trim()) parts.push(`# Sheet: ${s}\n${csv}`);
+                }
+                return parts.join('\n\n').trim();
+              }
+              // Regular ZIP — concat readable text from inner PDFs/DOCXs.
+              const parts = [];
+              for (const ent of z.getEntries().slice(0, 12)) {
+                if (ent.isDirectory) continue;
+                const en = ent.entryName.toLowerCase();
+                if (/\.(pdf|docx|xlsx)$/.test(en)) {
+                  const inner = ent.getData();
+                  const sub = await parseBuffer(ent.entryName, inner);
+                  if (sub) parts.push(`# ${ent.entryName}\n${sub.slice(0, 20000)}`);
+                  if (parts.join('').length > 60000) break;
+                }
+              }
+              return parts.join('\n\n').trim();
+            } catch (_) { /* fall through */ }
+          }
+          return '';
+        }
+        return '';
+      } catch (e) {
+        console.log(`       ⚠️  parse error for "${name.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+        return '';
+      }
+    };
+
+    // Download each doc anchor via in-page fetch (cookies inherited =
+    // authenticated). Cap at 8 docs to keep latency bounded.
+    const texts = [];
+    const MAX_DOCS = 8;
+    const targets = pageState.docAnchors.slice(0, MAX_DOCS);
+    for (const a of targets) {
+      try {
+        const dataArr = await page.evaluate(async (url) => {
+          try {
+            const r = await fetch(url, { credentials: 'include' });
+            if (!r.ok) return { ok: false, status: r.status, ct: r.headers.get('content-type') };
+            const ct = r.headers.get('content-type') || '';
+            const buf = await r.arrayBuffer();
+            return { ok: true, status: r.status, ct, bytes: Array.from(new Uint8Array(buf)) };
+          } catch (e) {
+            return { ok: false, error: String(e && e.message || e) };
+          }
+        }, a.href).catch(() => ({ ok: false, error: 'evaluate-failed' }));
+
+        if (!dataArr || !dataArr.ok) {
+          console.log(`    ⚠️  mercell-tender: fetch failed for "${a.text.slice(0, 40)}" (status=${dataArr?.status || '?'}, err=${dataArr?.error || '?'})`);
+          continue;
+        }
+        const buf = Buffer.from(dataArr.bytes);
+        const fmt = detectFmt(buf);
+        if (fmt === 'unknown' || fmt === 'html-or-xml') {
+          // Likely a login redirect or error page — skip.
+          console.log(`    ⚠️  mercell-tender: "${a.text.slice(0, 40)}" returned non-doc (fmt=${fmt}, ct=${dataArr.ct}, ${buf.length}B)`);
+          continue;
+        }
+        const text = await parseBuffer(a.text || a.href, buf);
+        if (text && text.length > 100) {
+          const clip = text.slice(0, 30000);
+          texts.push(`--- (mercell-doc) ${(a.text || a.href).slice(0, 80)} ---\n${clip}`);
+          console.log(`    ✓ mercell-tender: parsed "${(a.text || a.href).slice(0, 50)}" (${buf.length}B → ${clip.length}ch, fmt=${fmt})`);
+        } else {
+          console.log(`    ⚠️  mercell-tender: "${(a.text || a.href).slice(0, 40)}" yielded no usable text (fmt=${fmt}, ${buf.length}B)`);
+        }
+      } catch (e) {
+        console.log(`    ⚠️  mercell-tender: error processing "${(a.text || a.href).slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+      }
+    }
+
+    const sourceFilesText = texts.join('\n\n');
+    const elapsed = Date.now() - t0;
+    console.log(`    🟦 mercell-tender: done in ${elapsed}ms — extracted ${texts.length}/${targets.length} docs, ${sourceFilesText.length}ch total`);
+
+    return {
+      sourceHost: hostLabel,
+      finalUrl,
+      bodyTextPreview: pageState.bodyText.slice(0, 5000),
+      sourceFilesText,
+      error: null,
+      skipped: null,
+    };
+  } catch (e) {
+    console.log(`    ⚠️  mercell-tender handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return null;
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
 async function fetchSourcePageDetails(browser, sourceUrl) {
   // URL scheme normalisation — Mercell sometimes returns sourceUrl
   // values like "www.conselleriadefacenda.es/silex" without an
@@ -6863,13 +7142,36 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
     }
   } catch (_) {}
 
-  // Mercell-internų permalink'ų atpažinimas — jei "Go to source" veda į
-  // patį Mercell (permalink.mercell.com ar mercell.com/*), šaltinio
-  // skrapinti nėra prasmės, nes tai yra tiesiog redirect'as į patį
-  // Mercell tender'io puslapį arba į portal'o landing page'ą, iš kurio
-  // realaus tender'io turinio pasiekti neįmanoma be papildomo login'o.
+  // 2026-05-18 — Mercell-internal handling rewrite.
+  //
+  // Previous behavior: ANY *.mercell.com URL was skipped as
+  // "Mercell-internal" to avoid recursive loops. That dropped ~10% of
+  // tenders (audit found 9 tenders in scraper-output 9.log where source
+  // URL was permalink.mercell.com → skipped → AI made content-filter
+  // calls from title+description only, missing real procurement docs).
+  //
+  // New: route permalink.mercell.com and app.mercell.com/tender/* URLs
+  // to the dedicated fetchMercellTenderDocuments handler, which uses the
+  // existing authenticated browser session (Monika's Mercell login) to
+  // navigate the Next.js tender page, scrape document anchors, and
+  // download via in-page fetch (cookies inherited). Other Mercell hosts
+  // (s2c.mercell.com, my.mercell.com — internal-only dashboards) still
+  // get the skip — they don't host tender documents.
   try {
     const u = new URL(sourceUrl);
+    const isPermalink = u.hostname === 'permalink.mercell.com';
+    const isAppTender = u.hostname === 'app.mercell.com' && /^\/(tender|permalink)\//i.test(u.pathname);
+    if (isPermalink || isAppTender) {
+      const result = await fetchMercellTenderDocuments(browser, sourceUrl);
+      if (result && (result.sourceFilesText || result.bodyTextPreview)) {
+        return result;
+      }
+      console.log(`    ℹ️  mercell-tender handler returned empty — falling through to original skip`);
+      return {
+        skipped: 'mercell-tender-empty',
+        sourceHost: u.host,
+      };
+    }
     if (/(^|\.)mercell\.com$/i.test(u.hostname)) {
       console.log(`    skipping Mercell-internal source: ${u.host}`);
       return {
