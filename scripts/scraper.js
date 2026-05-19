@@ -7033,29 +7033,39 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
 async function fetchMercellTenderDocuments(browser, sourceUrl) {
   let u = new URL(sourceUrl);
 
-  // 2026-05-19 — PERMALINK REWRITE.
+  // 2026-05-19 — PERMALINK REWRITE (Mercell classic ASP.NET).
   //
   // permalink.mercell.com/<id>.aspx redirects to www.mercell.com/<lang>/tender/<id>/<slug>
-  // — the PUBLIC MARKETING PAGE behind a paywall. body shows only:
+  // — the PUBLIC MARKETING PAGE with paywall. body shows only:
   //   - "Sign in" link → my.mercell.com/en/m/logon/?ReturnUrl=/m/mts/Tender.aspx?id=<id>
   //   - "Tender access" → plans/pricing
   //   - Language switcher (World/Danmark/Deutschland/...)
   // bodyLen=~1500ch, no document anchors.
   //
-  // The actual authenticated tender page lives at:
-  //   https://app.mercell.com/tender/<id>
+  // The real authenticated tender page (classic Mercell ASP.NET) lives at:
+  //   https://my.mercell.com/m/mts/Tender.aspx?id=<id>
   //
-  // We're already authenticated on *.mercell.com (Monika's session
-  // cookies + Bearer captured during search login), so navigating to
-  // app.mercell.com/tender/<id> shows the full SaaS view with documents.
+  // This page shows:
+  //   - Tender description + buyer info
+  //   - File list (e.g. "01 Invitation to tender.pdf", "05 SSA-D Appendix
+  //     3 - System documentation.pdf", etc.)
+  //   - "Show interest" submit button:
+  //       <input type="submit" name="ctl00$main$btnDownloadInterest"
+  //              value="Show interest"
+  //              id="ctl00_main_btnDownloadInterest" ...>
+  //
+  // The files are NOT downloadable until "Show interest" is clicked.
+  // After the ASP.NET __doPostBack, the file anchors become live and
+  // we can download via authenticated in-page fetch (Monika's session
+  // cookies cover my.mercell.com sub-domain).
   //
   // Rewrite the URL upfront so we land directly on the authenticated
-  // platform instead of the marketing redirect chain.
+  // tender page instead of the marketing redirect chain.
   const permalinkMatch = u.hostname === 'permalink.mercell.com'
     && u.pathname.match(/^\/(\d+)\.aspx$/i);
   if (permalinkMatch) {
     const tenderId = permalinkMatch[1];
-    const rewritten = `https://app.mercell.com/tender/${tenderId}`;
+    const rewritten = `https://my.mercell.com/m/mts/Tender.aspx?id=${tenderId}`;
     console.log(`    🟦 mercell-tender: rewriting permalink (${u.host}) → ${rewritten}`);
     sourceUrl = rewritten;
     u = new URL(sourceUrl);
@@ -7114,6 +7124,76 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     }, { timeout: 10000 }).catch(() => null);
     await new Promise((r) => setTimeout(r, 2000));
 
+    // 2026-05-19 — my.mercell.com logon detection + login.
+    //
+    // The classic ASP.NET Tender.aspx redirects anonymous visitors to
+    // /en/m/logon/?ReturnUrl=/m/mts/Tender.aspx?id=<id>. Our initial
+    // Mercell login was on ums-lambda-authentication-service.platform.app
+    // .mercell.com — that may not set cookies for my.mercell.com (separate
+    // subdomain with its own classic ASP.NET auth).
+    //
+    // Detect logon redirect → fill Monika's credentials → submit →
+    // return to Tender.aspx with active session.
+    {
+      const curUrl = page.url();
+      if (/\/m\/logon\/?/i.test(curUrl) || /logon\.aspx/i.test(curUrl)) {
+        console.log(`    🟦 mercell-tender: detected my.mercell.com logon page — submitting credentials`);
+        const username = process.env.MERCELL_USERNAME || '';
+        const password = process.env.MERCELL_PASSWORD || '';
+        if (!username || !password) {
+          console.log(`    ⚠️  mercell-tender: no MERCELL_USERNAME/PASSWORD env — cannot login to my.mercell.com`);
+        } else {
+          const loggedIn = await page.evaluate((u, p) => {
+            const allInputs = Array.from(document.querySelectorAll('input'));
+            const visible = (el) => el && el.offsetParent !== null;
+            // Find email/username field — Mercell classic uses ASP.NET
+            // ctl00$main$tbUsername / tbEmail / tbLogin name patterns.
+            const userInput = allInputs.find((i) =>
+              visible(i) && /^(email|text)$/i.test(i.type) &&
+              /(email|user|login)/i.test((i.name || '') + ' ' + (i.id || '') + ' ' + (i.placeholder || ''))
+            ) || allInputs.find((i) => visible(i) && i.type === 'email');
+            const passInput = allInputs.find((i) => visible(i) && i.type === 'password');
+            if (!userInput || !passInput) return { ok: false, reason: 'no-fields' };
+            try {
+              userInput.focus();
+              userInput.value = u;
+              userInput.dispatchEvent(new Event('input', { bubbles: true }));
+              userInput.dispatchEvent(new Event('change', { bubbles: true }));
+              passInput.focus();
+              passInput.value = p;
+              passInput.dispatchEvent(new Event('input', { bubbles: true }));
+              passInput.dispatchEvent(new Event('change', { bubbles: true }));
+            } catch (e) {
+              return { ok: false, reason: 'fill-error', err: String(e).slice(0, 80) };
+            }
+            // Find submit button (Sign in / Logg på / Log på / etc.)
+            const submitBtn = Array.from(document.querySelectorAll(
+              'input[type="submit"], button[type="submit"], button'
+            )).find((b) => {
+              if (b.disabled || b.offsetParent === null) return false;
+              const t = (b.value || b.innerText || '').trim().toLowerCase();
+              return /^(sign\s*in|log\s*in|logg?\s*på|login|inloggen|kirjaudu)/i.test(t)
+                  || /(ctl00.*btnLogin|ctl00.*btnSignIn|btnLogon)/i.test(b.name || b.id || '');
+            });
+            if (!submitBtn) return { ok: false, reason: 'no-submit' };
+            try { submitBtn.click(); return { ok: true, button: submitBtn.value || submitBtn.innerText }; }
+            catch (e) { return { ok: false, reason: 'click-error', err: String(e).slice(0, 80) }; }
+          }, username, password).catch((e) => ({ ok: false, reason: 'evaluate-error', err: String(e).slice(0, 80) }));
+          if (loggedIn && loggedIn.ok) {
+            console.log(`    🟦 mercell-tender: logon submitted ("${(loggedIn.button || '').slice(0, 30)}") — waiting for redirect`);
+            await Promise.race([
+              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null),
+              new Promise((r) => setTimeout(r, 5000)),
+            ]);
+            await new Promise((r) => setTimeout(r, 1500));
+            console.log(`    🟦 mercell-tender: post-login URL: ${page.url().slice(0, 100)}`);
+          } else {
+            console.log(`    ⚠️  mercell-tender: logon submit failed (${loggedIn?.reason || '?'}${loggedIn?.err ? ', ' + loggedIn.err : ''})`);
+          }
+        }
+      }
+    }
+
     // 2026-05-19 — Try to reach Documents section.
     //
     // Mercell tender pages render an "Overview" tab by default. Document
@@ -7145,6 +7225,49 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
       window.scrollTo(0, document.body.scrollHeight);
     }).catch(() => null);
     await new Promise((r) => setTimeout(r, 1000));
+
+    // 2026-05-19 — "Show interest" click (Mercell classic ASP.NET).
+    //
+    // my.mercell.com/m/mts/Tender.aspx shows file list but the
+    // download links are inactive until the user clicks "Show interest"
+    // (ctl00$main$btnDownloadInterest). After the postback, the page
+    // re-renders with active download anchors. This is a classic
+    // ASP.NET WebForms __doPostBack pattern.
+    //
+    // EN: "Show interest"   NO: "Vis interesse"   SE: "Visa intresse"
+    // DA: "Vis interesse"   FI: "Näytä kiinnostus"   DE: "Interesse zeigen"
+    const showInterestClicked = await page.evaluate(() => {
+      // Prefer the canonical Mercell name attr — handles all locales.
+      const byName = document.querySelector('input[name="ctl00$main$btnDownloadInterest"]')
+        || document.querySelector('input[id="ctl00_main_btnDownloadInterest"]');
+      if (byName && !byName.disabled && byName.offsetParent !== null) {
+        try { byName.scrollIntoView({ block: 'center' }); } catch (_) {}
+        byName.click();
+        return (byName.value || 'Show interest').slice(0, 40);
+      }
+      // Text-based fallback (multi-lang).
+      const RE = /\b(show\s+interest|vis\s+interesse|visa\s+intresse|n[äa]yt[äa]\s+kiinnostus|interesse\s+zeigen|montrer\s+l['']int[ée]r[êe]t|to[on]\s+interesse)\b/i;
+      const inputs = Array.from(document.querySelectorAll('input[type="submit"], input[type="button"], button'));
+      for (const el of inputs) {
+        if (el.disabled || el.offsetParent === null) continue;
+        const text = (el.value || el.innerText || el.textContent || '').trim();
+        if (text && RE.test(text)) {
+          try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
+          el.click();
+          return text.slice(0, 40);
+        }
+      }
+      return null;
+    }).catch(() => null);
+    if (showInterestClicked) {
+      console.log(`    🟦 mercell-tender: clicked "Show interest" button ("${showInterestClicked}") — waiting for postback`);
+      // ASP.NET __doPostBack — wait for navigation OR DOM update
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => null),
+        new Promise((r) => setTimeout(r, 4000)),
+      ]);
+      await new Promise((r) => setTimeout(r, 2000));
+    }
 
     const finalUrl = page.url();
     console.log(`    🟦 mercell-tender: landed on ${finalUrl.slice(0, 100)}`);
