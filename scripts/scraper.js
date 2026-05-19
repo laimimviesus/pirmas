@@ -7328,6 +7328,56 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
       await new Promise((r) => setTimeout(r, 2000));
     }
 
+    // 2026-05-19 — "Enable download" click (Mercell classic ASP.NET).
+    //
+    // SECOND gate that appears on some tenders (observed on license/software
+    // procurement, e.g. permalink.mercell.com/283799952.aspx — "Negotiating
+    // licences, software and services from Microsoft"):
+    //
+    //   <input type="submit" name="ctl00$main$btnDownload"
+    //          value="Enable download" id="ctl00_main_btnDownload"
+    //          class="button bgColor1 width100pct">
+    //
+    // This button is distinct from btnDownloadInterest. Some tenders show
+    // ONLY this one; some show it AFTER the Show-interest postback re-renders
+    // the page; some show both side-by-side. We click it here unconditionally
+    // if present — the postback unlocks the actual download anchors below.
+    //
+    // EN: "Enable download"   NO: "Aktiver nedlasting"   SE: "Aktivera nedladdning"
+    // DA: "Aktiver download"   FI: "Salli lataus"        DE: "Download aktivieren"
+    // FR: "Activer le téléchargement"  NL: "Download activeren"
+    const enableDownloadClicked = await page.evaluate(() => {
+      // Prefer the canonical Mercell name attr — handles all locales.
+      const byName = document.querySelector('input[name="ctl00$main$btnDownload"]')
+        || document.querySelector('input[id="ctl00_main_btnDownload"]');
+      if (byName && !byName.disabled && byName.offsetParent !== null) {
+        try { byName.scrollIntoView({ block: 'center' }); } catch (_) {}
+        byName.click();
+        return (byName.value || 'Enable download').slice(0, 40);
+      }
+      // Text-based fallback (multi-lang).
+      const RE = /\b(enable\s+download|aktiver\s+(nedlast(?:ning)?|download)|aktivera\s+nedladdning|salli\s+lataus|download\s+aktivieren|activer\s+le\s+t[ée]l[ée]chargement|download\s+activeren)\b/i;
+      const inputs = Array.from(document.querySelectorAll('input[type="submit"], input[type="button"], button'));
+      for (const el of inputs) {
+        if (el.disabled || el.offsetParent === null) continue;
+        const text = (el.value || el.innerText || el.textContent || '').trim();
+        if (text && RE.test(text)) {
+          try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
+          el.click();
+          return text.slice(0, 40);
+        }
+      }
+      return null;
+    }).catch(() => null);
+    if (enableDownloadClicked) {
+      console.log(`    🟦 mercell-tender: clicked "Enable download" button ("${enableDownloadClicked}") — waiting for postback`);
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => null),
+        new Promise((r) => setTimeout(r, 4000)),
+      ]);
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+
     const finalUrl = page.url();
     console.log(`    🟦 mercell-tender: landed on ${finalUrl.slice(0, 100)}`);
     if (capturedJson.length) {
