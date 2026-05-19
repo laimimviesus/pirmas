@@ -820,15 +820,17 @@ async function extractFieldsWithAI(text, meta = {}) {
     'You extract structured procurement tender fields from free-form notice text plus attached document text. ' +
     'The user message has sections labeled TITLE / DESCRIPTION / MERCELL_PAGE / DOCUMENTS. Scan ALL sections thoroughly. ' +
     'Return ONLY a JSON object (no prose, no markdown fences) with these keys: ' +
-    'maxBudget, estimatedBudgetEur, duration, requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement, rejectReason, rejectCategory.\n' +
+    'maxBudget, estimatedBudgetEur, duration, requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement, lotStructure, itLotsScope, rejectReason, rejectCategory.\n' +
     'Rules:\n' +
     '- maxBudget: total ceiling / max contract value AS STATED in the tender. Empty string if not explicitly stated.\n' +
     '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND description gives enough basis.\n' +
     '- duration: contract length in months or years. Empty string if not stated.\n' +
     '- requirementsForSupplier: concise bullet-style summary. MUST EXTRACT EXACT METRICS: specific ISO certifications (e.g., ISO 27001, 9001), exact financial thresholds, and security/compliance standards. DO NOT invent or generalize.\n' +
-    '- qualificationRequirements: concise bullet-style summary. CRITICAL: You must extract EXACT MEASURABLE METRICS for company and experts. Include exact years of required experience (e.g., "minimum 2 years of Java"), exact number of required reference projects (e.g., "2 verifiable projects in 3 years"), credit ratings (e.g., "Rating Alfa"), turnover requirements (e.g., "€50,000 per fiscal year"), and specific named expert roles. DO NOT hallucinate. If metrics are not stated, do not invent them.\n' +
+    '- qualificationRequirements: concise bullet-style summary of formal SUPPLIER eligibility requirements (NOT system/technical capabilities). Look specifically for sections titled "Qualification requirements", "Kvalifikasjonskrav", "Kvalifikationskrav", "Vaatimukset tarjoajalle", "Wymagania kwalifikacyjne", "Eignungskriterien", "Critères de sélection", "Requisitos de aptitud", "Requisiti di partecipazione" — and the surrounding tables/lists. These almost always cover four families: (a) LEGAL — company registration (Firmaattest / company certificate / business registry), (b) ECONOMIC — turnover thresholds, credit rating (e.g., "Rating Alfa"), audited annual accounts, (c) TECHNICAL — number and type of reference projects (e.g., "up to 3 reference projects within last 3 years"), required key-person roles and years of experience, (d) QUALITY — ISO certifications (9001, 14001, 27001, etc.). CRITICAL: extract EXACT MEASURABLE METRICS verbatim (numeric thresholds, years, certification numbers, page limits like "max 2 A4 pages per reference"). DO NOT hallucinate. If a section says only "sufficient capacity" without numbers, write that verbatim and note "(no numeric threshold stated)". DO NOT confuse system/technical specifications with supplier qualifications — system specs go into requirementsForSupplier, not here.\n' +
     '- offerWeighingCriteria: award criteria with weights if present (e.g., "Price 40%, Quality 60%").\n' +
-    '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English.\n' +
+    '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English. SPECIAL CASE: if lotStructure=="partial" AND there are IT/software-development lots, the scope should describe ONLY the IT lots (not the umbrella framework). If lotStructure=="all-required", describe the whole umbrella.\n' +
+    '- lotStructure: one of "single" | "partial" | "all-required". Mark "single" if the tender procures one consolidated scope. Mark "partial" for multi-lot tenders where bidders MAY submit for individual lots/categories independently (look for phrases like "Tilbud på deler av oppdraget er tillatt", "Adgang til å gi tilbud på deler", "Det er adgang til å gi tilbud på enkeltkategorier", "Lots: division into lots = yes", "partial bids allowed", "tilbud på enkelte delkontrakter", "anbud på delar"). Mark "all-required" for multi-lot tenders where bidders MUST cover EVERY lot to win (look for phrases like "Det er ikke adgang til å gi tilbud på deler av oppdraget", "no partial bids", "tilbud må omfatte hele leveransen", "bidders must submit for all lots"). When unclear in a multi-lot tender, default to "all-required".\n' +
+    '- itLotsScope: ONLY when lotStructure=="partial". A bullet-style list of lots that are software development / web/mobile app dev / bespoke IT system creation. Format: "Lot 2B – Architecture, development, data and integration: <one-line description>". Include ONLY lots we (custom software development firm) could realistically bid for. Empty string if lotStructure!="partial" OR no IT-relevant lots.\n' +
     '- rejectReason: short English string (≤120 chars) explaining WHY this tender is a poor fit, OR empty string if a good fit. We are a custom-software development firm that BUILDS systems from scratch. Reject (set rejectReason) when ANY of these apply:\n' +
     '   • SaaS Provision/Creation: Tender procures a SaaS subscription, or asks to build a SaaS platform for them to resell. Set rejectReason="saas_provision_or_creation".\n' +
     '   • Off-The-Shelf (COTS) Implementation: Tender is for deploying, configuring, maintaining or licensing an existing finished product/platform (e.g., Salesforce, SAP, Dynamics, ServiceNow, Oracle, standard CMS). Set rejectReason="cots_implementation_or_licenses".\n' +
@@ -838,7 +840,9 @@ async function extractFieldsWithAI(text, meta = {}) {
     '   • Surveys/Research: Conducting public surveys, sociological polling, non-IT market research. Set rejectReason="surveys_market_research".\n' +
     '   • GIS / Geo-specific: Geographic Information Systems (GIS), geological mapping, spatial data systems requiring specific local geographical knowledge/access. Set rejectReason="gis_geospatial".\n' +
     '   • Physical/Infrastructure: Hardware delivery, cabling, network/telecom infra. Set rejectReason="hardware_network_infra".\n' +
-    '   AMBIGUOUS PROCUREMENT: If it says "system implementation" but implies configuring an off-the-shelf product → REJECT. ACCEPT (empty rejectReason) ONLY if it is custom software development, web/mobile app dev from scratch, bespoke architecture, or maintenance/evolution of custom systems.\n' +
+    '   • Mixed Lots Required Together: lotStructure=="all-required" AND the umbrella scope covers non-IT work (construction, physical security, cleaning, logistics, food service, training-only, etc.) that we cannot perform alongside the IT portion. Set rejectReason="mixed_lots_all_required".\n' +
+    '   • Multi-lot Framework Without IT Lots: lotStructure=="partial" but NONE of the available lots is custom software development (e.g. all lots are management consulting, legal advisory, HR, surveys, hardware supply). Set rejectReason="framework_no_it_lots".\n' +
+    '   AMBIGUOUS PROCUREMENT: If it says "system implementation" but implies configuring an off-the-shelf product → REJECT. ACCEPT (empty rejectReason) ONLY if it is custom software development, web/mobile app dev from scratch, bespoke architecture, or maintenance/evolution of custom systems. For partial-bid multi-lot tenders, ACCEPT (empty rejectReason) when AT LEAST ONE lot is custom software development — itLotsScope must list those lot(s).\n' +
     '- rejectCategory: short machine-readable category matching the rejectReason. Empty string if not rejected.\n' +
     'Write all field values in English. Use exact numbers from the source.';
   const metaLine = [
@@ -906,6 +910,12 @@ async function extractFieldsWithAI(text, meta = {}) {
         throw parseErr;
       }
     }
+    // Normalise lotStructure to one of the three values (defensive: AI
+    // sometimes returns capitalised/synonyms like "Partial" or "all required").
+    const rawLot = (parsed.lotStructure || '').toString().toLowerCase().trim();
+    let lotStructure = 'single';
+    if (/^partial$/.test(rawLot) || /partial[-\s_]bid/.test(rawLot) || /^per[-\s]?lot$/.test(rawLot)) lotStructure = 'partial';
+    else if (/^all[-\s_]?required$/.test(rawLot) || /all[\s_]?lots?[\s_]?required/.test(rawLot) || /full[-\s_]?bundle/.test(rawLot)) lotStructure = 'all-required';
     return {
       maxBudget: (parsed.maxBudget || '').toString().trim(),
       estimatedBudgetEur: (parsed.estimatedBudgetEur || '').toString().trim(),
@@ -914,6 +924,8 @@ async function extractFieldsWithAI(text, meta = {}) {
       qualificationRequirements: (parsed.qualificationRequirements || '').toString().trim(),
       offerWeighingCriteria: (parsed.offerWeighingCriteria || '').toString().trim(),
       scopeOfAgreement: (parsed.scopeOfAgreement || '').toString().trim(),
+      lotStructure,
+      itLotsScope: (parsed.itLotsScope || '').toString().trim(),
       rejectReason: (parsed.rejectReason || '').toString().trim(),
       rejectCategory: (parsed.rejectCategory || '').toString().trim(),
     };
@@ -2645,76 +2657,158 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
     page.setDefaultNavigationTimeout(20000);
     page.setDefaultTimeout(20000);
 
-    // Step 1 — load the entrance page and look for any href that points
-    // to publicpurchase_docs.asp, extract LID (list/lot ID).
+    // Step 1 — load the entrance page and collect ALL unique LIDs.
+    //
+    // Multi-lot framework agreements (e.g. kriminalomsorgsdirektoratet
+    // 2026/831 "Consulting" — has lots 2A strategic, 2B architecture,
+    // 2C security, etc.) expose the procurement documents per-LOT, not at
+    // the entrance level. The entrance page lists category links with
+    // distinct LIDs; the actual Konkurransegrunnlag lives in each lot's
+    // own publicpurchase_docs.asp?LID=<lot_id> page. Earlier behaviour
+    // grabbed only the first LID encountered → AI was fed generic
+    // top-level text and qualifications came back empty/generic.
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
     } catch (e) {
       console.log(`    🇳🇴 eu-supply: entrance nav warn: ${(e.message || '').slice(0, 80)}`);
     }
     await new Promise((r) => setTimeout(r, 1500));
-    const lid = await page.evaluate(() => {
-      const links = Array.from(document.querySelectorAll('a[href]'));
-      for (const a of links) {
+    const lidsWithLabels = await page.evaluate(() => {
+      const out = new Map(); // LID → {label, href}
+      // 1) Anchor-based — visible lot/category links
+      document.querySelectorAll('a[href]').forEach((a) => {
         const href = a.getAttribute('href') || '';
         const m = href.match(/[?&]LID=(\d+)/i);
-        if (m) return m[1];
+        if (!m) return;
+        const lid = m[1];
+        if (out.has(lid)) return;
+        const label = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        out.set(lid, { label, href });
+      });
+      // 2) onclick/JS handlers — some lots use postback-style buttons
+      document.querySelectorAll('[onclick]').forEach((el) => {
+        const handler = el.getAttribute('onclick') || '';
+        const m = handler.match(/LID\s*=\s*['"]?(\d+)|LID=(\d+)/i);
+        if (!m) return;
+        const lid = m[1] || m[2];
+        if (out.has(lid)) return;
+        const label = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        out.set(lid, { label, href: '' });
+      });
+      // 3) Last-resort: raw HTML scan (catches dynamically-built strings)
+      if (out.size === 0) {
+        const html = document.documentElement.outerHTML;
+        const RX = /LID=(\d+)/gi;
+        let m;
+        while ((m = RX.exec(html)) !== null) {
+          if (!out.has(m[1])) out.set(m[1], { label: '', href: '' });
+        }
       }
-      // Fallback — scan whole HTML for LID=xxx
-      const html = document.documentElement.outerHTML;
-      const m2 = html.match(/LID=(\d+)/i);
-      return m2 ? m2[1] : null;
-    }).catch(() => null);
-    if (!lid) {
+      return Array.from(out.entries()).map(([lid, info]) => ({ lid, ...info }));
+    }).catch(() => []);
+
+    if (!lidsWithLabels.length) {
       console.log(`    🇳🇴 eu-supply: PID=${pid} but no LID found on entrance page`);
       return [];
     }
-    console.log(`    🇳🇴 eu-supply: PID=${pid}, LID=${lid} — navigating to docs page`);
-
-    // Step 2 — navigate to the documents page.
-    const docsUrl = `https://${entranceHost}/app/rfq/publicpurchase_docs.asp?PID=${pid}&LID=${lid}&AllowPrint=1`;
-    try {
-      await page.goto(docsUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    } catch (e) {
-      console.log(`    🇳🇴 eu-supply: docs page nav warn: ${(e.message || '').slice(0, 80)}`);
+    // Cap lots — 5 is plenty for any realistic multi-lot framework, keeps
+    // runtime sane (5 lots × 6 docs = 30 max fetches per tender).
+    const MAX_LOTS = 5;
+    const allLots = lidsWithLabels.slice(0, MAX_LOTS);
+    if (lidsWithLabels.length > 1) {
+      console.log(`    🇳🇴 eu-supply: PID=${pid} — detected ${lidsWithLabels.length} lot(s) (using first ${allLots.length})`);
+      for (const lot of allLots) {
+        console.log(`       lot LID=${lot.lid} "${(lot.label || '(no label)').slice(0, 70)}"`);
+      }
+    } else {
+      console.log(`    🇳🇴 eu-supply: PID=${pid}, LID=${allLots[0].lid} — navigating to docs page`);
     }
-    await new Promise((r) => setTimeout(r, 1500));
 
-    // Step 3 — parse DownloadPublicDocument JS calls + document names.
-    const found = await page.evaluate(() => {
-      const RX = /DownloadPublicDocument\(\s*['"]?(\d+)['"]?\s*,\s*['"]?([^'"]+)['"]?\s*,\s*['"]?(\d+)['"]?\s*\)/g;
-      const html = document.documentElement.outerHTML;
-      const seen = new Map();
-      // Walk DOM rows first — gives us doc NAMES alongside doc IDs.
-      const rows = document.querySelectorAll('tr, .doc-row, [data-doc-id], li');
-      for (const row of rows) {
-        const links = row.querySelectorAll('a[href], [onclick]');
-        for (const link of links) {
-          const handler = (link.getAttribute('onclick') || link.getAttribute('href') || '');
-          const m = handler.match(/DownloadPublicDocument\(\s*['"]?(\d+)['"]?\s*,\s*['"]?([^'"]+)['"]?\s*,\s*['"]?(\d+)['"]?\s*\)/);
-          if (!m) continue;
-          const docId = m[1];
-          if (seen.has(docId)) continue;
-          const name = (link.innerText || link.textContent || row.innerText || '')
-            .trim().replace(/\s+/g, ' ').slice(0, 200);
-          seen.set(docId, { docId, elemId: m[2], lid: m[3], name });
-        }
+    // Step 2 — for each lot LID, navigate to its docs page and collect docs.
+    // Aggregate across all lots (deduped by docId — some shared docs may
+    // appear under multiple lots).
+    const found = [];
+    const seenDocIds = new Set();
+    for (const lot of allLots) {
+      const docsUrl = `https://${entranceHost}/app/rfq/publicpurchase_docs.asp?PID=${pid}&LID=${lot.lid}&AllowPrint=1`;
+      try {
+        await page.goto(docsUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      } catch (e) {
+        console.log(`    🇳🇴 eu-supply: docs page nav warn (LID=${lot.lid}): ${(e.message || '').slice(0, 80)}`);
+        continue;
       }
-      // Fallback — pull from raw HTML if we missed any in DOM walk.
-      let m;
-      while ((m = RX.exec(html)) !== null) {
-        if (!seen.has(m[1])) {
-          seen.set(m[1], { docId: m[1], elemId: m[2], lid: m[3], name: '' });
+      await new Promise((r) => setTimeout(r, 1200));
+
+      // Step 3 — parse DownloadPublicDocument JS calls + document names.
+      const lotDocs = await page.evaluate(() => {
+        const RX = /DownloadPublicDocument\(\s*['"]?(\d+)['"]?\s*,\s*['"]?([^'"]+)['"]?\s*,\s*['"]?(\d+)['"]?\s*\)/g;
+        const html = document.documentElement.outerHTML;
+        const seen = new Map();
+        const rows = document.querySelectorAll('tr, .doc-row, [data-doc-id], li');
+        for (const row of rows) {
+          const links = row.querySelectorAll('a[href], [onclick]');
+          for (const link of links) {
+            const handler = (link.getAttribute('onclick') || link.getAttribute('href') || '');
+            const m = handler.match(/DownloadPublicDocument\(\s*['"]?(\d+)['"]?\s*,\s*['"]?([^'"]+)['"]?\s*,\s*['"]?(\d+)['"]?\s*\)/);
+            if (!m) continue;
+            const docId = m[1];
+            if (seen.has(docId)) continue;
+            const name = (link.innerText || link.textContent || row.innerText || '')
+              .trim().replace(/\s+/g, ' ').slice(0, 200);
+            seen.set(docId, { docId, elemId: m[2], lid: m[3], name });
+          }
         }
+        let m;
+        while ((m = RX.exec(html)) !== null) {
+          if (!seen.has(m[1])) {
+            seen.set(m[1], { docId: m[1], elemId: m[2], lid: m[3], name: '' });
+          }
+        }
+        return Array.from(seen.values());
+      }).catch(() => []);
+
+      // Dedupe across lots (some master docs appear under multiple LIDs).
+      for (const d of lotDocs) {
+        if (seenDocIds.has(d.docId)) continue;
+        seenDocIds.add(d.docId);
+        // Tag with lot label for diagnostic logging.
+        d._lotLabel = lot.label || '';
+        d._lotLid = lot.lid;
+        found.push(d);
       }
-      return Array.from(seen.values());
-    }).catch(() => []);
+      console.log(`    🇳🇴 eu-supply: lot LID=${lot.lid} → ${lotDocs.length} doc(s) (${lotDocs.filter(d => !seenDocIds.has(d.docId) || found.includes(d)).length} new)`);
+    }
 
     if (!found.length) {
-      console.log(`    🇳🇴 eu-supply: no DownloadPublicDocument calls found on docs page`);
+      console.log(`    🇳🇴 eu-supply: no DownloadPublicDocument calls found across ${allLots.length} lot(s)`);
       return [];
     }
-    console.log(`    🇳🇴 eu-supply: ${found.length} document(s) detected on docs page`);
+
+    // Re-prioritize across lots: same scoreFile logic as in main collector —
+    // Konkurransegrunnlag / Tilbudsinvitasjon / "01 " prefix get top slots.
+    // Inline a minimal scorer (the main one lives later in the file scope).
+    const PRIORITY_KW = [
+      'tilbudsinvitasjon', 'konkurransegrunnlag', 'tender invitation',
+      'kvalifikasjon', 'kvalifik', 'krav', 'kravspec',
+      'anbudsinbjudan', 'förfrågningsunderlag', 'udbudsbetingelser',
+      'requirement', 'qualification', 'criteria', 'specification', 'tor',
+      'cahier', 'dossier de consultation', 'pliego', 'disciplinare',
+      'vergabeunterlag', 'siwz', 'swz',
+    ];
+    const NEG_KW = [
+      'espd', 'gdpr', 'nda', 'cv', 'logo', 'databehandleravtale',
+      'systemdokumentasjon', 'egenerkl', 'sanksjonslov', 'forpliktelseserkl',
+    ];
+    const scoreDoc = (n) => {
+      const s = String(n || '').toLowerCase();
+      let v = 0;
+      for (const k of PRIORITY_KW) if (s.includes(k)) v += 10;
+      for (const k of NEG_KW) if (s.includes(k)) v -= 8;
+      if (/^\s*(00|01)[\s_\-\.]/.test(s)) v += 6;
+      return v;
+    };
+    found.sort((a, b) => scoreDoc(b.name) - scoreDoc(a.name));
+    console.log(`    🇳🇴 eu-supply: ${found.length} unique doc(s) across ${allLots.length} lot(s); top: ${found.slice(0, 5).map(d => `"${(d.name || '(unnamed)').slice(0, 50)}"(${scoreDoc(d.name)})`).join(', ')}`);
 
     // Step 4 — build the real download URL using the JS function's own
     // formula. The JS source (revealed by diagnostic in earlier run) is:
@@ -2733,10 +2827,21 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
     // function falls through to `window.open(strURL)` when ActiveX
     // FileMgr isn't loaded — that opens a popup whose responses aren't
     // visible on this page's response stream.
-    let pdfParseLib = null;
+    // Format-aware parsers. eu-supply tenders mix PDF + DOCX + XLSX + ZIP
+    // freely (e.g. Statsbygg SSA-F suites ship "Avtaletekst.docx",
+    // "Bilag.docx", "Sikkerhetskrav.xlsx" alongside the PDF Konkurranse-
+    // grunnlag). Without DOCX support the actual qualification doc was
+    // silently dropped. All four libs are optional; missing one only
+    // disables that one format.
+    let pdfParseLib = null, mammothLib = null, XLSXLib = null, AdmZipLib = null;
     try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+    try { mammothLib  = require('mammoth');   } catch (_) {}
+    try { XLSXLib     = require('xlsx');      } catch (_) {}
+    try { AdmZipLib   = require('adm-zip');   } catch (_) {}
     const texts = [];
-    const MAX_DOCS = 6;
+    // Bumped from 6 — multi-lot frameworks routinely have 5×3 = 15 useful
+    // docs across lots. Per-lot we cap implicitly via aggregate.
+    const MAX_DOCS = 12;
 
     // Read the JS globals the page's DownloadPublicDocument uses.
     const ctmGlobals = await page.evaluate(() => {
@@ -2815,15 +2920,12 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
       let capturedUrl = null;
       if (result && result.ok && result.data && result.data.length > 1000) {
         const buf = Buffer.from(result.data);
-        // Accept PDF magic OR generic octet-stream/attachment.
-        const isPdf = buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
+        // Accept any binary-looking response — we'll dispatch by magic bytes
+        // below. PDF / DOCX / XLSX / ZIP all show up here.
         const ctL = (result.ct || '').toLowerCase();
         const cdL = (result.cd || '').toLowerCase();
-        const looksBinary = isPdf
-          || ctL.includes('application/pdf')
-          || ctL.includes('octet-stream')
-          || cdL.includes('attachment');
-        if (looksBinary) {
+        const isHtml = ctL.includes('text/html') && !cdL.includes('attachment');
+        if (!isHtml) {
           bytes = buf;
           capturedUrl = result.url || downloadUrl;
         }
@@ -2835,22 +2937,103 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
         console.log(`    ⚠️  eu-supply: download failed for "${labelName}" (id=${doc.docId}, status=${status}, ct=${ct})`);
         continue;
       }
-      if (!pdfParseLib) {
-        console.log(`    ⚠️  eu-supply: pdf-parse unavailable, can't extract "${labelName}"`);
-        continue;
-      }
+
+      // Format dispatch by magic bytes + filename hints. eu-supply hides the
+      // real extension behind the JS download wrapper, so we sniff the
+      // payload's first 4 bytes:
+      //   %PDF (25 50 44 46) → pdf-parse
+      //   PK\x03\x04 (50 4B 03 04) → ZIP/OOXML — try mammoth (DOCX) first,
+      //     then XLSX, then adm-zip recursion
+      //   D0 CF 11 E0 → legacy MS Office CFB — unsupported, skip
+      const b = bytes;
+      const isPdf = b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46;
+      const isZip = b[0] === 0x50 && b[1] === 0x4B && b[2] === 0x03 && b[3] === 0x04;
+      const nameL = String(labelName).toLowerCase();
+      const looksDocx = nameL.endsWith('.docx') || /\.docx[\s)\]]?\s*$/.test(nameL);
+      const looksXlsx = nameL.endsWith('.xlsx') || /\.xlsx[\s)\]]?\s*$/.test(nameL);
+      let text = '';
+      let format = 'unknown';
       try {
-        const parsed = await pdfParseLib(bytes);
-        const text = ((parsed && parsed.text) || '').trim();
-        if (text.length > 100) {
-          const clipped = text.slice(0, 80000);
-          texts.push(`--- (eu-supply) ${labelName} ---\n${clipped}`);
-          console.log(`    🇳🇴 eu-supply: parsed PDF "${labelName}" (${bytes.length}B → ${clipped.length}ch from ${(capturedUrl || '').slice(0, 80)})`);
+        if (isPdf && pdfParseLib) {
+          const parsed = await pdfParseLib(bytes);
+          text = ((parsed && parsed.text) || '').trim();
+          format = 'PDF';
+        } else if (isZip) {
+          // Try mammoth (DOCX) FIRST — most tender docs are DOCX-as-ZIP.
+          // If that fails, fall through to XLSX, then plain ZIP recursion.
+          if (mammothLib && (looksDocx || !looksXlsx)) {
+            try {
+              const r = await mammothLib.extractRawText({ buffer: bytes });
+              text = (r && r.value ? r.value : '').trim();
+              if (text.length > 100) format = 'DOCX';
+            } catch (_) { /* fall through */ }
+          }
+          if (!text && XLSXLib && (looksXlsx || !looksDocx)) {
+            try {
+              const wb = XLSXLib.read(bytes, { type: 'buffer' });
+              const parts = [];
+              for (const sname of wb.SheetNames) {
+                const sheet = wb.Sheets[sname];
+                parts.push(`### ${sname}\n${XLSXLib.utils.sheet_to_csv(sheet)}`);
+              }
+              text = parts.join('\n\n').trim();
+              if (text.length > 100) format = 'XLSX';
+            } catch (_) { /* fall through */ }
+          }
+          if (!text && AdmZipLib) {
+            try {
+              const zip = new AdmZipLib(bytes);
+              const entries = zip.getEntries().slice(0, 20);
+              const parts = [];
+              for (const e of entries) {
+                if (e.isDirectory) continue;
+                const en = e.entryName.toLowerCase();
+                if (en.endsWith('.pdf') && pdfParseLib) {
+                  try {
+                    const p = await pdfParseLib(e.getData());
+                    if (p && p.text) parts.push(`--- ${e.entryName} (zip/PDF) ---\n${p.text}`);
+                  } catch (_) {}
+                } else if (en.endsWith('.docx') && mammothLib) {
+                  try {
+                    const m = await mammothLib.extractRawText({ buffer: e.getData() });
+                    if (m && m.value) parts.push(`--- ${e.entryName} (zip/DOCX) ---\n${m.value}`);
+                  } catch (_) {}
+                } else if (en.endsWith('.xlsx') && XLSXLib) {
+                  try {
+                    const wb = XLSXLib.read(e.getData(), { type: 'buffer' });
+                    for (const sname of wb.SheetNames) {
+                      parts.push(`--- ${e.entryName}:${sname} (zip/XLSX) ---\n${XLSXLib.utils.sheet_to_csv(wb.Sheets[sname])}`);
+                    }
+                  } catch (_) {}
+                }
+              }
+              text = parts.join('\n\n').trim();
+              if (text.length > 100) format = 'ZIP-inner';
+            } catch (_) { /* give up */ }
+          }
         } else {
-          console.log(`    ⚠️  eu-supply: PDF "${labelName}" extracted text too short (${text.length}ch)`);
+          // Unknown magic — try treating as plain text (some endpoints
+          // return raw HTML when ActiveX FileMgr is missing).
+          const asString = bytes.toString('utf8', 0, Math.min(bytes.length, 200));
+          if (/<html|<body|<!DOCTYPE/i.test(asString)) {
+            console.log(`    ⚠️  eu-supply: "${labelName}" returned HTML page (likely auth wall) — skipping`);
+            continue;
+          }
         }
       } catch (e) {
-        console.log(`    ⚠️  eu-supply: PDF parse failed for "${labelName}": ${(e.message || '').slice(0, 80)}`);
+        console.log(`    ⚠️  eu-supply: parse error for "${labelName}": ${(e.message || '').slice(0, 80)}`);
+      }
+
+      if (text && text.length > 100) {
+        const clipped = text.slice(0, 80000);
+        const lotTag = doc._lotLabel ? ` [lot ${doc._lotLid}]` : '';
+        texts.push(`--- (eu-supply ${format}${lotTag}) ${labelName} ---\n${clipped}`);
+        console.log(`    🇳🇴 eu-supply: parsed ${format} "${labelName}" (${bytes.length}B → ${clipped.length}ch from ${(capturedUrl || '').slice(0, 80)})`);
+      } else if (format === 'unknown') {
+        const magic = Array.from(bytes.slice(0, 4)).map(x => x.toString(16).padStart(2, '0')).join(' ');
+        console.log(`    ⚠️  eu-supply: unknown format for "${labelName}" (magic=${magic}, ${bytes.length}B) — skipping`);
+      } else {
+        console.log(`    ⚠️  eu-supply: ${format} "${labelName}" extracted text too short (${text.length}ch)`);
       }
     }
     return texts;
@@ -10202,42 +10385,98 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         'requirement', 'qualification', 'criteria', 'criterion', 'specification',
         'spec', 'tor', 'terms of reference', 'task description', 'sow',
         'scope of work', 'rfp', 'tender doc', 'evaluation', 'award', 'selection',
+        'tender invitation', 'invitation to tender', 'instructions to tenderers',
         // Lithuanian
         'reikalav', 'kvalifik', 'kriterij', 'specifik', 'sąlyg', 'pirkimo',
+        'kvietim',
         // Polish
         'wymag', 'kwalifik', 'kryteri', 'specyfik', 'opis przedmiotu',
+        'siwz', 'swz',  // Specyfikacja Istotnych Warunków Zamówienia (primary doc)
         // German
         'anforder', 'kriterien', 'lastenheft', 'leistungsbeschr',
-        // Norwegian / Swedish / Danish
+        'vergabeunterlag', 'vergabe', 'ausschreibungsunterlag',
+        // Norwegian (NB! list extended — these were missing)
         'krav', 'kravspec', 'tildelings',
+        'tilbudsinvitasjon',     // Statsbygg primary doc
+        'konkurransegrunnlag',   // Norwegian primary procurement doc
+        'kvalifikasjon',         // explicit (kvalifik already catches but defensive)
+        // Swedish
+        'anbudsinbjudan', 'upphandlingsdokument', 'förfrågningsunderlag',
+        // Danish
+        'udbudsbetingelser', 'udbudsmateriale', 'tilbudsindbydelse',
         // Dutch
         'eisen', 'bestek', 'criteri', 'gunning',
+        'aanbestedingsdoc', 'aanbestedingsdocument', 'beschrijvend document',
         // French
         'exigen', 'cahier', 'crit',
+        'règlement de consultation', 'reglement de consultation',
+        'dossier de consultation', 'dce', 'ccap', 'cctp',
         // Spanish / Portuguese
         'requisi', 'pliego',
+        'pliego de cláusulas', 'pliego administrativo', 'pliego técnico',
+        'caderno de encargos',
         // Italian
         'capitolat',
+        'disciplinare', 'bando di gara', 'capitolato d\'oneri',
         // Czech / Slovak
         'požadav', 'kritéri',
+        'zadávací dokumentace', 'súuťažné podklady',
         // Finnish
         'vaatimuk', 'kelpoisuu',
+        'tarjouspyynt', 'hankinta-asiakirj',
         // Estonian
         'nõue', 'kriteer',
+        'hankedokument',
         // Latvian
         'prasīb',
+        'iepirkuma nolikum',
+      ];
+      // Extra-high-priority phrases — these names appear EXCLUSIVELY on the
+      // single most important document in a tender pack (Statsbygg "Tilbuds-
+      // invitasjon", Polish "SWZ", German "Vergabeunterlagen", French RC/DCE,
+      // Italian "Disciplinare di gara"). Boost them 2x so they always lead.
+      const PRIMARY_DOC_KW = [
+        'tilbudsinvitasjon', 'konkurransegrunnlag',
+        'anbudsinbjudan', 'förfrågningsunderlag',
+        'udbudsbetingelser', 'udbudsmateriale',
+        'vergabeunterlag', 'ausschreibungsunterlag',
+        'règlement de consultation', 'reglement de consultation',
+        'dossier de consultation', 'cahier des charges',
+        'pliego de cláusulas', 'pliego administrativo',
+        'disciplinare di gara', 'capitolato d\'oneri',
+        'aanbestedingsdocument', 'beschrijvend document',
+        'siwz', 'swz', 'specyfikacja istotnych warunk',
+        'zadávací dokumentace', 'súuťažné podklady',
+        'tarjouspyynt', 'hankinta-asiakirj',
+        'iepirkuma nolikum', 'hankedokument',
+        'tender invitation', 'invitation to tender',
       ];
       const NEGATIVE_KW = [
         'espd', 'gdpr', 'nda', 'cv', 'logo', 'cover-letter', 'price-form',
         'kainos forma', 'formularz cenowy', 'preisblatt', 'oferta-cenow',
+        // Data-processor / DPA templates — never qualifications
+        'databehandleravtale', 'databehandler', 'data processing agreement',
+        // System / technical / security technical specs — describe the
+        // SYSTEM, not supplier qualifications
+        'systemdokumentasjon', 'systemarkitektur',
+        // Sanctions / commitment templates
+        'sanksjonslovgivning', 'forpliktelseserkl', 'solidaransvarserkl',
+        // Egenerklæring is the supplier self-declaration FORM (blank
+        // template), not the qualification requirements themselves
+        'egenerkl',
       ];
       const scoreFile = (name) => {
         const n = String(name || '').toLowerCase();
         let s = 0;
         for (const kw of POSITIVE_KW) if (n.includes(kw)) s += 10;
+        for (const kw of PRIMARY_DOC_KW) if (n.includes(kw)) s += 15; // big boost
         for (const kw of NEGATIVE_KW) if (n.includes(kw)) s -= 8;
         // Annex/appendix → slight de-prioritization (often supplementary)
-        if (/\b(annex|appendix|priedas|liite|załącznik|bilag|bilaga|anlage|allegato|anexo)\b/i.test(n)) s -= 2;
+        if (/\b(annex|appendix|priedas|liite|załącznik|bilag|bilaga|anlage|allegato|anexo|vedlegg)\b/i.test(n)) s -= 2;
+        // Filename prefix boost: buyers conventionally number the primary
+        // procurement document "01" or "00" (Statsbygg/Norwegian, Swedish,
+        // many EU portals). Strong hint even if the keyword list misses.
+        if (/^\s*(00|01)[\s_\-\.]/.test(n)) s += 6;
         return s;
       };
       collectedFiles.sort((a, b) => scoreFile(b.name) - scoreFile(a.name));
@@ -12727,10 +12966,16 @@ async function runScraper() {
           if (!dd.offerWeighingCriteria && ai.offerWeighingCriteria) { dd.offerWeighingCriteria = ai.offerWeighingCriteria; filled.push('criteria'); }
           // scopeOfAgreement: AI's English summary overrides native-language description
           if (ai.scopeOfAgreement) { dd.scopeOfAgreement = ai.scopeOfAgreement; filled.push('scope'); }
+          // Carry multi-lot framework analysis through
+          dd.lotStructure = ai.lotStructure || 'single';
+          if (ai.itLotsScope) { dd.itLotsScope = ai.itLotsScope; }
           // Carry reject decision through (used by the content filter below)
           if (ai.rejectReason) { dd.rejectReason = ai.rejectReason; }
           if (ai.rejectCategory) { dd.rejectCategory = ai.rejectCategory; }
           if (filled.length) console.log(`    🤖 AI filled: ${filled.join(', ')}`);
+          if (dd.lotStructure && dd.lotStructure !== 'single') {
+            console.log(`    🧩 multi-lot framework: structure=${dd.lotStructure}${dd.itLotsScope ? ` — IT lots: "${dd.itLotsScope.slice(0, 120)}"` : ''}`);
+          }
         }
 
         // --- POST-AI BUDGET FILTER ---------------------------------
@@ -12743,6 +12988,27 @@ async function runScraper() {
           toFetch[i].details = dd;
           await new Promise(r => setTimeout(r, 200));
           continue;
+        }
+
+        // --- POST-AI MULTI-LOT FRAMEWORK NARROWING -----------------
+        // For multi-lot tenders with partial-bid allowed AND at least one
+        // IT-relevant lot, narrow the scope to ONLY describe the IT lot(s).
+        // This keeps the sheet row focused on what we could realistically
+        // bid for instead of the umbrella description (which often covers
+        // unrelated lots like legal advisory, HR consulting, etc.).
+        //
+        // For multi-lot with NO IT lots → AI is instructed to set
+        // rejectReason="framework_no_it_lots"; standard content filter
+        // below will drop the row.
+        // For all-required + non-IT lots → AI is instructed to set
+        // rejectReason="mixed_lots_all_required"; same outcome.
+        if (dd.lotStructure === 'partial' && dd.itLotsScope && dd.itLotsScope.length > 20) {
+          // Replace umbrella scope with the IT-lot summary; prefix it so
+          // the sheet reader knows this is a narrowed lot view.
+          const itScope = dd.itLotsScope;
+          console.log(`    🧩 narrowing scope to IT lots only (was ${(dd.scopeOfAgreement || '').length}ch umbrella → ${itScope.length}ch IT lots)`);
+          dd.scopeOfAgreement = `[IT lots only — framework permits partial bids]\n${itScope}`;
+          dd.scopeOfAgreementEn = dd.scopeOfAgreement;  // already English from AI
         }
 
         // --- POST-AI CONTENT FILTER --------------------------------
