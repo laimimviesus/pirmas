@@ -7031,7 +7031,36 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
 //      shape compatible with fetchSourcePageDetails.
 // =====================================================================
 async function fetchMercellTenderDocuments(browser, sourceUrl) {
-  const u = new URL(sourceUrl);
+  let u = new URL(sourceUrl);
+
+  // 2026-05-19 — PERMALINK REWRITE.
+  //
+  // permalink.mercell.com/<id>.aspx redirects to www.mercell.com/<lang>/tender/<id>/<slug>
+  // — the PUBLIC MARKETING PAGE behind a paywall. body shows only:
+  //   - "Sign in" link → my.mercell.com/en/m/logon/?ReturnUrl=/m/mts/Tender.aspx?id=<id>
+  //   - "Tender access" → plans/pricing
+  //   - Language switcher (World/Danmark/Deutschland/...)
+  // bodyLen=~1500ch, no document anchors.
+  //
+  // The actual authenticated tender page lives at:
+  //   https://app.mercell.com/tender/<id>
+  //
+  // We're already authenticated on *.mercell.com (Monika's session
+  // cookies + Bearer captured during search login), so navigating to
+  // app.mercell.com/tender/<id> shows the full SaaS view with documents.
+  //
+  // Rewrite the URL upfront so we land directly on the authenticated
+  // platform instead of the marketing redirect chain.
+  const permalinkMatch = u.hostname === 'permalink.mercell.com'
+    && u.pathname.match(/^\/(\d+)\.aspx$/i);
+  if (permalinkMatch) {
+    const tenderId = permalinkMatch[1];
+    const rewritten = `https://app.mercell.com/tender/${tenderId}`;
+    console.log(`    🟦 mercell-tender: rewriting permalink (${u.host}) → ${rewritten}`);
+    sourceUrl = rewritten;
+    u = new URL(sourceUrl);
+  }
+
   const hostLabel = u.host;
   const t0 = Date.now();
   let page = null;
