@@ -840,6 +840,7 @@ async function extractFieldsWithAI(text, meta = {}) {
     '   • Surveys/Research: Conducting public surveys, sociological polling, non-IT market research. Set rejectReason="surveys_market_research".\n' +
     '   • GIS / Geo-specific: Geographic Information Systems (GIS), geological mapping, spatial data systems requiring specific local geographical knowledge/access. Set rejectReason="gis_geospatial".\n' +
     '   • Physical/Infrastructure: Hardware delivery, cabling, network/telecom infra. Set rejectReason="hardware_network_infra".\n' +
+    '   • 24/7 Operational Support Required: Tender MANDATES round-the-clock (24/7, 24x7, 24h) operational support, on-call duty, after-hours response SLA (e.g., 1h response any time), live ops coverage, NOC services, or shift-based monitoring as a CORE deliverable. We are a development firm without 24/7 ops capacity. Look for phrases like "24/7 support", "døgnvakt", "24-timers vakt", "24 Stunden", "support 24h/7j", "operativ støtte døgnet rundt", "24/7 SLA", "1-hour response time at all hours", "around-the-clock", "soporte 24/7", "supporto 24 ore", "monitoraggio continuativo". DO NOT trigger this category for normal business-hours support, best-effort response, or maintenance windows. Set rejectReason="requires_24_7_support".\n' +
     '   • Mixed Lots Required Together: lotStructure=="all-required" AND the umbrella scope covers non-IT work (construction, physical security, cleaning, logistics, food service, training-only, etc.) that we cannot perform alongside the IT portion. Set rejectReason="mixed_lots_all_required".\n' +
     '   • Multi-lot Framework Without IT Lots: lotStructure=="partial" but NONE of the available lots is custom software development (e.g. all lots are management consulting, legal advisory, HR, surveys, hardware supply). Set rejectReason="framework_no_it_lots".\n' +
     '   AMBIGUOUS PROCUREMENT: If it says "system implementation" but implies configuring an off-the-shelf product → REJECT. ACCEPT (empty rejectReason) ONLY if it is custom software development, web/mobile app dev from scratch, bespoke architecture, or maintenance/evolution of custom systems. For partial-bid multi-lot tenders, ACCEPT (empty rejectReason) when AT LEAST ONE lot is custom software development — itLotsScope must list those lot(s).\n' +
@@ -2725,10 +2726,16 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
     }
 
     // Step 2 — for each lot LID, navigate to its docs page and collect docs.
-    // Aggregate across all lots (deduped by docId — some shared docs may
-    // appear under multiple lots).
+    // Dedupe by both docId AND normalized filename — eu-supply assigns each
+    // lot its own docId for content-identical files (observed 2026-05-19:
+    // tender PID=455427 had 22 lots × same Konkurransegrunnlag.docx, all
+    // with different docIds but same filename, wasting 22 parse cycles).
     const found = [];
     const seenDocIds = new Set();
+    const seenNames = new Set();
+    const normalizeName = (n) => String(n || '').toLowerCase()
+      .replace(/\s+/g, ' ').trim()
+      .replace(/[^\w\s.\-]/g, '');
     for (const lot of allLots) {
       const docsUrl = `https://${entranceHost}/app/rfq/publicpurchase_docs.asp?PID=${pid}&LID=${lot.lid}&AllowPrint=1`;
       try {
@@ -2767,16 +2774,25 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
         return Array.from(seen.values());
       }).catch(() => []);
 
-      // Dedupe across lots (some master docs appear under multiple LIDs).
+      // Dedupe across lots — by docId AND by normalized filename (same
+      // file uploaded once per lot gets distinct docIds but identical names).
+      let lotNew = 0;
       for (const d of lotDocs) {
         if (seenDocIds.has(d.docId)) continue;
+        const nameKey = normalizeName(d.name);
+        if (nameKey && seenNames.has(nameKey)) {
+          // Same filename already seen in earlier lot — skip the duplicate.
+          seenDocIds.add(d.docId);
+          continue;
+        }
         seenDocIds.add(d.docId);
-        // Tag with lot label for diagnostic logging.
+        if (nameKey) seenNames.add(nameKey);
         d._lotLabel = lot.label || '';
         d._lotLid = lot.lid;
         found.push(d);
+        lotNew++;
       }
-      console.log(`    🇳🇴 eu-supply: lot LID=${lot.lid} → ${lotDocs.length} doc(s) (${lotDocs.filter(d => !seenDocIds.has(d.docId) || found.includes(d)).length} new)`);
+      console.log(`    🇳🇴 eu-supply: lot LID=${lot.lid} → ${lotDocs.length} doc(s) (${lotNew} new after dedup)`);
     }
 
     if (!found.length) {
@@ -3064,6 +3080,176 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
 //   Programma van Eisen   — requirements programme (technical reqs)
 //   UEA / ESPD            — Uniform European Procurement Document
 //   Aanbestedingsleidraad — procurement guide (often contains both reqs and quals)
+// =====================================================================
+
+// =====================================================================
+// fetchArtifikDocuments
+// ---------------------------------------------------------------------
+// app.artifik.no/procurements/<id> — Norwegian React SPA tender platform
+// (used by municipalities like Gjøvik Kommune). The procurement page
+// loads structured data via JSON API calls (e.g. /api/procurements/<id>/
+// award-criteria, /qualification-criteria, /documents). The generic
+// source-page handler only captures the rendered body text — but key
+// sections (Tildelingskriterier, Kvalifikasjonskrav, Dokumenter) live in
+// TAB panels that aren't expanded by default.
+//
+// Strategy:
+//   1) Navigate to the procurement URL, wait for SPA hydration (~4s)
+//   2) Intercept all JSON responses from app.artifik.no/api/* — these
+//      carry the structured tender data
+//   3) Click through every plausible tab/section label across NO/EN
+//   4) After each click wait briefly, then capture additional API calls
+//   5) Concatenate captured JSON + final rendered body
+//
+// Returns array of text snippets to merge into sourceFilesText.
+// =====================================================================
+async function fetchArtifikDocuments(browser, sourceUrl) {
+  let pid = null;
+  let host = null;
+  try {
+    const u = new URL(sourceUrl);
+    if (!/(^|\.)artifik\.no$/i.test(u.hostname)) return [];
+    const m = u.pathname.match(/\/procurements?\/(\d+)/i);
+    if (!m) return [];
+    pid = m[1];
+    host = u.hostname;
+  } catch (_) { return []; }
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(20000);
+    page.setDefaultTimeout(20000);
+
+    // Capture API JSON responses — the SPA's data layer.
+    const apiResponses = [];
+    const seenApiUrls = new Set();
+    page.on('response', async (resp) => {
+      try {
+        const url = resp.url();
+        if (!/\/api\//i.test(url)) return;
+        if (seenApiUrls.has(url)) return;
+        seenApiUrls.add(url);
+        const ct = resp.headers()['content-type'] || '';
+        if (!/json/i.test(ct)) return;
+        const body = await resp.text().catch(() => '');
+        if (body.length > 40 && body.length < 300000) {
+          apiResponses.push({ url, body });
+        }
+      } catch (_) {}
+    });
+
+    await page.goto(sourceUrl, { waitUntil: 'networkidle2', timeout: 20000 }).catch((e) => {
+      console.log(`    🇳🇴 artifik: nav warn: ${(e.message || '').slice(0, 80)}`);
+    });
+    await new Promise((r) => setTimeout(r, 4000));
+
+    // Click through every tab/section we can reasonably find. Multi-pass:
+    // some SPAs add tabs after first click.
+    const TAB_LABELS = [
+      // Norwegian
+      'Krav', 'Kvalifikasjon', 'Kvalifikasjonskrav', 'Tildelingskriterier',
+      'Dokumenter', 'Vedlegg', 'Om anskaffelsen', 'Om', 'Detaljer',
+      'Tilbudsinvitasjon', 'Konkurransegrunnlag',
+      // English
+      'Requirements', 'Qualifications', 'Qualification requirements',
+      'Award criteria', 'Documents', 'Attachments', 'About', 'Details',
+      'Tender invitation',
+      // Swedish (some Norwegian municipalities operate cross-border)
+      'Krav', 'Tilldelningskriterier', 'Dokument',
+    ];
+    const triedLabels = new Set();
+    let clickedAnything = false;
+    for (const label of TAB_LABELS) {
+      if (triedLabels.has(label.toLowerCase())) continue;
+      triedLabels.add(label.toLowerCase());
+      const clicked = await page.evaluate((t) => {
+        const escaped = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re = new RegExp(`^\\s*${escaped}\\s*$`, 'i');
+        const candidates = Array.from(document.querySelectorAll(
+          'a, button, [role="tab"], [role="button"], li, h2, h3, [data-tab], [data-section]'
+        ));
+        for (const el of candidates) {
+          if (el.offsetParent === null) continue;
+          const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (text && re.test(text)) {
+            try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
+            try { el.click(); return true; } catch (_) {}
+          }
+        }
+        return false;
+      }, label).catch(() => false);
+      if (clicked) {
+        clickedAnything = true;
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+    }
+    if (clickedAnything) {
+      // One more settle pass after the click storm
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    // Capture fully-rendered body after tab expansion.
+    const finalBody = await page.evaluate(() => {
+      return (document.body && document.body.innerText) || '';
+    }).catch(() => '');
+
+    // Walk captured JSON for fields that look relevant (criteria/
+    // requirements/documents/etc). We don't know the exact schema —
+    // just stringify the most relevant-looking responses and let the AI
+    // sort it out.
+    const RELEVANT_HINTS = [
+      'qualification', 'kvalifik', 'criteria', 'kriterier', 'tildeling',
+      'award', 'requirement', 'krav', 'document', 'dokument',
+      'pris', 'price', 'reference', 'referans',
+    ];
+    const scoredApi = apiResponses.map(({ url, body }) => {
+      const u = url.toLowerCase();
+      const b = body.toLowerCase();
+      let score = 0;
+      for (const h of RELEVANT_HINTS) {
+        if (u.includes(h)) score += 5;
+        if (b.includes(h)) score += 1;
+      }
+      return { url, body, score };
+    }).sort((a, b) => b.score - a.score);
+
+    const out = [];
+    if (scoredApi.length) {
+      out.push(`--- (artifik API JSON, PID=${pid}) ---`);
+      const MAX_API_TOTAL = 60000;
+      let totalChars = 0;
+      for (const r of scoredApi.slice(0, 15)) {
+        if (totalChars > MAX_API_TOTAL) break;
+        let formatted = r.body;
+        try {
+          const parsed = JSON.parse(r.body);
+          formatted = JSON.stringify(parsed, null, 2);
+        } catch (_) {}
+        const cap = Math.max(2000, MAX_API_TOTAL - totalChars);
+        const clipped = formatted.slice(0, cap);
+        out.push(`# ${r.url.replace(/^https?:\/\/[^/]+/, '')}\n${clipped}`);
+        totalChars += clipped.length;
+      }
+    }
+    if (finalBody && finalBody.length > 500) {
+      out.push(`--- (artifik rendered body, PID=${pid}) ---\n${finalBody.slice(0, 40000)}`);
+    }
+
+    if (!out.length) {
+      console.log(`    🇳🇴 artifik: PID=${pid} — no API responses or body content captured`);
+      return [];
+    }
+    console.log(`    🇳🇴 artifik: PID=${pid} — captured ${apiResponses.length} API response(s), ${finalBody.length}ch body, ${clickedAnything ? 'clicked tabs' : 'no tabs clicked'}`);
+    return [out.join('\n\n')];
+  } catch (e) {
+    console.log(`    ⚠️  artifik handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
 // =====================================================================
 async function fetchTenderNedDocuments(browser, sourceUrl) {
   let noticeId = null;
@@ -6612,43 +6798,84 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
         break;
       }
 
-      // Tick visible CGU acceptance checkbox
+      // Tick visible CGU acceptance checkbox.
+      //
+      // 2026-05-19 (rev 2) — awsolutions.fr is a Material-UI (React) app.
+      // The previous approach (`cb.checked = true; cb.dispatchEvent('change')`)
+      // does NOT trigger React's internal state update because the
+      // `checked` property setter is intercepted by React's synthetic
+      // event system, and a direct property assignment bypasses it.
+      // Result: visual state changes but `Suivant` stays disabled.
+      //
+      // Working approach for React/MUI:
+      //   STRATEGY 1 — Click the visible label or wrapper element. MUI
+      //     wraps the real <input> in a <span class="MuiCheckbox-root">
+      //     and a <label class="MuiFormControlLabel-root">. Clicking
+      //     EITHER fires the proper synthetic onChange via React's
+      //     event delegation.
+      //   STRATEGY 2 — Use the native HTMLInputElement.prototype.checked
+      //     setter from getOwnPropertyDescriptor (the React-recognized
+      //     "native value setter" trick used by react-testing-library).
+      //     Then fire input + change events.
       const cbChecked = await page.evaluate(() => {
         const cbs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
         let any = 0;
+        const nativeCheckedSetter = Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype, 'checked'
+        ).set;
         for (const cb of cbs) {
           if (cb.disabled || cb.checked) continue;
-          if (cb.offsetParent === null) continue;
-          // Build context text from label, parent, grandparent
+          // Note: MUI's hidden input has offsetParent===null; allow it.
+          // Build context text from label, parent, grandparent, and the
+          // closest MuiFormControlLabel (which is where the visible text
+          // lives in Material-UI checkbox markup).
           const labelEl = cb.labels && cb.labels[0];
+          const muiLabel = cb.closest('.MuiFormControlLabel-root, label');
           const parent = cb.parentElement;
           const grand = parent?.parentElement;
           const ctx = (
             (labelEl?.innerText || labelEl?.textContent || '') + ' ' +
+            (muiLabel?.innerText || muiLabel?.textContent || '') + ' ' +
             (parent?.innerText || '') + ' ' +
             (grand?.innerText || '')
           ).toLowerCase().slice(0, 600);
-          // Match CGU / Terms acceptance phrases (FR/EN)
-          const matchesCGU = /conditions\s*g[ée]n[ée]rales|terms\s*and\s*conditions|terms\s*of\s*(?:use|service)|cgu\b|we\s*have\s*read|j['']?\s*accepte|i\s*(?:have\s*)?read|i\s*accept/i.test(ctx);
-          if (matchesCGU) {
-            try {
-              cb.checked = true;
-              cb.dispatchEvent(new Event('change', { bubbles: true }));
-              cb.dispatchEvent(new Event('click', { bubbles: true }));
-              any++;
-            } catch (_) {}
-          }
+          // Match CGU / Terms acceptance phrases (FR/EN) — broadened.
+          const matchesCGU = /conditions\s*g[ée]n[ée]rales|terms\s*and\s*conditions|terms\s*of\s*(?:use|service)|cgu\b|we\s*have\s*read|j['']?\s*accepte|i\s*(?:have\s*)?read|i\s*accept|pris\s*connaissance|lu\s*et\s*(?:approuv[eé]|accept[eé])|j['']?\s*ai\s*lu|i\s*agree|i\s*confirm|je\s*reconnais|je\s*certifie/i.test(ctx);
+          if (!matchesCGU) continue;
+
+          // STRATEGY 1: click the MUI label or wrapper. This is the
+          // most reliable way to fire React's onChange handler.
+          let clicked = false;
+          try {
+            const mfclRoot = cb.closest('.MuiFormControlLabel-root');
+            const mcbRoot = cb.closest('.MuiCheckbox-root');
+            const clickTarget = labelEl || mfclRoot || mcbRoot;
+            if (clickTarget && clickTarget.offsetParent !== null) {
+              clickTarget.scrollIntoView({ block: 'center' });
+              clickTarget.click();
+              clicked = true;
+            }
+          } catch (_) {}
+
+          // STRATEGY 2: native React-recognized setter + events.
+          // Fires even when STRATEGY 1 succeeded — belt-and-suspenders
+          // for cases where MUI ignores synthetic label clicks.
+          try {
+            nativeCheckedSetter.call(cb, true);
+            cb.dispatchEvent(new Event('input', { bubbles: true }));
+            cb.dispatchEvent(new Event('change', { bubbles: true }));
+            if (!clicked) cb.dispatchEvent(new Event('click', { bubbles: true }));
+          } catch (_) {}
+          any++;
         }
         return any;
       }).catch(() => 0);
       if (cbChecked) {
         console.log(`    🇫🇷 marches-publics.info: ticked ${cbChecked} CGU acceptance checkbox(es)`);
-        // 2026-05-19 — Vue/React forms validate `change` events with a
-        // small delay before unlocking the disabled "Suivant" button.
-        // Without this wait, the button is still disabled when we look
-        // for it and offsetParent===null on the disabled DOM, so we
-        // never find it. 800-1500ms is typical.
-        await new Promise((r) => setTimeout(r, 1500));
+        // React/MUI debounces form validation by ~300-800ms after the
+        // change event. 1500ms gives the disabled Suivant button time
+        // to re-render as enabled.
+        await new Promise((r) => setTimeout(r, 1800));
       }
 
       // Click "Following" / "Suivant" / "Next" advance button.
@@ -6684,31 +6911,64 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
 
       if (!clicked) {
         console.log(`    🇫🇷 marches-publics.info step ${step}: no advance button found — stopping wizard walk`);
-        // Diagnostic dump — list all visible button/role=button text so
-        // we can refine the matcher on edge cases.
-        const btnSample = await page.evaluate(() => {
-          const all = Array.from(document.querySelectorAll(
-            'button, input[type="submit"], input[type="button"], a.btn, a[role="button"], [role="button"], div[onclick], span[onclick]'
-          ));
-          return all
-            .filter((el) => el.offsetParent !== null)
-            .slice(0, 12)
+        // Diagnostic dump — buttons + ALL checkboxes (so we can tell
+        // whether Suivant stayed disabled because of another unticked
+        // required checkbox, not just CGU).
+        const diag = await page.evaluate(() => {
+          const visible = (el) => el && el.offsetParent !== null;
+          const btns = Array.from(document.querySelectorAll(
+            'button, input[type="submit"], input[type="button"], a.btn, a[role="button"], [role="button"]'
+          )).filter(visible).slice(0, 12).map((el) => ({
+            tag: el.tagName.toLowerCase(),
+            type: el.getAttribute('type') || '',
+            text: (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+            disabled: !!el.disabled,
+            cls: (el.className || '').toString().slice(0, 80),
+          }));
+          const cbs = Array.from(document.querySelectorAll('input[type="checkbox"]'))
+            .slice(0, 20)
+            .map((cb) => {
+              const mfcl = cb.closest('.MuiFormControlLabel-root, label');
+              const labelText = (mfcl?.innerText || mfcl?.textContent || cb.labels?.[0]?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+              return {
+                checked: cb.checked,
+                disabled: cb.disabled,
+                hidden: cb.offsetParent === null,
+                required: cb.required || cb.getAttribute('aria-required') === 'true',
+                label: labelText,
+              };
+            });
+          // Also list visible required text inputs that might block validation
+          const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="email"], textarea, select'))
+            .filter(visible)
+            .filter((el) => el.required || el.getAttribute('aria-required') === 'true' || !el.value)
+            .slice(0, 10)
             .map((el) => ({
               tag: el.tagName.toLowerCase(),
-              type: el.getAttribute('type') || '',
-              role: el.getAttribute('role') || '',
-              text: (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
-              disabled: !!el.disabled,
-              cls: (el.className || '').toString().slice(0, 80),
+              name: el.name || el.id || '',
+              required: el.required || el.getAttribute('aria-required') === 'true',
+              hasValue: !!el.value,
             }));
-        }).catch(() => []);
-        if (btnSample.length) {
-          console.log(`       visible buttons (${btnSample.length}):`);
-          for (const b of btnSample) {
-            console.log(`         <${b.tag}${b.type ? ' type=' + b.type : ''}${b.role ? ' role=' + b.role : ''}${b.disabled ? ' disabled' : ''}> "${b.text}" class="${b.cls}"`);
+          return { btns, cbs, inputs };
+        }).catch(() => ({ btns: [], cbs: [], inputs: [] }));
+
+        if (diag.btns.length) {
+          console.log(`       visible buttons (${diag.btns.length}):`);
+          for (const b of diag.btns) {
+            console.log(`         <${b.tag}${b.type ? ' type=' + b.type : ''}${b.disabled ? ' disabled' : ''}> "${b.text}" class="${b.cls}"`);
           }
         } else {
-          console.log(`       (no visible buttons at all — wizard may not have rendered)`);
+          console.log(`       (no visible buttons — wizard may not have rendered)`);
+        }
+        if (diag.cbs.length) {
+          console.log(`       checkboxes (${diag.cbs.length}): ${diag.cbs.filter(c => c.checked).length} checked, ${diag.cbs.filter(c => !c.checked && !c.disabled).length} unchecked-actionable`);
+          for (const c of diag.cbs) {
+            const flags = [c.checked ? '✓' : '✗', c.disabled ? 'disabled' : '', c.hidden ? 'hidden' : '', c.required ? 'required' : ''].filter(Boolean).join(',');
+            console.log(`         [${flags}] "${c.label}"`);
+          }
+        }
+        if (diag.inputs.length) {
+          console.log(`       required/empty inputs (${diag.inputs.length}): ${diag.inputs.map(i => `${i.tag}[${i.name}${i.required ? ',required' : ''}${!i.hasValue ? ',empty' : ''}]`).join(' ')}`);
         }
         break;
       }
@@ -9107,6 +9367,24 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     } catch (e) {
       console.log(`    ⚠️ eu-supply handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // app.artifik.no Documents handler — Norwegian SaaS tender platform
+    // (Gjøvik Kommune et al). React SPA with tab-loaded sections; we
+    // intercept /api/* JSON + click through every plausible tab to
+    // expose qualification/award/document data. No-op for non-artifik.
+    try {
+      const artifikTexts = await fetchArtifikDocuments(browser, sourceUrl);
+      if (artifikTexts && artifikTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + artifikTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇳🇴 artifik: appended ${artifikTexts.length} block(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ artifik handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     // TenderNed (www.tenderned.nl) Documents handler — NL public tenders.
