@@ -6443,17 +6443,38 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
       }).catch(() => 0);
       if (cbChecked) {
         console.log(`    🇫🇷 marches-publics.info: ticked ${cbChecked} CGU acceptance checkbox(es)`);
+        // 2026-05-19 — Vue/React forms validate `change` events with a
+        // small delay before unlocking the disabled "Suivant" button.
+        // Without this wait, the button is still disabled when we look
+        // for it and offsetParent===null on the disabled DOM, so we
+        // never find it. 800-1500ms is typical.
+        await new Promise((r) => setTimeout(r, 1500));
       }
 
-      // Click "Following" / "Suivant" / "Next" advance button
+      // Click "Following" / "Suivant" / "Next" advance button.
+      //
+      // 2026-05-19 — LOOSER MATCHING.
+      // Previous regex (^\s*(suivant|...)\s*$) failed to match common
+      // real-world variants: "Suivant ›", "Étape suivante", "Continuer →",
+      // "Suivant >". The wizard buttons usually have an icon/arrow appended.
+      // Use a contains-pattern instead.
       const clicked = await page.evaluate(() => {
-        const candidates = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a.btn, a[role="button"]'));
+        const candidates = Array.from(document.querySelectorAll(
+          'button, input[type="submit"], input[type="button"], a.btn, a[role="button"], ' +
+          '[role="button"], div[onclick], span[onclick]'
+        ));
+        // Match keywords ANYWHERE in the button text — covers
+        // "Suivant ›", "Étape suivante", "Following >", "Continuer →".
+        const ADVANCE_RE = /\b(following|suivant|continuer|continue|next|étape\s+suivante|valider\s+et\s+(?:continuer|suivre)|valider)\b/i;
+        // Anti-pattern — buttons that look like "next" but aren't (e.g.,
+        // "Retour" reverses). Filter explicitly.
+        const REJECT_RE = /\b(annuler|cancel|retour|back|précédent|previous)\b/i;
         const target = candidates.find((el) => {
           if (el.disabled || el.offsetParent === null) return false;
           const text = (el.innerText || el.value || el.textContent || '').trim();
-          // Match the wizard's NEXT-step button. "Following" is the
-          // English translation evergabe etc. use for "Suivant".
-          return /^\s*(following|suivant|continuer|continue|next|étape\s+suivante|valider\s+et\s+(?:continuer|suivre))\s*$/i.test(text);
+          if (!text || text.length > 60) return false;
+          if (REJECT_RE.test(text)) return false;
+          return ADVANCE_RE.test(text);
         });
         if (!target) return null;
         try { target.scrollIntoView({ block: 'center' }); } catch (_) {}
@@ -6463,6 +6484,32 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
 
       if (!clicked) {
         console.log(`    🇫🇷 marches-publics.info step ${step}: no advance button found — stopping wizard walk`);
+        // Diagnostic dump — list all visible button/role=button text so
+        // we can refine the matcher on edge cases.
+        const btnSample = await page.evaluate(() => {
+          const all = Array.from(document.querySelectorAll(
+            'button, input[type="submit"], input[type="button"], a.btn, a[role="button"], [role="button"], div[onclick], span[onclick]'
+          ));
+          return all
+            .filter((el) => el.offsetParent !== null)
+            .slice(0, 12)
+            .map((el) => ({
+              tag: el.tagName.toLowerCase(),
+              type: el.getAttribute('type') || '',
+              role: el.getAttribute('role') || '',
+              text: (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+              disabled: !!el.disabled,
+              cls: (el.className || '').toString().slice(0, 80),
+            }));
+        }).catch(() => []);
+        if (btnSample.length) {
+          console.log(`       visible buttons (${btnSample.length}):`);
+          for (const b of btnSample) {
+            console.log(`         <${b.tag}${b.type ? ' type=' + b.type : ''}${b.role ? ' role=' + b.role : ''}${b.disabled ? ' disabled' : ''}> "${b.text}" class="${b.cls}"`);
+          }
+        } else {
+          console.log(`       (no visible buttons at all — wizard may not have rendered)`);
+        }
         break;
       }
       console.log(`    🇫🇷 marches-publics.info: clicked "${clicked}" — advancing to next step`);
@@ -7023,7 +7070,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
 
     console.log(`    🟦 mercell-tender: navigating to ${sourceUrl.slice(0, 100)}`);
     try {
-      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
     } catch (e) {
       console.log(`    ⚠️  mercell-tender: navigation error: ${(e.message || '').slice(0, 100)}`);
     }
@@ -7035,8 +7082,40 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
       if (h1 && (h1.innerText || '').trim().length > 5) return true;
       const body = (document.body.innerText || '').length;
       return body > 1500;
-    }, { timeout: 8000 }).catch(() => null);
-    await new Promise((r) => setTimeout(r, 1500));
+    }, { timeout: 10000 }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // 2026-05-19 — Try to reach Documents section.
+    //
+    // Mercell tender pages render an "Overview" tab by default. Document
+    // anchors usually live in a "Documents" / "Files" tab/section that
+    // requires a click. Try multiple text patterns (EN/NO/SE/DA/FI/DE/FR
+    // localized labels).
+    const docTabClicked = await page.evaluate(() => {
+      const TAB_RE = /^(documents?|filer?|filer|dokumenter|dokumentai|tiedostot|dokumente|documents?|documenten|dosi[ae]rs?|fichiers?)$/i;
+      const clickables = Array.from(document.querySelectorAll('a, button, [role="tab"], [role="button"], li'));
+      for (const el of clickables) {
+        const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t && TAB_RE.test(t)) {
+          try {
+            el.scrollIntoView({ block: 'center' });
+            el.click();
+            return t;
+          } catch (_) {}
+        }
+      }
+      return null;
+    }).catch(() => null);
+    if (docTabClicked) {
+      console.log(`    🟦 mercell-tender: clicked "${docTabClicked}" tab — waiting for content`);
+      await new Promise((r) => setTimeout(r, 2500));
+    }
+
+    // Scroll to bottom — triggers any lazy-loaded sections.
+    await page.evaluate(() => {
+      window.scrollTo(0, document.body.scrollHeight);
+    }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 1000));
 
     const finalUrl = page.url();
     console.log(`    🟦 mercell-tender: landed on ${finalUrl.slice(0, 100)}`);
@@ -7098,6 +7177,20 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     if (pageState.docAnchors.length) {
       for (const a of pageState.docAnchors.slice(0, 8)) {
         console.log(`       doc anchor: "${a.text.slice(0, 60)}" → ${a.href.slice(0, 90)}`);
+      }
+    } else if (pageState.anchorCount > 0) {
+      // No doc anchors matched — dump first 10 anchors so we can refine
+      // patterns next iteration. Helps when Mercell ships a new layout.
+      const sample = await page.evaluate(() => {
+        const a = Array.from(document.querySelectorAll('a[href]')).slice(0, 12);
+        return a.map((x) => ({
+          text: (x.innerText || x.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+          href: (x.href || '').slice(0, 110),
+        }));
+      }).catch(() => []);
+      console.log(`    🔎 mercell-tender: no doc anchors matched — sample of ${sample.length} anchors:`);
+      for (const a of sample) {
+        console.log(`       a: "${a.text}" → ${a.href}`);
       }
     }
 
