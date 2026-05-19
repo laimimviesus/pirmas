@@ -6878,10 +6878,132 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
           `active="${(stepState.activeStep || '').slice(0, 40)}")`
         );
         reachedDocsStep = true;
-        // Cache the captured state for harvesting after the loop
-        // (mainText + muiFiles will feed the fallback content extractor
-        // if anchor-based fetch comes up empty).
-        page._mpiDocStepCache = stepState;
+
+        // 2026-05-19 — Lazy-load wait. awsolutions.fr renders the
+        // Documents step shell instantly but fetches the actual file
+        // list asynchronously (XHR), populating MUI components 1-3s
+        // later. Without this wait we capture an empty placeholder.
+        //
+        // Strategy: scroll to trigger any IntersectionObservers, wait
+        // up to 5s with periodic re-checks for content arrival.
+        await page.evaluate(() => {
+          try { window.scrollTo(0, document.body.scrollHeight); } catch (_) {}
+          try { window.scrollTo(0, 0); } catch (_) {}
+        }).catch(() => null);
+        await new Promise((r) => setTimeout(r, 2500));
+
+        // Try clicking "Tout télécharger" / "Download all" — many
+        // awsolutions.fr Documents steps expose a bulk-download
+        // button that streams a ZIP of all files. Faster than
+        // per-file clicks if it works.
+        const bulkClicked = await page.evaluate(() => {
+          const RE = /\b(tout\s+t[ée]l[ée]charger|t[ée]l[ée]charger\s+tout|t[ée]l[ée]charger\s+le\s+dossier|download\s+all|t[ée]l[ée]charger\s+les?\s+documents?)\b/i;
+          const cands = Array.from(document.querySelectorAll(
+            'button, a, [role="button"], input[type="submit"]'
+          ));
+          for (const el of cands) {
+            if (el.disabled) continue;
+            if (el.offsetParent === null) continue;
+            const text = (el.innerText || el.value || el.textContent || '').trim();
+            if (text && RE.test(text) && text.length < 80) {
+              try { el.scrollIntoView({ block: 'center' }); el.click(); return text.slice(0, 50); } catch (_) {}
+            }
+          }
+          // Also check aria-label / title for icon-only download buttons
+          const iconCands = Array.from(document.querySelectorAll(
+            'button[aria-label], a[aria-label], [role="button"][aria-label], button[title], a[title]'
+          ));
+          for (const el of iconCands) {
+            if (el.disabled || el.offsetParent === null) continue;
+            const lbl = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+            if (lbl && RE.test(lbl)) {
+              try { el.scrollIntoView({ block: 'center' }); el.click(); return `aria:${lbl.slice(0, 50)}`; } catch (_) {}
+            }
+          }
+          return null;
+        }).catch(() => null);
+        if (bulkClicked) {
+          console.log(`    🇫🇷 marches-publics.info: clicked bulk download ("${bulkClicked}") — waiting for response`);
+          // Bulk download usually returns a ZIP via a separate response.
+          // We don't capture it here (no response interception set up),
+          // but the click may also expand the file list. Re-capture state.
+          await new Promise((r) => setTimeout(r, 2500));
+        }
+
+        // RE-CAPTURE stepState — now with files (hopefully) populated.
+        const enrichedState = await page.evaluate(() => {
+          const anchors = Array.from(document.querySelectorAll('a[href]'));
+          const docAnchors = anchors.filter((a) => {
+            const href = (a.getAttribute('href') || '').toLowerCase();
+            const text = (a.innerText || a.textContent || '').trim();
+            return (
+              /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:\?|#|$)/i.test(href) ||
+              /\b(t[ée]l[ée]charger|download)\b/i.test(text) ||
+              /(?:^|\/)(?:download|t[ée]l[ée]chargement|file|fichier|telecharger)[^/]*$/i.test(href)
+            );
+          });
+          const FILENAME_RE = /([A-Za-z0-9_\-. ]{4,80}\.(?:pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods))/gi;
+          // BROADER container set — also include table rows (some
+          // awsolutions deployments render files as MuiTable), grid items,
+          // and depot-specific class names.
+          const muiFiles = [];
+          const seenNames = new Set();
+          const containers = document.querySelectorAll(
+            '.MuiListItem-root, .MuiCard-root, .MuiTableRow-root, .MuiGrid-item, ' +
+            '[role="listitem"], [role="row"], li, tr, ' +
+            '[class*="document"], [class*="Document"], [class*="file" i], ' +
+            '[class*="depot"], [class*="depot-document"], [data-document-id], [data-file-id]'
+          );
+          for (const c of containers) {
+            const t = (c.innerText || c.textContent || '').trim();
+            if (!t || t.length > 1200) continue;
+            FILENAME_RE.lastIndex = 0;
+            let m;
+            while ((m = FILENAME_RE.exec(t)) !== null) {
+              const name = m[1].trim();
+              const key = name.toLowerCase();
+              if (seenNames.has(key)) continue;
+              seenNames.add(key);
+              muiFiles.push({ name });
+              if (muiFiles.length >= 40) break;
+            }
+            if (muiFiles.length >= 40) break;
+          }
+          // BROADER mainText capture — concatenate all major content
+          // containers (in case the page has multiple sections).
+          const mainSelectors = [
+            'main', '[role="main"]', '.depot-content', '.MuiContainer-root',
+            '.MuiPaper-root', '.depot-step-content', '#content', '.content',
+          ];
+          let mainText = '';
+          for (const sel of mainSelectors) {
+            const nodes = document.querySelectorAll(sel);
+            for (const n of nodes) {
+              const t = (n.innerText || '').replace(/\s+/g, ' ').trim();
+              if (t.length > 200 && !mainText.includes(t.slice(0, 100))) {
+                mainText += (mainText ? '\n\n' : '') + t;
+              }
+            }
+          }
+          if (!mainText) {
+            mainText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+          }
+          return {
+            url: location.href,
+            docAnchorCount: docAnchors.length,
+            muiFiles,
+            mainText: mainText.slice(0, 60000),
+          };
+        }).catch(() => null);
+
+        if (enrichedState) {
+          console.log(
+            `    🇫🇷 marches-publics.info: post-wait re-capture: docAnchors=${enrichedState.docAnchorCount}, MUI files=${enrichedState.muiFiles.length}, mainText=${enrichedState.mainText.length}ch`
+          );
+          page._mpiDocStepCache = enrichedState;
+        } else {
+          page._mpiDocStepCache = stepState;
+        }
         break;
       }
 
