@@ -6760,20 +6760,97 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
         const docAnchors = anchors.filter((a) => {
           const href = (a.getAttribute('href') || '').toLowerCase();
           const text = (a.innerText || a.textContent || '').trim();
-          // Match downloadable patterns OR download-like text
           return (
             /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:\?|#|$)/i.test(href) ||
             /\b(t[ée]l[ée]charger|download)\b/i.test(text) ||
             /(?:^|\/)(?:download|t[ée]l[ée]chargement|file|fichier|telecharger)[^/]*$/i.test(href)
           );
         });
-        // Detect step indicators (e.g., "5 - Documents" / "3 - Documents")
         const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ');
         const stepLabels = bodyText.match(/\b[1-6]\s*-\s*(?:CGU|Lots|Documents|R[eé]pondants|Questionnaires|R[eé]capitulatif)\b/gi) || [];
+
+        // Detect ACTIVE step via MUI Stepper. MUI uses
+        // .MuiStepLabel-active class on the current step's label, OR
+        // aria-current="step", OR a parent with role="presentation" and
+        // text matching. Fallback to "active" class on any step element.
+        let activeStep = '';
+        const activeCandidates = Array.from(document.querySelectorAll(
+          '.MuiStepLabel-active, .MuiStepLabel-root.active, [aria-current="step"], .step.active, .stepper-step.active, [class*="step"][class*="active"]'
+        ));
+        for (const el of activeCandidates) {
+          const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (t && t.length < 60) { activeStep = t; break; }
+        }
+        // Fallback: regex match "X - Documents" in body where X is large
+        // enough to suggest we're past CGU
+        if (!activeStep) {
+          const matchActive = bodyText.match(/\b([1-6])\s*-\s*(CGU|Lots|Documents|R[eé]pondants|Questionnaires|R[eé]capitulatif)\b/g);
+          if (matchActive && matchActive.length) {
+            activeStep = matchActive[matchActive.length - 1]; // last = current usually
+          }
+        }
+        const isDocumentsStep = /documents/i.test(activeStep) ||
+                                 /t[ée]l[ée]charger\s+(?:tous|toutes|le\s+dossier|les\s+documents)/i.test(bodyText) ||
+                                 /dossier\s+de\s+consultation/i.test(bodyText.slice(0, 4000));
+
+        // MUI-aware file detection — files often rendered as list items
+        // with download icon buttons (not <a href>). Look for filename-
+        // like text in list/card structures.
+        const FILENAME_RE = /([A-Za-z0-9_\-. ]{4,80}\.(?:pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods))/gi;
+        const muiFiles = [];
+        const seenNames = new Set();
+        const containers = document.querySelectorAll(
+          '.MuiListItem-root, .MuiCard-root, [role="listitem"], li, tr, [class*="document"], [class*="file"], [class*="depot-document"]'
+        );
+        for (const c of containers) {
+          const t = (c.innerText || c.textContent || '').trim();
+          if (!t || t.length > 800) continue;
+          // Look for explicit filename in the container
+          FILENAME_RE.lastIndex = 0;
+          let m;
+          while ((m = FILENAME_RE.exec(t)) !== null) {
+            const name = m[1].trim();
+            const key = name.toLowerCase();
+            if (seenNames.has(key)) continue;
+            seenNames.add(key);
+            // Find an associated click target (download button) inside
+            const dlBtn = c.querySelector('button, a, [role="button"], [data-testid*="download"], [aria-label*="télécharger" i], [aria-label*="download" i]');
+            muiFiles.push({
+              name,
+              hasDownloadBtn: !!dlBtn,
+              btnAriaLabel: dlBtn?.getAttribute('aria-label') || '',
+            });
+            if (muiFiles.length >= 30) break;
+          }
+          if (muiFiles.length >= 30) break;
+        }
+
+        // Also extract the visible body of the wizard's main content
+        // area (excluding nav/header/footer chrome). This captures
+        // qualification + award + lot descriptions that awsolutions.fr
+        // renders directly into the page even without files.
+        const mainSelectors = [
+          'main', '[role="main"]', '.depot-content', '.MuiContainer-root',
+          '#content', '.content',
+        ];
+        let mainText = '';
+        for (const sel of mainSelectors) {
+          const m2 = document.querySelector(sel);
+          if (m2) {
+            const t = (m2.innerText || '').replace(/\s+/g, ' ').trim();
+            if (t.length > mainText.length) mainText = t;
+          }
+        }
+        if (!mainText) mainText = bodyText;
+
         return {
           url: location.href,
           docAnchorCount: docAnchors.length,
           stepLabels: stepLabels.slice(0, 6),
+          activeStep,
+          isDocumentsStep,
+          muiFiles,
+          mainText: mainText.slice(0, 30000),
           firstDocTexts: docAnchors.slice(0, 4).map((a) => (a.innerText || a.textContent || '').trim().slice(0, 60)),
         };
       }).catch(() => null);
@@ -6785,16 +6862,26 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
       lastStepUrl = stepState.url;
       console.log(
         `    🇫🇷 marches-publics.info step ${step}: url=${(stepState.url || '').slice(-70)} ` +
-        `docAnchors=${stepState.docAnchorCount} ` +
+        `docAnchors=${stepState.docAnchorCount} muiFiles=${(stepState.muiFiles || []).length} ` +
+        `active="${(stepState.activeStep || '').slice(0, 40)}" ` +
         `steps=[${(stepState.stepLabels || []).join(' | ')}]`
       );
 
-      // Heuristic: if we see ≥2 downloadable anchors with file extensions,
-      // assume we're on Documents step. (1 anchor could be a "User
-      // guide" howto; ≥2 means the actual tender PDFs are loaded.)
-      if (stepState.docAnchorCount >= 2) {
-        console.log(`    🇫🇷 marches-publics.info: reached Documents step (${stepState.docAnchorCount} anchors visible)`);
+      // Reached Documents step — either by classic anchor count, by
+      // active-step indicator, OR by MUI file-list detection.
+      if (stepState.docAnchorCount >= 2 ||
+          stepState.isDocumentsStep ||
+          (stepState.muiFiles && stepState.muiFiles.length >= 1)) {
+        console.log(
+          `    🇫🇷 marches-publics.info: reached Documents step ` +
+          `(anchors=${stepState.docAnchorCount}, MUI files=${(stepState.muiFiles || []).length}, ` +
+          `active="${(stepState.activeStep || '').slice(0, 40)}")`
+        );
         reachedDocsStep = true;
+        // Cache the captured state for harvesting after the loop
+        // (mainText + muiFiles will feed the fallback content extractor
+        // if anchor-based fetch comes up empty).
+        page._mpiDocStepCache = stepState;
         break;
       }
 
@@ -6983,6 +7070,25 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
     }
 
     if (!reachedDocsStep) {
+      // Even if we didn't formally reach Documents, but Suivant became
+      // disabled mid-walk (e.g., on the LAST content-bearing step where
+      // there's nothing to advance to), the cached page state may still
+      // hold useful body text — qualifications + award criteria are
+      // often rendered as plain HTML on every wizard step. Try to
+      // capture mainText from the current page as a last-resort
+      // fallback before giving up.
+      try {
+        const fallback = await page.evaluate(() => {
+          const body = (document.body?.innerText || '').replace(/\s+/g, ' ');
+          // Heuristic — does the body contain qualification/award language?
+          const hasQualLang = /(qualifications?|crit[èe]res?\s+de\s+(?:s[ée]lection|jugement|attribution)|cahier\s+des\s+(?:clauses|charges)|r[èe]glement\s+de\s+(?:la\s+)?consultation|CCAP|CCTP|candidatures?|DUME|DC[12])/i.test(body);
+          return hasQualLang ? body.slice(0, 25000) : '';
+        }).catch(() => '');
+        if (fallback && fallback.length > 500) {
+          console.log(`    🇫🇷 marches-publics.info: wizard walk incomplete but extracted ${fallback.length}ch fallback content (qualifications/criteria language detected)`);
+          return [`--- (marches-publics.info wizard fallback) ---\n${fallback}`];
+        }
+      } catch (_) {}
       console.log(`    ⚠️  marches-publics.info: wizard walk ended without reaching Documents step (last URL: ${lastStepUrl.slice(-80)})`);
       return [];
     }
@@ -7017,7 +7123,28 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
     }).catch(() => []);
 
     if (!docs.length) {
-      console.log(`    ⚠️  marches-publics.info: Documents step reached but no doc anchors extracted`);
+      // No <a href> anchors — try the cached MUI-aware state from the
+      // wizard walk. awsolutions.fr renders the Documents step as
+      // .MuiListItem-root cards with onClick handlers (not links); we
+      // can't fetch the files directly without their internal IDs, but
+      // we CAN extract the filenames + visible body text for AI context.
+      const cache = page._mpiDocStepCache;
+      const muiFiles = cache?.muiFiles || [];
+      const mainText = cache?.mainText || '';
+      if (mainText || muiFiles.length) {
+        console.log(`    🇫🇷 marches-publics.info: no doc anchors but cached MUI state — ${muiFiles.length} file(s) listed, ${mainText.length}ch body text`);
+        const out = [];
+        if (muiFiles.length) {
+          out.push(`--- (marches-publics.info MUI file list) ---`);
+          out.push(muiFiles.map((f) => `• ${f.name}`).join('\n'));
+        }
+        if (mainText) {
+          out.push(`--- (marches-publics.info Documents page content) ---`);
+          out.push(mainText);
+        }
+        return [out.join('\n\n')];
+      }
+      console.log(`    ⚠️  marches-publics.info: Documents step reached but no doc anchors or MUI content extracted`);
       return [];
     }
     console.log(`    🇫🇷 marches-publics.info: collected ${docs.length} doc anchor(s)`);
