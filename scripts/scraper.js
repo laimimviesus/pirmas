@@ -705,6 +705,18 @@ async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperat
 // Reset to null at the start of each tender's AI section.
 let _lastAiNonRetryableError = null;
 
+// Companion flag: set when the CRITICAL extractFieldsWithAI() call fails
+// for ANY reason — including 429/529 "exhausted retries" from transient
+// Anthropic overload. Unlike _lastAiNonRetryableError, this does NOT trip
+// the global circuit breaker (next tender may succeed once load eases),
+// but it DOES cause the current tender to be deferred — otherwise the
+// row lands in the sheet with empty requirements/qualifications/criteria
+// and raw HTML in scope, and the tenderId-dedup logic prevents the next
+// run from ever re-processing it. Observed pattern (2026-05-19): eu-supply
+// + marches-publics tenders with all AI-filled columns blank.
+// Reset to null at the start of each tender's AI section.
+let _lastAiExtractionFailure = null;
+
 // Global circuit breaker. Once any AI call hits a non-retryable error, this
 // trips and ALL subsequent callClaude() invocations short-circuit before
 // touching the network or the rate limiter. Saves wall-clock time during
@@ -907,6 +919,11 @@ async function extractFieldsWithAI(text, meta = {}) {
     };
   } catch (e) {
     _markAiFailure(e);
+    // Always set extraction-failure flag — covers 429/529 "exhausted retries"
+    // (overload) which _isAiNonRetryable() classifies as retryable but in
+    // practice still leaves the tender with no extracted fields. The per-
+    // tender loop checks this flag and defers row-write so we re-try next run.
+    _lastAiExtractionFailure = String(e && e.message || 'unknown').slice(0, 200);
     console.log(`    ⚠️ AI extract failed: ${e.message.slice(0, 160)}`);
     return {};
   }
@@ -7124,71 +7141,113 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     }, { timeout: 10000 }).catch(() => null);
     await new Promise((r) => setTimeout(r, 2000));
 
-    // 2026-05-19 — my.mercell.com logon detection + login.
+    // 2026-05-19 — my.mercell.com logon detection + SSO Login click.
     //
     // The classic ASP.NET Tender.aspx redirects anonymous visitors to
-    // /en/m/logon/?ReturnUrl=/m/mts/Tender.aspx?id=<id>. Our initial
-    // Mercell login was on ums-lambda-authentication-service.platform.app
-    // .mercell.com — that may not set cookies for my.mercell.com (separate
-    // subdomain with its own classic ASP.NET auth).
+    // /en/m/logon/default.aspx?ReturnUrl=/m/mts/Tender.aspx?id=<id>.
     //
-    // Detect logon redirect → fill Monika's credentials → submit →
-    // return to Tender.aspx with active session.
+    // MODERN MERCELL FLOW (2026): the logon page is SSO-ONLY — no
+    // email/password form. Only visible anchor is "SSO Login" which
+    // points to /m/logon/SsoLogOn.aspx?ReturnUrl=... → that handler
+    // delegates auth to the same ums-lambda-authentication-service.
+    // platform.app.mercell.com endpoint we already logged into at
+    // scraper start (Monika's session). So clicking "SSO Login" should
+    // round-trip auth and land us back on Tender.aspx with cookies set.
+    //
+    // Fallback: if SSO anchor isn't present (older Mercell deployments),
+    // try classic email/password form (kept for backward compatibility).
     {
       const curUrl = page.url();
-      if (/\/m\/logon\/?/i.test(curUrl) || /logon\.aspx/i.test(curUrl)) {
-        console.log(`    🟦 mercell-tender: detected my.mercell.com logon page — submitting credentials`);
-        const username = process.env.MERCELL_USERNAME || '';
-        const password = process.env.MERCELL_PASSWORD || '';
-        if (!username || !password) {
-          console.log(`    ⚠️  mercell-tender: no MERCELL_USERNAME/PASSWORD env — cannot login to my.mercell.com`);
+      const onLogon = /\/m\/logon\/?/i.test(curUrl) || /logon\.aspx/i.test(curUrl);
+      if (onLogon) {
+        console.log(`    🟦 mercell-tender: detected my.mercell.com logon page`);
+
+        // ─── Path A: SSO Login anchor (modern flow) ──────────────────
+        const ssoClicked = await page.evaluate(() => {
+          // Match by href pattern (most reliable — survives label changes)
+          const ssoAnchor = document.querySelector('a[href*="SsoLogOn"]')
+            || document.querySelector('a[href*="SsoLogon"]')
+            || document.querySelector('a[href*="ssologon"i]')
+            // Text-based fallback
+            || Array.from(document.querySelectorAll('a[href]')).find((a) => {
+                const t = (a.innerText || a.textContent || '').trim();
+                return /^\s*sso\s*log\s*in\s*$/i.test(t)
+                    || /^\s*single\s*sign-?on\s*$/i.test(t);
+              });
+          if (!ssoAnchor) return null;
+          try {
+            ssoAnchor.scrollIntoView({ block: 'center' });
+            ssoAnchor.click();
+            return ssoAnchor.href || ssoAnchor.innerText || 'SSO Login';
+          } catch (e) {
+            return { error: String(e).slice(0, 80) };
+          }
+        }).catch(() => null);
+
+        if (ssoClicked && typeof ssoClicked === 'string') {
+          console.log(`    🟦 mercell-tender: clicked SSO Login anchor — waiting for auth round-trip`);
+          // SSO bounce: my.mercell → ums-lambda-auth → my.mercell.
+          // Multiple navigations may occur. Give it generous wait.
+          await Promise.race([
+            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null),
+            new Promise((r) => setTimeout(r, 8000)),
+          ]);
+          // Sometimes SSO triggers a second redirect to the actual
+          // Tender.aspx — wait for that too.
+          await new Promise((r) => setTimeout(r, 2000));
+          console.log(`    🟦 mercell-tender: post-SSO URL: ${page.url().slice(0, 110)}`);
         } else {
-          const loggedIn = await page.evaluate((u, p) => {
-            const allInputs = Array.from(document.querySelectorAll('input'));
-            const visible = (el) => el && el.offsetParent !== null;
-            // Find email/username field — Mercell classic uses ASP.NET
-            // ctl00$main$tbUsername / tbEmail / tbLogin name patterns.
-            const userInput = allInputs.find((i) =>
-              visible(i) && /^(email|text)$/i.test(i.type) &&
-              /(email|user|login)/i.test((i.name || '') + ' ' + (i.id || '') + ' ' + (i.placeholder || ''))
-            ) || allInputs.find((i) => visible(i) && i.type === 'email');
-            const passInput = allInputs.find((i) => visible(i) && i.type === 'password');
-            if (!userInput || !passInput) return { ok: false, reason: 'no-fields' };
-            try {
-              userInput.focus();
-              userInput.value = u;
-              userInput.dispatchEvent(new Event('input', { bubbles: true }));
-              userInput.dispatchEvent(new Event('change', { bubbles: true }));
-              passInput.focus();
-              passInput.value = p;
-              passInput.dispatchEvent(new Event('input', { bubbles: true }));
-              passInput.dispatchEvent(new Event('change', { bubbles: true }));
-            } catch (e) {
-              return { ok: false, reason: 'fill-error', err: String(e).slice(0, 80) };
-            }
-            // Find submit button (Sign in / Logg på / Log på / etc.)
-            const submitBtn = Array.from(document.querySelectorAll(
-              'input[type="submit"], button[type="submit"], button'
-            )).find((b) => {
-              if (b.disabled || b.offsetParent === null) return false;
-              const t = (b.value || b.innerText || '').trim().toLowerCase();
-              return /^(sign\s*in|log\s*in|logg?\s*på|login|inloggen|kirjaudu)/i.test(t)
-                  || /(ctl00.*btnLogin|ctl00.*btnSignIn|btnLogon)/i.test(b.name || b.id || '');
-            });
-            if (!submitBtn) return { ok: false, reason: 'no-submit' };
-            try { submitBtn.click(); return { ok: true, button: submitBtn.value || submitBtn.innerText }; }
-            catch (e) { return { ok: false, reason: 'click-error', err: String(e).slice(0, 80) }; }
-          }, username, password).catch((e) => ({ ok: false, reason: 'evaluate-error', err: String(e).slice(0, 80) }));
-          if (loggedIn && loggedIn.ok) {
-            console.log(`    🟦 mercell-tender: logon submitted ("${(loggedIn.button || '').slice(0, 30)}") — waiting for redirect`);
-            await Promise.race([
-              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null),
-              new Promise((r) => setTimeout(r, 5000)),
-            ]);
-            await new Promise((r) => setTimeout(r, 1500));
-            console.log(`    🟦 mercell-tender: post-login URL: ${page.url().slice(0, 100)}`);
+          // ─── Path B: classic email/password form (legacy fallback) ─
+          console.log(`    🟦 mercell-tender: no SSO anchor — trying classic email/password form`);
+          const username = process.env.MERCELL_USERNAME || '';
+          const password = process.env.MERCELL_PASSWORD || '';
+          if (!username || !password) {
+            console.log(`    ⚠️  mercell-tender: no MERCELL_USERNAME/PASSWORD env — cannot login`);
           } else {
-            console.log(`    ⚠️  mercell-tender: logon submit failed (${loggedIn?.reason || '?'}${loggedIn?.err ? ', ' + loggedIn.err : ''})`);
+            const loggedIn = await page.evaluate((u, p) => {
+              const allInputs = Array.from(document.querySelectorAll('input'));
+              const visible = (el) => el && el.offsetParent !== null;
+              const userInput = allInputs.find((i) =>
+                visible(i) && /^(email|text)$/i.test(i.type) &&
+                /(email|user|login)/i.test((i.name || '') + ' ' + (i.id || '') + ' ' + (i.placeholder || ''))
+              ) || allInputs.find((i) => visible(i) && i.type === 'email');
+              const passInput = allInputs.find((i) => visible(i) && i.type === 'password');
+              if (!userInput || !passInput) return { ok: false, reason: 'no-fields' };
+              try {
+                userInput.focus();
+                userInput.value = u;
+                userInput.dispatchEvent(new Event('input', { bubbles: true }));
+                userInput.dispatchEvent(new Event('change', { bubbles: true }));
+                passInput.focus();
+                passInput.value = p;
+                passInput.dispatchEvent(new Event('input', { bubbles: true }));
+                passInput.dispatchEvent(new Event('change', { bubbles: true }));
+              } catch (e) {
+                return { ok: false, reason: 'fill-error', err: String(e).slice(0, 80) };
+              }
+              const submitBtn = Array.from(document.querySelectorAll(
+                'input[type="submit"], button[type="submit"], button'
+              )).find((b) => {
+                if (b.disabled || b.offsetParent === null) return false;
+                const t = (b.value || b.innerText || '').trim().toLowerCase();
+                return /^(sign\s*in|log\s*in|logg?\s*på|login|inloggen|kirjaudu)/i.test(t)
+                    || /(ctl00.*btnLogin|ctl00.*btnSignIn|btnLogon)/i.test(b.name || b.id || '');
+              });
+              if (!submitBtn) return { ok: false, reason: 'no-submit' };
+              try { submitBtn.click(); return { ok: true, button: submitBtn.value || submitBtn.innerText }; }
+              catch (e) { return { ok: false, reason: 'click-error', err: String(e).slice(0, 80) }; }
+            }, username, password).catch((e) => ({ ok: false, reason: 'evaluate-error', err: String(e).slice(0, 80) }));
+            if (loggedIn && loggedIn.ok) {
+              console.log(`    🟦 mercell-tender: logon submitted ("${(loggedIn.button || '').slice(0, 30)}") — waiting for redirect`);
+              await Promise.race([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null),
+                new Promise((r) => setTimeout(r, 5000)),
+              ]);
+              await new Promise((r) => setTimeout(r, 1500));
+              console.log(`    🟦 mercell-tender: post-login URL: ${page.url().slice(0, 100)}`);
+            } else {
+              console.log(`    ⚠️  mercell-tender: classic login failed (${loggedIn?.reason || '?'}${loggedIn?.err ? ', ' + loggedIn.err : ''})`);
+            }
           }
         }
       }
@@ -12495,6 +12554,7 @@ async function runScraper() {
     const BUDGET_MIN_EUR = 500000;
     let budgetFilteredCount = 0;
     let contentFilteredCount = 0;
+    let aiDeferredCount = 0;
     const contentFilterCategories = {};
 
     for (let i = 0; i < toFetch.length; i++) {
@@ -12523,11 +12583,14 @@ async function runScraper() {
       }
 
       // --- AI ENRICHMENT (translate + extract missing fields) -------
-      // Reset the per-tender AI failure flag — _markAiFailure() will set it
-      // if any AI call hits a non-retryable error (HTTP 400 invalid_request,
-      // 401/403, "credit balance too low"). Checked below before row-write
-      // to DEFER the tender (skip pendingRows.push) so the next run retries.
+      // Reset the per-tender AI failure flags — _markAiFailure() will set
+      // _lastAiNonRetryableError if any AI call hits a non-retryable error
+      // (HTTP 400 invalid_request, 401/403, "credit balance too low").
+      // extractFieldsWithAI() also sets _lastAiExtractionFailure on ANY
+      // failure (including 429/529 exhausted retries). Both are checked
+      // below before row-write to DEFER the tender so the next run retries.
       _lastAiNonRetryableError = null;
+      _lastAiExtractionFailure = null;
       if (AI_ENABLED) {
         const dd = toFetch[i].details || {};
         const rawTitle = cleanDescription(dd.title || toFetch[i].title || '');
@@ -12704,7 +12767,24 @@ async function runScraper() {
       // (title translation, scope, requirements) would be blank/native-language
       // and once the tenderId is in the sheet it won't be retried.
       if (_lastAiNonRetryableError) {
-        console.log(`    ⏭️  deferring row — AI failure (will retry next run): ${_lastAiNonRetryableError}`);
+        aiDeferredCount++;
+        console.log(`    ⏭️  deferring row — AI non-retryable failure (will retry next run): ${_lastAiNonRetryableError}`);
+        await new Promise(r => setTimeout(r, 200));
+        continue;
+      }
+
+      // Defer-on-extraction-failure: if extractFieldsWithAI() bailed for
+      // ANY reason (429/529 exhausted retries during Anthropic overload,
+      // 500/502/503, JSON parse failure, transient timeout), the row's
+      // requirementsForSupplier / qualificationRequirements / offer criteria
+      // / English scope columns would all be blank and SCOPE would carry
+      // raw native-language description (sometimes with raw HTML tags).
+      // Skip pendingRows.push so the next scheduled run re-attempts this
+      // tender against a less-loaded Anthropic API. Observed pattern
+      // (2026-05-19): eu-supply + marches-publics empty rows.
+      if (_lastAiExtractionFailure) {
+        aiDeferredCount++;
+        console.log(`    ⏭️  deferring row — AI extraction failed (likely 429/529 overload; will retry next run): ${_lastAiExtractionFailure}`);
         await new Promise(r => setTimeout(r, 200));
         continue;
       }
@@ -12745,6 +12825,7 @@ async function runScraper() {
     console.log(`Rows appended: ${totalAppended}`);
     console.log(`Budget-filtered (<500K EUR): ${budgetFilteredCount}`);
     console.log(`Content-filtered (poor fit):  ${contentFilteredCount}`);
+    console.log(`AI-deferred (retry next run): ${aiDeferredCount}`);
     if (contentFilteredCount > 0) {
       const breakdown = Object.entries(contentFilterCategories)
         .sort((a, b) => b[1] - a[1])
