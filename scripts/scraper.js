@@ -9102,10 +9102,23 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
           if (!ext) continue; // skip if we can't even guess an extension
           if (seen.has(abs)) continue;
           seen.add(abs);
+          // Mark VMP/Vergabe bulk-download anchors as priority. German
+          // procurement platforms (dtvp.de, evergabe.nrw.de, vergabe.metropoleruhr.de,
+          // and many other VMP/Healy Hudson installations) bundle the
+          // ENTIRE Vergabeunterlagen into a single "Alle Dokumente als
+          // ZIP-Datei herunterladen" link. A 2-4 MB ZIP commonly extracts
+          // to 200-500K of concatenated PDF/DOCX text — far over the
+          // default 30K per-file cap. Marking as priority bumps the cap
+          // to 150K (and the total cap to 180K via hasPriority).
+          const isBulkZip = ext === 'zip' && (
+            /alle\s+dokumente|vergabeunterlagen|dokumente\s+als\s+zip|zip-datei|gesamtdokumente|gesamtpaket/i.test(linkText) ||
+            /alledokumente|vergabeunterlagen|bulk|zipdownload|gesamtdownload/i.test(abs)
+          );
           out.push({
             url: abs,
             name: linkText || abs.split('/').pop() || `source-file.${ext}`,
             ext,
+            priority: isBulkZip || undefined,
           });
           if (out.length >= 20) break;
         }
