@@ -148,6 +148,13 @@ try {
 // credentials via the aliased host instead.
 const PORTAL_HOST_ALIASES = {
   'tarjouspalvelu.fi': 'cloudia.net',
+  // Bavaria DEVA — public-facing front-end is evergabe.bayern.de but the
+  // user-facing login (and the redirect target after clicking through
+  // the supplier deeplink) lives on auftraege.bayern.de. User registered
+  // the account at auftraege.bayern.de 2026-05-20; alias the front-end
+  // so credentials look-up by source-host hits the same cred entry
+  // regardless of which DEVA URL Mercell handed us.
+  'evergabe.bayern.de': 'auftraege.bayern.de',
 };
 function getPortalCreds(hostOrUrl) {
   if (!hostOrUrl || !_portalCreds || !Object.keys(_portalCreds).length) return null;
@@ -210,6 +217,27 @@ const ALWAYS_LOGIN_HOSTS = [
   // summary renders successfully (and thus is not flagged login-gated
   // by default heuristics), we still force login to reach the docs.
   'evergabe-online.de',
+  // evergabe.de (Healy Hudson) — German national procurement portal.
+  // Anonymous /unterlagen/<uuid>/zustellwege landing page renders a small
+  // shell ("Lizenzen und Support One Identity ... Am Vergabeverfahren
+  // teilnehmen ... Der Auftraggeber wird sofort automatisch informiert")
+  // with NO downloadable Vergabeunterlagen visible without login. User
+  // registered an account 2026-05-20 and added creds to PORTAL_CREDS_JSON.
+  // Force login here so we reach the post-registration Vergabeunterlagen
+  // download (typically a ZIP bundle reachable via the "Vergabeunterlagen
+  // herunterladen" anchor on the authenticated page).
+  'evergabe.de',
+  // auftraege.bayern.de (DEVA — Bavaria) — Mercell hands us a deeplink at
+  // evergabe.bayern.de/evergabe.bieter/api/supplier/external/deeplink/sub/<id>
+  // which redirects to auftraege.bayern.de. The anonymous DEVA shell shows
+  // only "Anmelden / Vorteile für angemeldete Unternehmen / Laden Sie
+  // Vergabeunterlagen gesammelt als zip-Container herunter" — the ZIP IS
+  // there but login-gated. User registered 2026-05-20. Both hosts in
+  // ALWAYS_LOGIN_HOSTS for safety: source hostname is sometimes captured
+  // as evergabe.bayern.de (pre-redirect) and sometimes as auftraege.bayern.de
+  // (post-redirect) depending on timing.
+  'auftraege.bayern.de',
+  'evergabe.bayern.de',
   // dtvp.de — REMOVED 2026-05-14 (briefly added then reverted same day).
   //
   // The Germany run revealed two facts that make forced-login a NET
