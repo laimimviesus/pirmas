@@ -12653,6 +12653,10 @@ async function runScraper() {
       'Austria', 'Belgium', 'Estonia', 'France', 'Germany',
       'Liechtenstein', 'Luxembourg', 'Portugal', 'Spain',
       'Switzerland', 'United Kingdom',
+      // 2026-05-25 — Lithuania added per user request. Mercell index
+      // covers viesiejipirkimai.lt + CVPP notices for Lithuanian buyers;
+      // creds for viesiejipirkimai.lt are already in PORTAL_CREDS_JSON.
+      'Lithuania',
     ];
 
     await clickButtonContainsText(page, 'Search & Filters');
@@ -13046,10 +13050,27 @@ async function runScraper() {
     ];
 
     let existingIds = new Set();
+    // 2026-05-25 — secondary dedup axis. tenderId-based dedup misses the
+    // case where the SAME procurement is re-posted by Mercell with a NEW
+    // internal ID (notice corrections, status flips, cross-portal
+    // re-imports). Real-world: "2026/831 - Operation, support, maintenance,
+    // development and hosting of Building for all" landed twice in May 2026.
+    // We also dedupe by normalized ORIGINAL-language title (column E),
+    // which stays stable across Mercell ID changes.
+    let existingTitles = new Set();
+    const normalizeTitleKey = (s) => String(s || '')
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .replace(/[^\w\s\-\/.()&äöüßñçéèêáíóúîôûàèìòùøæåäöüõőűąčęėįšųūžćłńóśźżďěňřťůý]/g, '')
+      .trim()
+      .slice(0, 240);
     try {
       const existing = await sheets.spreadsheets.values.get({
         spreadsheetId: SHEET_ID,
-        range: `${TAB_NAME}!A1:Q`,
+        // Read full row width — we now need columns C (link) and E
+        // (original title) for dedup, plus we may extend further in
+        // future without re-touching this range.
+        range: `${TAB_NAME}!A1:S`,
       });
       const rows = existing.data.values || [];
       const hasHeader = rows[0] && rows[0][0] === SHEET_HEADERS[0];
@@ -13065,17 +13086,48 @@ async function runScraper() {
       }
 
       for (let i = hasHeader ? 1 : 0; i < rows.length; i++) {
+        // Column C (index 2) = primary LINK; column O (index 14) was
+        // historical Source URL position before the schema swap.
         const link = rows[i][2] || rows[i][14] || '';
         const id = extractTenderId(link);
         if (id) existingIds.add(id);
+        // Column E (index 4) = TENDER NAME (Original) post-Task #55 swap.
+        // Also accept column D (English title) as a defensive fallback —
+        // legacy rows from before the col D/E swap may still have the
+        // original-language title sitting in column D.
+        const origTitle = rows[i][4] || '';
+        const altTitle  = rows[i][3] || '';
+        for (const t of [origTitle, altTitle]) {
+          const key = normalizeTitleKey(t);
+          if (key.length >= 8) existingTitles.add(key);
+        }
       }
-      console.log(`Existing tender IDs in sheet: ${existingIds.size}`);
+      console.log(`Existing tender IDs in sheet: ${existingIds.size}; unique titles: ${existingTitles.size}`);
     } catch (e) {
       console.log('WARN: could not read existing sheet:', e.message);
     }
 
-    const newTenders = allTenders.filter(t => !existingIds.has(t.tenderId));
-    console.log(`New tenders: ${newTenders.length} (${allTenders.length - newTenders.length} already in sheet)`);
+    // Apply BOTH dedup checks. tenderId catches same-URL revisits (cheap +
+    // unambiguous); title-key catches re-posts with new IDs. We log which
+    // path each skip took for auditability.
+    let skippedById = 0, skippedByTitle = 0;
+    const newTenders = allTenders.filter((t) => {
+      if (existingIds.has(t.tenderId)) { skippedById++; return false; }
+      const titleKey = normalizeTitleKey(t.title || '');
+      if (titleKey.length >= 8 && existingTitles.has(titleKey)) {
+        skippedByTitle++;
+        return false;
+      }
+      // Add to existingTitles in-flight so duplicates WITHIN this run
+      // (e.g. same tender returned twice by search across paginated
+      // result sets) are also skipped.
+      if (titleKey.length >= 8) existingTitles.add(titleKey);
+      return true;
+    });
+    console.log(
+      `New tenders: ${newTenders.length} ` +
+      `(${skippedById} skipped by tenderId, ${skippedByTitle} skipped by title match)`
+    );
 
     // ---- FETCH DETAILS + INCREMENTAL APPEND ----
     // SVARBU: GitHub Actions job'as turi 6h cap. Per praėjusį pilną run'ą
@@ -13345,12 +13397,12 @@ async function runScraper() {
         reqOut,                                                  // K — REQUIREMENTS FOR SUPPLIER
         qualOut,                                                 // L — QUALIFICATION REQUIREMENTS
         critOut,                                                 // M — OFFER WEIGHING CRITERIA
-        scopeOrigOut,                                            // N — SCOPE OF AGREEMENT (original)
+        scopeOrigOut,                                            // N — SCOPE OF AGREEMENT
         d.technicalStack || '',                                  // O — TECHNICAL STACK
         d.sourceUrl || '',                                       // P — Source URL
         d.referenceNumber || t.tenderId || '',                   // Q — Reference number
-        keywords,                                                // R — KEYWORDS
-        scopeEnOut,                                              // S — Scope of agreement (EN)
+        keywords,                                                // R — Keywords
+        '',                                                      // S — Komentarai (user notes; left empty)
       ];
     };
 
