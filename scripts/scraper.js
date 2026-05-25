@@ -13367,12 +13367,26 @@ async function runScraper() {
       try {
         const res = await sheets.spreadsheets.values.append({
           spreadsheetId: SHEET_ID,
-          // 2026-05-17: expanded from A:Q (17 cols) to A:S (19 cols)
-          // to include EN-translated columns 18 (Tender name (EN))
-          // and 19 (Scope of agreement (EN)) — keeps col 4/13 free
-          // for the ORIGINAL-language title/scope as the sheet
-          // header expects.
-          range: `${TAB_NAME}!A:S`,
+          // 2026-05-25 — Range changed from A:S → A:A.
+          //
+          // Google's values.append API behaviour: with insertDataOption=
+          // INSERT_ROWS it searches the SUPPLIED range for an "existing
+          // table" and appends below it. With range=A:S, if any stray
+          // non-empty cell exists in columns B-S that belongs to a
+          // SEPARATE table (e.g. a notes block in P-S from manual edits
+          // or a previous shifted-write), Google's table-detection picks
+          // THAT block as the anchor instead of the main A-S table.
+          // Result: 2026-05-25 full run wrote 69 rows to P:AH columns
+          // because Google found a stale table fragment there inside
+          // the A:S search range.
+          //
+          // Restricting range to A:A forces Google to ONLY anchor on
+          // column A's last non-empty cell. The 19-value row payload is
+          // still written across A:S (the row data dictates width — the
+          // range only dictates where the START column is). Net effect:
+          // appends always begin at column A regardless of what's in
+          // columns B-AH.
+          range: `${TAB_NAME}!A:A`,
           valueInputOption: 'RAW',
           insertDataOption: 'INSERT_ROWS',
           requestBody: { values: batch },
