@@ -3304,83 +3304,251 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
       await new Promise((r) => setTimeout(r, 2500));
     }
 
-    // STEP 3 — capture frames (CVPP sometimes renders tender detail in
-    // an iframe loaded by the parent's JS).
+    // STEP 3 — extra settle. CVPP's listContractDocuments.do renders the
+    // document list via AJAX after the page shell loads — first attempt
+    // (2026-05-25) captured before XHR completed, so we add 3.5s on top
+    // of the prior 2.5s waits.
+    await new Promise((r) => setTimeout(r, 3500));
+    // Trigger any IntersectionObservers
+    await page.evaluate(() => {
+      try { window.scrollTo(0, document.body.scrollHeight); } catch (_) {}
+      try { window.scrollTo(0, 0); } catch (_) {}
+    }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 1000));
+
+    // STEP 4 — harvest document anchors. CVPP's confirmed pattern is:
+    //   <a href="#" onclick="addUser('8021340')">filename.docx</a>
+    // The visible text IS the filename. The numeric arg to addUser() is
+    // the document ID. The actual download URL must be inferred (CVPP
+    // typically uses /epps/cft/getDocument.do?id=X&resourceId=Y or
+    // similar). To avoid guessing the URL path, we INTERCEPT the
+    // network response triggered by clicking each anchor in-page and
+    // capture the binary directly.
     const frames = page.frames();
     const allDocs = [];
-    const seen = new Set();
 
-    const harvestFrom = async (frameOrPage, label) => {
-      const anchors = await frameOrPage.evaluate(() => {
-        const RX_DL_EXT = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:\?|#|$)/i;
-        const RX_DL_PATH = /downloadFile|displayFile|getFile|FileServlet|fileServlet|FileDownload|getResource|prepareDocuments|listFiles|downloadAttachment|attachment/i;
-        const RX_DL_TEXT = /\b(atsisi[ųu]sti|parsisi[ųu]sti|atidaryti|download)\b/i;
-        const out = [];
-        const seenLocal = new Set();
-        for (const a of Array.from(document.querySelectorAll('a[href]'))) {
-          const hrefRaw = a.getAttribute('href') || '';
-          if (!hrefRaw || /^javascript:/i.test(hrefRaw) || hrefRaw === '#') continue;
-          let abs;
-          try { abs = new URL(hrefRaw, location.href).toString(); } catch (_) { continue; }
-          if (seenLocal.has(abs)) continue;
-          const text = (a.innerText || a.textContent || '').trim();
-          const isDl = RX_DL_EXT.test(abs) || RX_DL_PATH.test(abs) || RX_DL_TEXT.test(text);
-          if (!isDl) continue;
-          seenLocal.add(abs);
-          const filenameMatch = text.match(/([\w\-. ]{4,80}\.(?:pdf|docx?|xlsx?|pptx?|zip|rtf))/i);
-          out.push({
-            url: abs,
-            text: text.slice(0, 200),
-            filename: filenameMatch ? filenameMatch[1] : (text || abs.split('/').pop()),
-          });
-          if (out.length >= 40) break;
-        }
-        return out;
-      }).catch(() => []);
+    const harvested = await page.evaluate(() => {
+      const RX_FILENAME = /([\wÀ-ſ\-. _()]{3,120}\.(?:pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods))/i;
+      // CVPP confirmed onclick function names (broad — also captures
+      // synonyms like downloadDocument, getDocument). Numeric arg is
+      // the document ID.
+      const RX_ONCLICK_FN = /^\s*(?:return\s+)?(addUser|downloadDocument|getDocument|viewDocument|showDocument|displayDocument|getFile|downloadFile)\s*\(\s*['"]?(\d{3,15})['"]?\s*[,)]/i;
+      const out = [];
+      const seen = new Set();
+      const anchors = Array.from(document.querySelectorAll('a[onclick]'));
       for (const a of anchors) {
-        if (seen.has(a.url)) continue;
-        seen.add(a.url);
-        a._frameLabel = label;
-        allDocs.push(a);
+        const onclick = (a.getAttribute('onclick') || '').trim();
+        const m = onclick.match(RX_ONCLICK_FN);
+        if (!m) continue;
+        const fnName = m[1];
+        const docId = m[2];
+        const text = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
+        const fnMatch = text.match(RX_FILENAME);
+        const filename = fnMatch ? fnMatch[1] : (text || `document-${docId}`);
+        const key = `${fnName}:${docId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+          docId,
+          fnName,
+          filename: filename.slice(0, 180),
+          text: text.slice(0, 200),
+          // We pass a CSS-friendly selector descriptor to find this anchor again later
+          onclickSig: onclick.slice(0, 100),
+        });
+        if (out.length >= 30) break;
       }
-    };
+      return out;
+    }).catch(() => []);
 
-    await harvestFrom(page, 'main');
-    for (let i = 0; i < frames.length; i++) {
-      const fr = frames[i];
-      if (fr === page.mainFrame()) continue;
-      try {
-        const frUrl = fr.url();
-        if (!/viesiejipirkimai\.lt/i.test(frUrl)) continue;
-        await harvestFrom(fr, `iframe[${i}]`);
-      } catch (_) {}
+    console.log(`    🇱🇹 viesiejipirkimai: ${harvested.length} doc anchor(s) found via onclick="addUser/..." pattern (resourceId=${resourceId})`);
+
+    if (harvested.length === 0) {
+      // No anchors via the addUser pattern — run the full diagnostic.
+    } else {
+      // For each found doc, click + intercept the binary response.
+      for (const d of harvested.slice(0, 6)) {
+        allDocs.push(d);
+      }
     }
 
+    // Click each detected doc, capture the resulting download. Wraps
+    // page.on('response') with a one-shot capture per click — CVPP's
+    // addUser() may either window.open() a new tab OR trigger a direct
+    // GET/POST. We watch the main page; if it's a popup we capture
+    // via target.page() and serialise its content.
+
+    const captured = new Map(); // docId -> { buf, url, contentType }
+
+    const isLikelyDocResponse = (url, ct) => {
+      const u = url.toLowerCase();
+      const c = (ct || '').toLowerCase();
+      const isEpps = /\/epps\//.test(u);
+      const isBinary = c.includes('application/pdf') ||
+                       c.includes('application/vnd.openxml') ||
+                       c.includes('application/msword') ||
+                       c.includes('application/vnd.ms-excel') ||
+                       c.includes('application/octet-stream') ||
+                       c.includes('application/zip') ||
+                       c.includes('application/x-zip-compressed') ||
+                       /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt)(\?|$)/i.test(u);
+      return isEpps && isBinary;
+    };
+
+    // Pre-attach a response listener that builds a recent-response cache
+    // we can consult after each click. (We use response on the page
+    // object — request-level interception would require setRequestInter-
+    // ception which conflicts with normal nav.)
+    let lastResponseAt = 0;
+    const responseCache = [];
+    const responseHandler = async (resp) => {
+      try {
+        const u = resp.url();
+        const ct = resp.headers()['content-type'] || '';
+        if (!isLikelyDocResponse(u, ct)) return;
+        // Skip the page navigation responses (HTML)
+        if (/text\/html/i.test(ct)) return;
+        const buf = await resp.buffer().catch(() => null);
+        if (!buf || buf.length < 500) return;
+        responseCache.push({ url: u, ct, buf, ts: Date.now() });
+        lastResponseAt = Date.now();
+      } catch (_) {}
+    };
+    page.on('response', responseHandler);
+
+    for (const d of allDocs.slice(0, 6)) {
+      const tStart = Date.now();
+      // Click the anchor in-page by docId match in onclick — more
+      // resilient than CSS selectors when class/id are missing.
+      const clicked = await page.evaluate((docId, fnName) => {
+        const anchors = Array.from(document.querySelectorAll('a[onclick]'));
+        for (const a of anchors) {
+          const oc = a.getAttribute('onclick') || '';
+          if (oc.includes(`'${docId}'`) || oc.includes(`"${docId}"`) || oc.includes(`(${docId})`)) {
+            try { a.scrollIntoView({ block: 'center' }); a.click(); return true; } catch (_) {}
+          }
+        }
+        return false;
+      }, d.docId, d.fnName).catch(() => false);
+
+      if (!clicked) {
+        console.log(`    ⚠️  viesiejipirkimai: failed to click doc id=${d.docId} "${d.filename}"`);
+        continue;
+      }
+      // Wait up to 8s for a response matching this click. Detect by
+      // a NEW responseCache entry since tStart.
+      const waitDeadline = tStart + 8000;
+      while (Date.now() < waitDeadline) {
+        await new Promise((r) => setTimeout(r, 500));
+        const fresh = responseCache.find((r) => r.ts >= tStart);
+        if (fresh) {
+          captured.set(d.docId, fresh);
+          break;
+        }
+      }
+      if (!captured.has(d.docId)) {
+        console.log(`    ⚠️  viesiejipirkimai: clicked id=${d.docId} but no binary response captured within 8s`);
+      }
+    }
+
+    page.off('response', responseHandler);
+
+    // Convert captured responses into doc objects with bytes inline,
+    // so the existing parse loop below can extract text.
+    for (const d of allDocs) {
+      const cap = captured.get(d.docId);
+      if (!cap) continue;
+      d.url = cap.url;
+      d._capturedBuf = cap.buf;
+      d._capturedCt = cap.ct;
+    }
+    // Drop docs without captured bytes (we have nothing to parse)
+    const usable = allDocs.filter((d) => d._capturedBuf);
+    allDocs.length = 0;
+    Array.prototype.push.apply(allDocs, usable);
+
     if (!allDocs.length) {
-      // Diagnostic dump — show first 20 anchors so we can refine.
-      const sample = await page.evaluate(() => {
-        return Array.from(document.querySelectorAll('a[href]'))
-          .filter((a) => a.offsetParent !== null)
-          .slice(0, 20)
+      // Enhanced diagnostic dump — show what's ACTUALLY on the page so
+      // we can refine selectors. Captures: current URL, total anchor
+      // count, top anchors, elements with onclick (likely doc triggers),
+      // table rows, iframes.
+      const diag = await page.evaluate(() => {
+        const visible = (el) => el && el.offsetParent !== null;
+        const anchors = Array.from(document.querySelectorAll('a[href], a[onclick]'))
+          .filter(visible)
+          .slice(0, 40)
           .map((a) => ({
-            text: (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
-            href: (a.getAttribute('href') || '').slice(0, 100),
+            text: (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+            href: (a.getAttribute('href') || '').slice(0, 120),
+            onclick: (a.getAttribute('onclick') || '').slice(0, 100),
           }));
-      }).catch(() => []);
+        const onclicks = Array.from(document.querySelectorAll('[onclick]:not(a)'))
+          .filter(visible)
+          .slice(0, 20)
+          .map((el) => ({
+            tag: el.tagName.toLowerCase(),
+            text: (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+            onclick: (el.getAttribute('onclick') || '').slice(0, 120),
+          }));
+        const tableRows = Array.from(document.querySelectorAll('tr'))
+          .filter(visible)
+          .slice(0, 15)
+          .map((tr) => (tr.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 120))
+          .filter((t) => t.length > 5);
+        const iframes = Array.from(document.querySelectorAll('iframe'))
+          .map((f) => ({
+            src: f.getAttribute('src') || '(no src)',
+            id: f.id || '',
+            width: f.width || '',
+            height: f.height || '',
+          }));
+        return {
+          url: location.href,
+          totalAnchors: document.querySelectorAll('a').length,
+          totalOnclicks: document.querySelectorAll('[onclick]').length,
+          anchors,
+          onclicks,
+          tableRows,
+          iframes,
+        };
+      }).catch(() => ({ anchors: [], onclicks: [], tableRows: [], iframes: [] }));
+
       console.log(`    ⚠️  viesiejipirkimai: 0 file anchors after click/dump (resourceId=${resourceId})`);
-      console.log(`       frames detected: ${frames.length} (mainFrame + ${frames.length - 1} sub)`);
-      for (const a of sample) {
-        console.log(`       a: "${a.text}" → ${a.href}`);
+      console.log(`       current URL: ${(diag.url || '').slice(-100)}`);
+      console.log(`       total: ${diag.totalAnchors} anchors, ${diag.totalOnclicks} onclick elements, ${diag.iframes?.length || 0} iframes, frames=${frames.length}`);
+      if (diag.iframes && diag.iframes.length) {
+        for (const f of diag.iframes) {
+          console.log(`       iframe[${f.id || '?'}] src="${(f.src || '').slice(0, 80)}"`);
+        }
+      }
+      console.log(`       top anchors (${diag.anchors.length}):`);
+      for (const a of diag.anchors.slice(0, 25)) {
+        const oc = a.onclick ? ` onclick="${a.onclick.slice(0, 50)}"` : '';
+        console.log(`         "${a.text}" → ${a.href}${oc}`);
+      }
+      if (diag.onclicks && diag.onclicks.length) {
+        console.log(`       non-anchor onclicks (${diag.onclicks.length}):`);
+        for (const o of diag.onclicks.slice(0, 15)) {
+          console.log(`         <${o.tag}> "${o.text}" onclick="${o.onclick}"`);
+        }
+      }
+      if (diag.tableRows && diag.tableRows.length) {
+        console.log(`       visible table rows (${diag.tableRows.length}):`);
+        for (const t of diag.tableRows) {
+          console.log(`         tr: "${t}"`);
+        }
       }
       return [];
     }
 
-    console.log(`    🇱🇹 viesiejipirkimai: ${allDocs.length} doc anchor(s) detected (resourceId=${resourceId})`);
+    console.log(`    🇱🇹 viesiejipirkimai: ${allDocs.length} doc(s) captured (resourceId=${resourceId})`);
     for (const d of allDocs.slice(0, 6)) {
-      console.log(`       doc: "${(d.filename || d.text).slice(0, 60)}"${d._frameLabel !== 'main' ? ` (${d._frameLabel})` : ''} → ${d.url.slice(0, 80)}`);
+      console.log(`       doc id=${d.docId} "${(d.filename || d.text).slice(0, 60)}" url=${(d.url || '').slice(-80)} bytes=${d._capturedBuf?.length || 0}`);
     }
 
-    // STEP 4 — download + parse. Reuse cookies from current browser context.
+    // STEP 5 — parse the captured binaries. We already have the bytes
+    // from the in-browser click + page.on('response') interceptor —
+    // no second fetch needed.
     let pdfParseLib = null, mammothLib = null, XLSXLib = null, AdmZipLib = null;
     try { pdfParseLib = require('pdf-parse'); } catch (_) {}
     try { mammothLib  = require('mammoth');   } catch (_) {}
@@ -3390,19 +3558,35 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
     const texts = [];
     const MAX_DOCS = 6;
     for (const doc of allDocs.slice(0, MAX_DOCS)) {
-      const labelName = (doc.filename || doc.text || doc.url.split('/').pop()).slice(0, 100);
-      const result = await page.evaluate(async (url) => {
-        try {
-          const r = await fetch(url, { credentials: 'include', redirect: 'follow' });
-          if (!r.ok) return { ok: false, status: r.status };
-          const ct = r.headers.get('content-type') || '';
-          const ab = await r.arrayBuffer();
-          return { ok: true, status: r.status, ct, url: r.url || url, data: Array.from(new Uint8Array(ab)) };
-        } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
-      }, doc.url).catch((e) => ({ ok: false, error: e.message }));
-
-      if (!result || !result.ok || !result.data || result.data.length < 500) {
-        console.log(`    ⚠️  viesiejipirkimai: fetch failed "${labelName.slice(0, 40)}" (status=${result?.status || '?'})`);
+      const labelName = (doc.filename || doc.text || `doc-${doc.docId}`).slice(0, 100);
+      // Use captured bytes (set by response interceptor above). Fall back
+      // to fetch() if for some reason the click didn't capture (e.g., the
+      // click opened a popup we couldn't trace).
+      let resultData = null;
+      let resultCt = '';
+      if (doc._capturedBuf) {
+        resultData = Array.from(doc._capturedBuf);
+        resultCt = doc._capturedCt || '';
+      } else {
+        const result = await page.evaluate(async (url) => {
+          try {
+            const r = await fetch(url, { credentials: 'include', redirect: 'follow' });
+            if (!r.ok) return { ok: false, status: r.status };
+            const ct = r.headers.get('content-type') || '';
+            const ab = await r.arrayBuffer();
+            return { ok: true, status: r.status, ct, url: r.url || url, data: Array.from(new Uint8Array(ab)) };
+          } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
+        }, doc.url).catch((e) => ({ ok: false, error: e.message }));
+        if (!result || !result.ok || !result.data || result.data.length < 500) {
+          console.log(`    ⚠️  viesiejipirkimai: fetch failed "${labelName.slice(0, 40)}" (status=${result?.status || '?'})`);
+          continue;
+        }
+        resultData = result.data;
+        resultCt = result.ct || '';
+      }
+      const result = { data: resultData, ct: resultCt };
+      if (!result.data || result.data.length < 500) {
+        console.log(`    ⚠️  viesiejipirkimai: empty/tiny content for "${labelName.slice(0, 40)}"`);
         continue;
       }
       const buf = Buffer.from(result.data);
