@@ -238,6 +238,15 @@ const ALWAYS_LOGIN_HOSTS = [
   // (post-redirect) depending on timing.
   'auftraege.bayern.de',
   'evergabe.bayern.de',
+  // viesiejipirkimai.lt (CVPP) — Lithuanian central public procurement
+  // portal. Anonymous /epps/cft/prepareViewCfTWS.do shows tender title
+  // and buyer info but hides documents behind "Rodyti pirkimo meniu"
+  // toggle that's gated by login. Authenticated /epps/cft/viewTenders.do
+  // requires session cookies. Force login on every viesiejipirkimai URL
+  // so the dedicated fetchViesiejiPirkimaiDocuments handler has auth to
+  // navigate the Dokumentai tab. User registered + creds in
+  // PORTAL_CREDS_JSON (key "viesiejipirkimai.lt") 2026-05-25.
+  'viesiejipirkimai.lt',
   // dtvp.de — REMOVED 2026-05-14 (briefly added then reverted same day).
   //
   // The Germany run revealed two facts that make forced-login a NET
@@ -3130,6 +3139,317 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
 //   5) Concatenate captured JSON + final rendered body
 //
 // Returns array of text snippets to merge into sourceFilesText.
+// =====================================================================
+// =====================================================================
+// fetchViesiejiPirkimaiDocuments
+// ---------------------------------------------------------------------
+// viesiejipirkimai.lt — CVPP (Centrinė viešųjų pirkimų informacinė
+// sistema, Lithuanian central public procurement portal). Two URL modes:
+//
+//   /epps/cft/prepareViewCfTWS.do?resourceId=X — anonymous summary
+//       Body shows tender title + buyer info, but documents are hidden
+//       behind a "Rodyti pirkimo meniu" toggle that expands a tab nav.
+//
+//   /epps/cft/viewTenders.do?resourceId=X — authenticated full view
+//       Requires login. Post-login navigation back to this URL often
+//       returns dashboard chrome rather than tender detail — we need
+//       to click "Dokumentai" / "Pirkimo dokumentai" in the side menu
+//       to reach the actual file list.
+//
+// Strategy: navigate, scroll, try clicking "Rodyti pirkimo meniu" if
+// present, then click any "Dokumentai" / "Documents" / "Pirkimo
+// dokumentai" tab/link, then harvest file anchors. Falls back to
+// diagnostic dump (top 20 anchor texts) when nothing matches — so we
+// can refine selectors over multiple runs.
+// =====================================================================
+async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
+  let resourceId = null;
+  try {
+    const u = new URL(sourceUrl);
+    if (!/(^|\.)viesiejipirkimai\.lt$/i.test(u.hostname)) return [];
+    if (!/\/epps\/cft\//i.test(u.pathname)) return [];
+    resourceId = u.searchParams.get('resourceId');
+    if (!resourceId) return [];
+  } catch (_) { return []; }
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(25000);
+    page.setDefaultTimeout(25000);
+    try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
+
+    await page.goto(sourceUrl, { waitUntil: 'networkidle2', timeout: 25000 }).catch((e) => {
+      console.log(`    🇱🇹 viesiejipirkimai: nav warn: ${(e.message || '').slice(0, 80)}`);
+    });
+    await new Promise((r) => setTimeout(r, 2500));
+
+    // STEP 1 — open the "Rodyti pirkimo meniu" Bootstrap dropdown.
+    //
+    // User-confirmed DOM (2026-05-25):
+    //   <button id="dropdownMenuButton" type="button"
+    //           class="btn btn-danger btn-sm dropdown-toggle"
+    //           data-toggle="dropdown"
+    //           aria-haspopup="true" aria-expanded="false">
+    //     <i class="fa fa-list"></i><span>Rodyti pirkimo meniu</span>
+    //   </button>
+    //
+    // After click → dropdown unfolds with item list; one item is
+    // "Pirkimo dokumentai" which navigates to the document-listing page.
+    const menuOpened = await page.evaluate(() => {
+      const btn = document.getElementById('dropdownMenuButton');
+      if (!btn) return null;
+      try {
+        btn.scrollIntoView({ block: 'center' });
+        btn.click();
+        return btn.getAttribute('aria-expanded') || 'clicked';
+      } catch (_) { return null; }
+    }).catch(() => null);
+    if (menuOpened) {
+      console.log(`    🇱🇹 viesiejipirkimai: opened #dropdownMenuButton (aria-expanded=${menuOpened})`);
+      await new Promise((r) => setTimeout(r, 1000));
+    } else {
+      // Fallback — search by visible text. Bootstrap may have re-rendered
+      // the button without the canonical ID.
+      const fb = await page.evaluate(() => {
+        const cands = Array.from(document.querySelectorAll('button, a'));
+        for (const el of cands) {
+          if (el.offsetParent === null) continue;
+          const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (/^\s*rodyti\s+pirkimo\s+meniu/i.test(t)) {
+            try { el.scrollIntoView({ block: 'center' }); el.click(); return t.slice(0, 60); } catch (_) {}
+          }
+        }
+        return null;
+      }).catch(() => null);
+      if (fb) {
+        console.log(`    🇱🇹 viesiejipirkimai: opened dropdown via text fallback "${fb}"`);
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+
+    // STEP 2 — click "Pirkimo dokumentai" from the now-open dropdown.
+    // This NAVIGATES to a new page (the document-listing route), so we
+    // wait for either navigation OR DOM update afterward.
+    const dropdownClicked = await page.evaluate(() => {
+      // Look in dropdown menus (Bootstrap renders a .dropdown-menu sibling
+      // when toggled), or anywhere if the dropdown class detection fails.
+      const RE = /^\s*pirkimo\s+dokumentai\s*$/i;
+      const dropdowns = Array.from(document.querySelectorAll(
+        '.dropdown-menu, [role="menu"], .show, ul[aria-labelledby="dropdownMenuButton"]'
+      ));
+      for (const dd of dropdowns) {
+        const items = Array.from(dd.querySelectorAll('a, button, li'));
+        for (const it of items) {
+          const t = (it.innerText || it.textContent || '').replace(/\s+/g, ' ').trim();
+          if (t && RE.test(t)) {
+            try { it.scrollIntoView({ block: 'center' }); it.click(); return `dropdown:${t.slice(0, 60)}`; } catch (_) {}
+          }
+        }
+      }
+      // Fallback — any visible anchor with matching text
+      const anchors = Array.from(document.querySelectorAll('a, button, li'));
+      for (const a of anchors) {
+        if (a.offsetParent === null) continue;
+        const t = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t && RE.test(t)) {
+          try { a.scrollIntoView({ block: 'center' }); a.click(); return `anchor:${t.slice(0, 60)}`; } catch (_) {}
+        }
+      }
+      return null;
+    }).catch(() => null);
+    if (dropdownClicked) {
+      console.log(`    🇱🇹 viesiejipirkimai: clicked "Pirkimo dokumentai" (${dropdownClicked})`);
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => null),
+        new Promise((r) => setTimeout(r, 3500)),
+      ]);
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    // STEP 3 — on the new document-listing page, ensure the DOCUMENTS tab
+    // is active. User-confirmed DOM:
+    //   <a class="nav-link active" data-toggle="tab" role="tab"
+    //      aria-controls="contact"
+    //      onclick="selectTab('DOCUMENTS')"
+    //      href="javascript:void(0)">Pirkimo dokumentai</a>
+    // The tab is typically already active when we land here, but clicking
+    // it explicitly forces the DOCUMENTS content to render.
+    const docTabClicked = await page.evaluate(() => {
+      // Primary: by onclick attribute (very specific to CVPP).
+      const byOnclick = Array.from(document.querySelectorAll(
+        'a[onclick*="selectTab"], a[onclick*="DOCUMENTS"]'
+      ));
+      for (const el of byOnclick) {
+        const oc = el.getAttribute('onclick') || '';
+        if (/selectTab\(['"]?DOCUMENTS['"]?\)/i.test(oc)) {
+          try { el.scrollIntoView({ block: 'center' }); el.click(); return `onclick:${(el.innerText || '').trim().slice(0, 60)}`; } catch (_) {}
+        }
+      }
+      // Fallback: by exact tab text on a .nav-link
+      const cands = Array.from(document.querySelectorAll(
+        'a.nav-link, [role="tab"], a[data-toggle="tab"]'
+      ));
+      for (const el of cands) {
+        if (el.offsetParent === null) continue;
+        const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (/^\s*pirkimo\s+dokumentai\s*$/i.test(t)) {
+          try { el.scrollIntoView({ block: 'center' }); el.click(); return `text:${t.slice(0, 60)}`; } catch (_) {}
+        }
+      }
+      return null;
+    }).catch(() => null);
+    if (docTabClicked) {
+      console.log(`    🇱🇹 viesiejipirkimai: activated DOCUMENTS tab (${docTabClicked})`);
+      await new Promise((r) => setTimeout(r, 2500));
+    }
+
+    // STEP 3 — capture frames (CVPP sometimes renders tender detail in
+    // an iframe loaded by the parent's JS).
+    const frames = page.frames();
+    const allDocs = [];
+    const seen = new Set();
+
+    const harvestFrom = async (frameOrPage, label) => {
+      const anchors = await frameOrPage.evaluate(() => {
+        const RX_DL_EXT = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:\?|#|$)/i;
+        const RX_DL_PATH = /downloadFile|displayFile|getFile|FileServlet|fileServlet|FileDownload|getResource|prepareDocuments|listFiles|downloadAttachment|attachment/i;
+        const RX_DL_TEXT = /\b(atsisi[ųu]sti|parsisi[ųu]sti|atidaryti|download)\b/i;
+        const out = [];
+        const seenLocal = new Set();
+        for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+          const hrefRaw = a.getAttribute('href') || '';
+          if (!hrefRaw || /^javascript:/i.test(hrefRaw) || hrefRaw === '#') continue;
+          let abs;
+          try { abs = new URL(hrefRaw, location.href).toString(); } catch (_) { continue; }
+          if (seenLocal.has(abs)) continue;
+          const text = (a.innerText || a.textContent || '').trim();
+          const isDl = RX_DL_EXT.test(abs) || RX_DL_PATH.test(abs) || RX_DL_TEXT.test(text);
+          if (!isDl) continue;
+          seenLocal.add(abs);
+          const filenameMatch = text.match(/([\w\-. ]{4,80}\.(?:pdf|docx?|xlsx?|pptx?|zip|rtf))/i);
+          out.push({
+            url: abs,
+            text: text.slice(0, 200),
+            filename: filenameMatch ? filenameMatch[1] : (text || abs.split('/').pop()),
+          });
+          if (out.length >= 40) break;
+        }
+        return out;
+      }).catch(() => []);
+      for (const a of anchors) {
+        if (seen.has(a.url)) continue;
+        seen.add(a.url);
+        a._frameLabel = label;
+        allDocs.push(a);
+      }
+    };
+
+    await harvestFrom(page, 'main');
+    for (let i = 0; i < frames.length; i++) {
+      const fr = frames[i];
+      if (fr === page.mainFrame()) continue;
+      try {
+        const frUrl = fr.url();
+        if (!/viesiejipirkimai\.lt/i.test(frUrl)) continue;
+        await harvestFrom(fr, `iframe[${i}]`);
+      } catch (_) {}
+    }
+
+    if (!allDocs.length) {
+      // Diagnostic dump — show first 20 anchors so we can refine.
+      const sample = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll('a[href]'))
+          .filter((a) => a.offsetParent !== null)
+          .slice(0, 20)
+          .map((a) => ({
+            text: (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+            href: (a.getAttribute('href') || '').slice(0, 100),
+          }));
+      }).catch(() => []);
+      console.log(`    ⚠️  viesiejipirkimai: 0 file anchors after click/dump (resourceId=${resourceId})`);
+      console.log(`       frames detected: ${frames.length} (mainFrame + ${frames.length - 1} sub)`);
+      for (const a of sample) {
+        console.log(`       a: "${a.text}" → ${a.href}`);
+      }
+      return [];
+    }
+
+    console.log(`    🇱🇹 viesiejipirkimai: ${allDocs.length} doc anchor(s) detected (resourceId=${resourceId})`);
+    for (const d of allDocs.slice(0, 6)) {
+      console.log(`       doc: "${(d.filename || d.text).slice(0, 60)}"${d._frameLabel !== 'main' ? ` (${d._frameLabel})` : ''} → ${d.url.slice(0, 80)}`);
+    }
+
+    // STEP 4 — download + parse. Reuse cookies from current browser context.
+    let pdfParseLib = null, mammothLib = null, XLSXLib = null, AdmZipLib = null;
+    try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+    try { mammothLib  = require('mammoth');   } catch (_) {}
+    try { XLSXLib     = require('xlsx');      } catch (_) {}
+    try { AdmZipLib   = require('adm-zip');   } catch (_) {}
+
+    const texts = [];
+    const MAX_DOCS = 6;
+    for (const doc of allDocs.slice(0, MAX_DOCS)) {
+      const labelName = (doc.filename || doc.text || doc.url.split('/').pop()).slice(0, 100);
+      const result = await page.evaluate(async (url) => {
+        try {
+          const r = await fetch(url, { credentials: 'include', redirect: 'follow' });
+          if (!r.ok) return { ok: false, status: r.status };
+          const ct = r.headers.get('content-type') || '';
+          const ab = await r.arrayBuffer();
+          return { ok: true, status: r.status, ct, url: r.url || url, data: Array.from(new Uint8Array(ab)) };
+        } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
+      }, doc.url).catch((e) => ({ ok: false, error: e.message }));
+
+      if (!result || !result.ok || !result.data || result.data.length < 500) {
+        console.log(`    ⚠️  viesiejipirkimai: fetch failed "${labelName.slice(0, 40)}" (status=${result?.status || '?'})`);
+        continue;
+      }
+      const buf = Buffer.from(result.data);
+      const b = buf;
+      const isPdf = b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46;
+      const isZip = b[0] === 0x50 && b[1] === 0x4B && b[2] === 0x03 && b[3] === 0x04;
+      const nameL = labelName.toLowerCase();
+      let text = '', fmt = 'unknown';
+      try {
+        if (isPdf && pdfParseLib) {
+          const p = await pdfParseLib(buf);
+          text = (p && p.text ? p.text : '').trim();
+          fmt = 'PDF';
+        } else if (isZip) {
+          if (mammothLib && (nameL.endsWith('.docx') || !nameL.endsWith('.xlsx'))) {
+            try { const m = await mammothLib.extractRawText({ buffer: buf }); text = (m?.value || '').trim(); if (text.length > 100) fmt = 'DOCX'; } catch (_) {}
+          }
+          if (!text && XLSXLib) {
+            try {
+              const wb = XLSXLib.read(buf, { type: 'buffer' });
+              const parts = [];
+              for (const sn of wb.SheetNames) parts.push(`### ${sn}\n${XLSXLib.utils.sheet_to_csv(wb.Sheets[sn])}`);
+              text = parts.join('\n\n').trim();
+              if (text.length > 100) fmt = 'XLSX';
+            } catch (_) {}
+          }
+        }
+      } catch (e) {
+        console.log(`    ⚠️  viesiejipirkimai: parse error "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 60)}`);
+      }
+      if (text && text.length > 100) {
+        const clipped = text.slice(0, 80000);
+        texts.push(`--- (viesiejipirkimai ${fmt}) ${labelName} ---\n${clipped}`);
+        console.log(`    🇱🇹 viesiejipirkimai: parsed ${fmt} "${labelName}" (${buf.length}B → ${clipped.length}ch)`);
+      } else {
+        console.log(`    ⚠️  viesiejipirkimai: extracted text too short for "${labelName}" (${text.length}ch, fmt=${fmt})`);
+      }
+    }
+    return texts;
+  } catch (e) {
+    console.log(`    ⚠️  viesiejipirkimai handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
 // =====================================================================
 async function fetchArtifikDocuments(browser, sourceUrl) {
   let pid = null;
@@ -9657,6 +9977,25 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     } catch (e) {
       console.log(`    ⚠️ eu-supply handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // viesiejipirkimai.lt CVPP Documents handler — Lithuanian central
+    // public procurement portal. Requires login cookies set by the
+    // upstream attemptPortalLogin flow (creds in PORTAL_CREDS_JSON).
+    // Expands "Rodyti pirkimo meniu" toggle, clicks Dokumentai tab, then
+    // harvests file anchors. No-op for non-viesiejipirkimai sources.
+    try {
+      const vpTexts = await fetchViesiejiPirkimaiDocuments(browser, sourceUrl);
+      if (vpTexts && vpTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + vpTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇱🇹 viesiejipirkimai: appended ${vpTexts.length} doc(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ viesiejipirkimai handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     // app.artifik.no Documents handler — Norwegian SaaS tender platform
