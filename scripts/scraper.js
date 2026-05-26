@@ -3706,11 +3706,71 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
       const tStart = Date.now();
 
       // BULK ZIP path — Type B layout. Click downloadZip() button on
-      // MAIN page (no popup involved), then wait for ZIP file to land in
-      // download dir.
+      // MAIN page, then wait for ZIP file to land in download dir.
+      //
+      // 2026-05-26 — for "downloadForAnonymousUser" the click triggers a
+      // JS function. We first dump that function's source to discover the
+      // real download URL pattern (so we can fall back to direct fetch
+      // if the browser-level download config doesn't catch the file).
       if (d.kind === 'bulk') {
         let filesBefore = [];
         try { filesBefore = fs.readdirSync(downloadDir); } catch (_) {}
+
+        // Inspect the JS function source — reveals the actual URL CVPP
+        // hits when the button is clicked.
+        const fnSource = await page.evaluate((fnName) => {
+          try {
+            const fn = window[fnName];
+            if (typeof fn === 'function') {
+              return fn.toString().slice(0, 800);
+            }
+          } catch (_) {}
+          return null;
+        }, d.fnName).catch(() => null);
+        if (fnSource) {
+          // Log just the body (skip the "function name() {" wrapper for brevity)
+          const bodyOnly = fnSource.replace(/\s+/g, ' ').slice(0, 400);
+          console.log(`    🇱🇹 viesiejipirkimai: ${d.fnName}() source: ${bodyOnly}`);
+          // Try to extract a /epps/ URL pattern from the function body
+          const urlMatch = fnSource.match(/['"]([^'"\s<>]*\/epps\/[^'"\s<>]+)['"]/i);
+          if (urlMatch) {
+            const candidateUrl = new URL(urlMatch[1], 'https://viesiejipirkimai.lt').toString();
+            console.log(`    🇱🇹 viesiejipirkimai: extracted candidate URL: ${candidateUrl.slice(-100)}`);
+            // Direct fetch using page cookies — bypasses any window.open
+            // / CDP download timing issues.
+            const directResult = await page.evaluate(async (url) => {
+              try {
+                const r = await fetch(url, { credentials: 'include', redirect: 'follow' });
+                if (!r.ok) return { ok: false, status: r.status };
+                const ct = r.headers.get('content-type') || '';
+                const cd = r.headers.get('content-disposition') || '';
+                const ab = await r.arrayBuffer();
+                return { ok: true, status: r.status, ct, cd, url: r.url || url, data: Array.from(new Uint8Array(ab)) };
+              } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
+            }, candidateUrl).catch(() => null);
+            if (directResult && directResult.ok && directResult.data && directResult.data.length > 1000) {
+              const buf = Buffer.from(directResult.data);
+              const isZip = buf[0] === 0x50 && buf[1] === 0x4B;
+              const isPdf = buf[0] === 0x25 && buf[1] === 0x50;
+              if (isZip || isPdf) {
+                captured.set('bulk', { url: directResult.url, ct: directResult.ct, buf, ts: Date.now() });
+                console.log(`    🇱🇹 viesiejipirkimai: ✓ direct fetch SUCCESS ${buf.length}B (${isZip ? 'ZIP' : 'PDF'}) from ${directResult.url.slice(-80)}`);
+                d.url = directResult.url;
+                d._capturedBuf = buf;
+                d._capturedCt = directResult.ct;
+                d.filename = (directResult.cd.match(/filename[*]?=(?:"([^"]+)"|([^;]+))/) || [])[1] || d.filename;
+                continue;
+              } else {
+                const magic = Array.from(buf.slice(0, 4)).map(x => x.toString(16).padStart(2, '0')).join(' ');
+                console.log(`    ⚠️  viesiejipirkimai: direct fetch returned non-binary (magic=${magic}, ${buf.length}B, ct=${directResult.ct.slice(0, 60)})`);
+              }
+            } else {
+              console.log(`    ⚠️  viesiejipirkimai: direct fetch failed (status=${directResult?.status || directResult?.error || '?'})`);
+            }
+          }
+        } else {
+          console.log(`    ℹ️  viesiejipirkimai: couldn't read ${d.fnName}() source — falling back to button click`);
+        }
 
         const bulkClicked = await page.evaluate((fnName) => {
           const buttons = Array.from(document.querySelectorAll('button[onclick], input[onclick]'));
