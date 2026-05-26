@@ -3393,10 +3393,17 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
                        c.includes('application/vnd.openxml') ||
                        c.includes('application/msword') ||
                        c.includes('application/vnd.ms-excel') ||
+                       c.includes('application/vnd.ms-powerpoint') ||
                        c.includes('application/octet-stream') ||
+                       c.includes('application/x-octet-stream') ||
                        c.includes('application/zip') ||
+                       c.includes('application/x-zip') ||
                        c.includes('application/x-zip-compressed') ||
-                       /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt)(\?|$)/i.test(u);
+                       c.includes('application/force-download') ||
+                       c.includes('application/x-download') ||
+                       c.includes('application/x-msdownload') ||
+                       c.includes('application/binary') ||
+                       /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(\?|$)/i.test(u);
       return isEpps && isBinary;
     };
 
@@ -3465,14 +3472,55 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         await pp.waitForNetworkIdle({ idleTime: 1500, timeout: 8000 }).catch(() => null);
         await new Promise((r) => setTimeout(r, 1500));
 
-        // PRIMARY PATH — click the "Susieti / Sutinku / Patvirtinti" button.
+        // PRIMARY PATH — CVPP confirmed flow (log 31 diagnostic):
+        //   Popup body: "Asociacijos tipas: 1. Susieti visus naudotojus
+        //                                   2. Susieti tik save  PASIRINKTI"
+        //   Button: <button onclick="addUser()">PASIRINKTI</button>
+        // Must select the "tik save" radio FIRST (option 2) → safer
+        // default that registers ONLY our user, not whole organization.
+        // Then click PASIRINKTI.
         const confirmClicked = await pp.evaluate(() => {
-          // Match LT confirmation verbs: susieti (associate), sutinku
-          // (agree), patvirtinti (confirm), tęsti (continue), atsisiųsti
-          // (download — sometimes used). Plus EN fallbacks.
-          const RE_CONFIRM = /^\s*(susieti|sutinku|patvirtinti|t[ęe]sti|atsisi[ųu]sti|parsisi[ųu]sti|i\s*agree|confirm|continue|accept|download|ok)\b/i;
-          // Anti-pattern — reject "Atšaukti/Cancel/Uždaryti"
-          const RE_REJECT = /^\s*(at[šs]aukti|u[žz]daryti|cancel|close|atgal|back)\b/i;
+          // STEP A — select the "tik save" radio button. CVPP form
+          // typically has 2 radios: associate-all (value=2 or "ALL") and
+          // associate-self-only (value=1 or "USER"). We pick the SAFER
+          // one (only ourselves) by matching the LT label "tik save"
+          // or "tik mane" or English "only me".
+          const RE_SELF = /tik\s+save|tik\s+mane|only\s+me|self|individual/i;
+          const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+          let radioPicked = '';
+          for (const r of radios) {
+            // Build context from label + parent + sibling text
+            const labelEl = r.labels && r.labels[0];
+            const parent = r.parentElement;
+            const ctx = (
+              (labelEl?.innerText || labelEl?.textContent || '') + ' ' +
+              (parent?.innerText || '')
+            ).slice(0, 300);
+            if (RE_SELF.test(ctx)) {
+              try {
+                r.scrollIntoView({ block: 'center' });
+                r.click();
+                radioPicked = ctx.replace(/\s+/g, ' ').trim().slice(0, 60);
+                break;
+              } catch (_) {}
+            }
+          }
+          // Fallback — if no radio matched but there ARE radios, click
+          // the LAST one (CVPP convention: list typically goes
+          // "all-users" first, "only-self" second).
+          if (!radioPicked && radios.length >= 2) {
+            const r = radios[radios.length - 1];
+            try {
+              r.scrollIntoView({ block: 'center' });
+              r.click();
+              radioPicked = '(last radio fallback)';
+            } catch (_) {}
+          }
+
+          // STEP B — click the submit button. New regex includes
+          // "pasirinkti" (Select) which is CVPP's specific verb.
+          const RE_CONFIRM = /^\s*(pasirinkti|susieti|sutinku|patvirtinti|t[ęe]sti|atsisi[ųu]sti|parsisi[ųu]sti|i\s*agree|confirm|continue|accept|select|download|ok|submit)\b/i;
+          const RE_REJECT = /^\s*(at[šs]aukti|u[žz]daryti|cancel|close|atgal|back|reset|i[šs]valyti)\b/i;
           const cands = Array.from(document.querySelectorAll(
             'button, input[type="submit"], input[type="button"], a.btn, a[role="button"], [role="button"]'
           ));
@@ -3482,10 +3530,14 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
             if (!text || text.length > 60) continue;
             if (RE_REJECT.test(text)) continue;
             if (RE_CONFIRM.test(text)) {
-              try { el.scrollIntoView({ block: 'center' }); el.click(); return text.slice(0, 60); } catch (_) {}
+              try {
+                el.scrollIntoView({ block: 'center' });
+                el.click();
+                return `${radioPicked ? `radio="${radioPicked}" → ` : ''}btn="${text.slice(0, 40)}"`;
+              } catch (_) {}
             }
           }
-          return null;
+          return radioPicked ? `radio="${radioPicked}" (no submit btn)` : null;
         }).catch(() => null);
 
         if (confirmClicked) {
