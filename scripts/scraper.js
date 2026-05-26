@@ -3430,8 +3430,30 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
     // Popup handler — when addUser calls window.open(), Puppeteer fires
     // a 'targetcreated' event on the browser. We attach a response
     // listener to the popup page so its binary content gets captured
-    // too. We also track popup-by-docId so the per-click harvester
-    // can find the matching popup for in-popup anchor scraping.
+    // too. We also track popup-by-docId for in-popup anchor scraping.
+    //
+    // CRITICAL — CDP download path setup. User-confirmed CVPP flow (log 32):
+    // after "Pasirinkti" click, browser receives a file via Content-
+    // Disposition: attachment header. In Chromium headless mode WITHOUT
+    // explicit download path, the file is silently discarded — response
+    // body never reaches our `page.on('response')` listener. Solution:
+    // create a temp dir + CDP Page.setDownloadBehavior on EVERY popup,
+    // then watch the dir for new files after Pasirinkti click.
+    const fs = require('fs');
+    const pathLib = require('path');
+    const os = require('os');
+    const downloadDir = fs.mkdtempSync(pathLib.join(os.tmpdir(), 'cvpp-dl-'));
+    const installDownloadBehavior = async (targetPage) => {
+      try {
+        const cdp = await targetPage.target().createCDPSession();
+        await cdp.send('Page.setDownloadBehavior', {
+          behavior: 'allow',
+          downloadPath: downloadDir,
+        }).catch(() => null);
+      } catch (_) {}
+    };
+    await installDownloadBehavior(page);
+
     const popupPages = [];
     const popupByDocId = new Map(); // docId -> page
     const targetCreatedHandler = async (target) => {
@@ -3441,7 +3463,9 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         if (!pp) return;
         popupPages.push(pp);
         pp.on('response', (r) => responseHandler(r, `popup[${popupPages.length - 1}]`));
-        // Try to match this popup to a known docId by URL pattern
+        // Configure download path on this popup too — Pasirinkti click
+        // inside the popup may trigger file stream via window.location.
+        await installDownloadBehavior(pp);
         try {
           const u = pp.url();
           const mDoc = u.match(/documentId=(\d{3,15})|docId=(\d{3,15})|fileId=(\d{3,15})|attachmentId=(\d{3,15})/i);
@@ -3635,7 +3659,52 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         });
 
       if (matchedPopup) {
+        // Snapshot files BEFORE probe so we can detect new downloads.
+        let filesBefore = [];
+        try { filesBefore = fs.readdirSync(downloadDir); } catch (_) {}
+
         const dlCandidates = await probePopupForDownload(matchedPopup);
+
+        // CHECK DISK for new file landed via Pasirinkti → Content-Disposition.
+        // CVPP file streaming via attachment header writes to downloadDir
+        // (CDP Page.setDownloadBehavior). Wait up to 8s for file to appear.
+        const watchDeadline = Date.now() + 8000;
+        let newFile = null;
+        while (Date.now() < watchDeadline) {
+          await new Promise((r) => setTimeout(r, 500));
+          try {
+            const filesNow = fs.readdirSync(downloadDir);
+            const fresh = filesNow.filter((f) => !filesBefore.includes(f) && !f.endsWith('.crdownload'));
+            for (const fname of fresh) {
+              const fpath = pathLib.join(downloadDir, fname);
+              try {
+                const st = fs.statSync(fpath);
+                if (st.size > 500) { newFile = { name: fname, path: fpath, size: st.size }; break; }
+              } catch (_) {}
+            }
+            if (newFile) break;
+          } catch (_) {}
+        }
+
+        if (newFile) {
+          try {
+            const buf = fs.readFileSync(newFile.path);
+            captured.set(d.docId, {
+              url: `file://${newFile.path}`,
+              ct: '',  // we'll detect by magic bytes downstream
+              buf,
+              ts: Date.now(),
+            });
+            console.log(`    🇱🇹 viesiejipirkimai: ✓ captured ${buf.length}B from disk: "${newFile.name}" (id=${d.docId})`);
+            // Cleanup — delete the downloaded file
+            try { fs.unlinkSync(newFile.path); } catch (_) {}
+            // Skip the candidate-fetch loop below
+            continue;
+          } catch (e) {
+            console.log(`    ⚠️  viesiejipirkimai: failed to read downloaded file "${newFile.name}": ${e.message}`);
+          }
+        }
+
         if (dlCandidates.length) {
           console.log(`    🇱🇹 viesiejipirkimai: popup probe found ${dlCandidates.length} download candidate(s) for id=${d.docId}`);
           // Try each candidate until one returns binary
@@ -3729,12 +3798,20 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
       }
     }
 
-    // Cleanup popup pages
+    // Cleanup popup pages + download dir
     for (const pp of popupPages) {
       try { await pp.close(); } catch (_) {}
     }
     browser.off('targetcreated', targetCreatedHandler);
     page.removeAllListeners('response');
+    try {
+      // Best-effort: remove the temp download dir + any leftover files
+      const remaining = fs.readdirSync(downloadDir);
+      for (const f of remaining) {
+        try { fs.unlinkSync(pathLib.join(downloadDir, f)); } catch (_) {}
+      }
+      try { fs.rmdirSync(downloadDir); } catch (_) {}
+    } catch (_) {}
 
     // Convert captured responses into doc objects with bytes inline,
     // so the existing parse loop below can extract text.
