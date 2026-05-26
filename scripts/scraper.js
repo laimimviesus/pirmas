@@ -3372,13 +3372,18 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
       }
     }
 
-    // Click each detected doc, capture the resulting download. Wraps
-    // page.on('response') with a one-shot capture per click — CVPP's
-    // addUser() may either window.open() a new tab OR trigger a direct
-    // GET/POST. We watch the main page; if it's a popup we capture
-    // via target.page() and serialise its content.
+    // Click each detected doc, capture the resulting download. CVPP's
+    // addUser() may:
+    //   (a) call window.open(URL) → opens a new TAB which streams the
+    //       file. We capture via browser.on('targetcreated').
+    //   (b) trigger an XHR fetch on the current page → page.on('response').
+    //   (c) submit a hidden form with target=_blank → also a new tab.
+    // We listen to BOTH paths simultaneously. Plus we capture ALL /epps/
+    // requests (not just binary) so the diagnostic dump shows what
+    // addUser ACTUALLY does when no binary response materialises.
 
     const captured = new Map(); // docId -> { buf, url, contentType }
+    const allEppsRequests = []; // diagnostic: every /epps/ request fired
 
     const isLikelyDocResponse = (url, ct) => {
       const u = url.toLowerCase();
@@ -3395,31 +3400,46 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
       return isEpps && isBinary;
     };
 
-    // Pre-attach a response listener that builds a recent-response cache
-    // we can consult after each click. (We use response on the page
-    // object — request-level interception would require setRequestInter-
-    // ception which conflicts with normal nav.)
-    let lastResponseAt = 0;
+    // Response handler — captures binary downloads + logs ALL /epps/ requests
+    // for diagnosis.
     const responseCache = [];
-    const responseHandler = async (resp) => {
+    const responseHandler = async (resp, frameLabel = 'main') => {
       try {
         const u = resp.url();
         const ct = resp.headers()['content-type'] || '';
+        // Diagnostic capture for any /epps/ response
+        if (/\/epps\//.test(u)) {
+          allEppsRequests.push({ url: u, ct: ct.slice(0, 60), frame: frameLabel, ts: Date.now() });
+        }
         if (!isLikelyDocResponse(u, ct)) return;
-        // Skip the page navigation responses (HTML)
         if (/text\/html/i.test(ct)) return;
         const buf = await resp.buffer().catch(() => null);
         if (!buf || buf.length < 500) return;
-        responseCache.push({ url: u, ct, buf, ts: Date.now() });
-        lastResponseAt = Date.now();
+        responseCache.push({ url: u, ct, buf, ts: Date.now(), frame: frameLabel });
       } catch (_) {}
     };
-    page.on('response', responseHandler);
+    page.on('response', (r) => responseHandler(r, 'main'));
+
+    // Popup handler — when addUser calls window.open(), Puppeteer fires
+    // a 'targetcreated' event on the browser. We attach a response
+    // listener to the popup page so its binary content gets captured
+    // too. We also try to close the popup after capture to avoid tab
+    // accumulation.
+    const popupPages = [];
+    const targetCreatedHandler = async (target) => {
+      try {
+        if (target.type() !== 'page') return;
+        const pp = await target.page();
+        if (!pp) return;
+        popupPages.push(pp);
+        pp.on('response', (r) => responseHandler(r, `popup[${popupPages.length - 1}]`));
+      } catch (_) {}
+    };
+    browser.on('targetcreated', targetCreatedHandler);
 
     for (const d of allDocs.slice(0, 6)) {
       const tStart = Date.now();
-      // Click the anchor in-page by docId match in onclick — more
-      // resilient than CSS selectors when class/id are missing.
+      // Click the anchor in-page by docId match in onclick.
       const clicked = await page.evaluate((docId, fnName) => {
         const anchors = Array.from(document.querySelectorAll('a[onclick]'));
         for (const a of anchors) {
@@ -3435,9 +3455,8 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         console.log(`    ⚠️  viesiejipirkimai: failed to click doc id=${d.docId} "${d.filename}"`);
         continue;
       }
-      // Wait up to 8s for a response matching this click. Detect by
-      // a NEW responseCache entry since tStart.
-      const waitDeadline = tStart + 8000;
+      // Wait up to 10s — increased from 8s for slow popup downloads.
+      const waitDeadline = tStart + 10000;
       while (Date.now() < waitDeadline) {
         await new Promise((r) => setTimeout(r, 500));
         const fresh = responseCache.find((r) => r.ts >= tStart);
@@ -3447,11 +3466,26 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         }
       }
       if (!captured.has(d.docId)) {
-        console.log(`    ⚠️  viesiejipirkimai: clicked id=${d.docId} but no binary response captured within 8s`);
+        // Show what /epps/ requests DID fire after this click, so we
+        // can see whether addUser made any network activity at all.
+        const recentReqs = allEppsRequests.filter((r) => r.ts >= tStart);
+        if (recentReqs.length) {
+          console.log(`    ⚠️  viesiejipirkimai: clicked id=${d.docId} — no binary response, but ${recentReqs.length} /epps/ request(s) fired:`);
+          for (const r of recentReqs.slice(0, 5)) {
+            console.log(`         [${r.frame}] ${r.ct} → ${r.url.slice(-90)}`);
+          }
+        } else {
+          console.log(`    ⚠️  viesiejipirkimai: clicked id=${d.docId} — NO /epps/ requests fired at all (popup blocked? form submit failed? function noop?)`);
+        }
       }
     }
 
-    page.off('response', responseHandler);
+    // Cleanup popup pages
+    for (const pp of popupPages) {
+      try { await pp.close(); } catch (_) {}
+    }
+    browser.off('targetcreated', targetCreatedHandler);
+    page.removeAllListeners('response');
 
     // Convert captured responses into doc objects with bytes inline,
     // so the existing parse loop below can extract text.
