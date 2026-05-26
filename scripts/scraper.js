@@ -863,8 +863,24 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- maxBudget: total ceiling / max contract value AS STATED in the tender. Empty string if not explicitly stated.\n' +
     '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND description gives enough basis.\n' +
     '- duration: contract length in months or years. Empty string if not stated.\n' +
-    '- requirementsForSupplier: concise bullet-style summary. MUST EXTRACT EXACT METRICS: specific ISO certifications (e.g., ISO 27001, 9001), exact financial thresholds, and security/compliance standards. DO NOT invent or generalize.\n' +
-    '- qualificationRequirements: concise bullet-style summary of formal SUPPLIER eligibility requirements (NOT system/technical capabilities). Look specifically for sections titled "Qualification requirements", "Kvalifikasjonskrav", "Kvalifikacijos reikalavimai", "Tiekėjo kvalifikaciniai reikalavimai", "Kvalifikationskrav", "Vaatimukset tarjoajalle", "Wymagania kwalifikacyjne", "Eignungskriterien", "Critères de sélection", "Requisitos de aptitud", "Requisiti di partecipazione" — and the surrounding tables/lists. These almost always cover four families: (a) LEGAL — company registration (Firmaattest / company certificate / business registry, "Įmonės registracijos pažymėjimas"), (b) ECONOMIC — turnover thresholds, credit rating, audited annual accounts, "Apyvarta", "Finansinė atskaitomybė", (c) TECHNICAL — number and type of reference projects (e.g., "up to 3 reference projects within last 3 years", "ne mažiau X panašių projektų per Y metų"), required key-person roles and years of experience (e.g., "Projekto vadovo patirtis ne mažiau 2 metų", "ne mažiau 1 specialisto su X metų patirtimi"), (d) QUALITY — ISO certifications (9001, 14001, 27001, etc.). CRITICAL: extract EXACT MEASURABLE METRICS verbatim (numeric thresholds, years, certification numbers, page limits like "max 2 A4 pages per reference"). PER-SPECIALIST DETAIL: when the tender lists named specialist roles (Project Manager / Projekto vadovas, Architect / Architektas, Developer / Programuotojas, Tester / Testuotojas, Security Officer / Saugos specialistas, etc.), include EACH role with its minimum-experience requirement. DO NOT hallucinate. If a section says only "sufficient capacity" without numbers, write that verbatim and note "(no numeric threshold stated)". DO NOT confuse system/technical specifications with supplier qualifications — system specs go into requirementsForSupplier, not here.\n' +
+    '- requirementsForSupplier: MANDATORY technical/legal requirements the supplier (company) MUST meet to participate. Examples: "ISO 27001 certified", "Security clearance Level 2", "GDPR DPA in place", "Hosted in EU only", "Native LT-speaking staff". This is NOT a summary of the work to be done — that goes in scopeOfAgreement. DO NOT invent or generalize. If documents do not explicitly list mandatory supplier requirements, write "(no explicit mandatory supplier requirements stated in tender documents)" rather than inferring from scope.\n' +
+    '- qualificationRequirements: FORMAL SUPPLIER COMPANY ELIGIBILITY. This is the supplier-side ENTRY criteria — the bar a bidder must clear to be ALLOWED to submit. It is NOT a description of work, NOT a list of capabilities to deliver, NOT the system features being built. Look for explicit sections titled "Qualification requirements", "Kvalifikasjonskrav", "Kvalifikacijos reikalavimai", "Tiekėjo kvalifikaciniai reikalavimai", "Kvalifikationskrav", "Vaatimukset tarjoajalle", "Wymagania kwalifikacyjne", "Eignungskriterien", "Critères de sélection", "Requisitos de aptitud", "Requisiti di partecipazione" — and the surrounding tables/lists. The four canonical families: (a) LEGAL — company registration ("Įmonės registracijos pažymėjimas", Firmaattest, business registry), (b) ECONOMIC — turnover thresholds ("Apyvarta ne mažiau X EUR per Y metų"), credit rating, audited annual accounts, (c) TECHNICAL — reference projects ("ne mažiau X panašių projektų per Y metų") AND named specialist roles with years of experience ("Projekto vadovas: 2 metai patirties IS projektuose", "Architektas: 5 metai", "Saugos specialistas: ISO 27001 sertifikuotas"), (d) QUALITY — ISO certifications (9001, 14001, 27001). \n' +
+    '\n' +
+    '   ❌ ANTI-PATTERNS — do NOT put these in qualifications field (they belong in scopeOfAgreement):\n' +
+    '     ✗ "Software development and system integration capabilities" ← this is SCOPE, not qualification\n' +
+    '     ✗ "Ability to update and extend functionality of meteorological tool" ← this is SCOPE\n' +
+    '     ✗ "SLIS programinės įrangos palaikymo paslaugų teikimas" ← this is SCOPE\n' +
+    '     ✗ "Experience with meteorological data systems" ← too generic; needs a NUMBER (years, projects count)\n' +
+    '     ✗ Generic "technical expertise" / "data validation capabilities" ← these describe WORK, not entry criteria\n' +
+    '\n' +
+    '   ✅ ACCEPTABLE patterns — these are real supplier qualifications:\n' +
+    '     ✓ "Įmonės metinė apyvarta ne mažiau 500 000 EUR per pastaruosius 3 metus"\n' +
+    '     ✓ "Projekto vadovas: minimum 2 metai patirties analogiškuose IS projektuose"\n' +
+    '     ✓ "Ne mažiau 2 reference projektai per 3 metus tame pačiame domene"\n' +
+    '     ✓ "ISO 27001 ir ISO 9001 sertifikatai"\n' +
+    '     ✓ "Ekonominis pajėgumas 30% sutarties vertės"\n' +
+    '\n' +
+    '   CRITICAL RULE: If documents do NOT explicitly list supplier qualification criteria (years, numbers, certifications, named roles), DO NOT generate text from scope. Instead write EXACTLY: "(no explicit supplier qualification requirements stated in tender documents)". Leaving this field empty is better than filling with scope-like content. PER-SPECIALIST DETAIL: when documents DO list named specialist roles (Projekto vadovas, Architektas, Programuotojas, Testuotojas, Saugos specialistas), include EACH role with its minimum-experience requirement verbatim from source.\n' +
     '- offerWeighingCriteria: award criteria with EXACT WEIGHTS. ALWAYS list every criterion with its percentage/weight verbatim from the tender (e.g., "Price 40%, Quality 60% (subdivided: solution specification 30%, establishment plan 30%)"). For Lithuanian tenders look for "Kainos lyginamasis svoris X%", "Ekonominio naudingumo X%", "Specialistų kvalifikacija ir patirtis X%". If quality sub-criteria are scored individually (Y1, Y2, Y3 etc.), list each with what is measured and the point range (e.g., "Y1 Project manager additional experience: 1 pt per 1 IS project, 2 pts for 2+ projects"). DO NOT lose subdivision detail — these scoring rules drive the award.\n' +
     '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English. SPECIAL CASE: if lotStructure=="partial" AND there are IT/software-development lots, the scope should describe ONLY the IT lots (not the umbrella framework). If lotStructure=="all-required", describe the whole umbrella.\n' +
     '- lotStructure: one of "single" | "partial" | "all-required". Mark "single" if the tender procures one consolidated scope. Mark "partial" for multi-lot tenders where bidders MAY submit for individual lots/categories independently (look for phrases like "Tilbud på deler av oppdraget er tillatt", "Adgang til å gi tilbud på deler", "Det er adgang til å gi tilbud på enkeltkategorier", "Lots: division into lots = yes", "partial bids allowed", "tilbud på enkelte delkontrakter", "anbud på delar"). Mark "all-required" for multi-lot tenders where bidders MUST cover EVERY lot to win (look for phrases like "Det er ikke adgang til å gi tilbud på deler av oppdraget", "no partial bids", "tilbud må omfatte hele leveransen", "bidders must submit for all lots"). When unclear in a multi-lot tender, default to "all-required".\n' +
@@ -3485,14 +3501,38 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
     // after "Pasirinkti" click, browser receives a file via Content-
     // Disposition: attachment header. In Chromium headless mode WITHOUT
     // explicit download path, the file is silently discarded — response
-    // body never reaches our `page.on('response')` listener. Solution:
-    // create a temp dir + CDP Page.setDownloadBehavior on EVERY popup,
-    // then watch the dir for new files after Pasirinkti click.
+    // body never reaches our `page.on('response')` listener.
+    //
+    // 2026-05-26 v2 — Page.setDownloadBehavior wasn't enough (log 35
+    // showed 0 files captured even after click). Reason: anonymous
+    // downloads via downloadForAnonymousUser() spawn a non-page target
+    // (download tab) which our per-page CDP behavior doesn't cover.
+    // Switch to Browser.setDownloadBehavior — BROWSER-LEVEL config that
+    // applies to all targets (page, popup, download) at once. Fallback
+    // to Page.setDownloadBehavior if the Browser-level command isn't
+    // supported by this Chromium build.
     const fs = require('fs');
     const pathLib = require('path');
     const os = require('os');
     const downloadDir = fs.mkdtempSync(pathLib.join(os.tmpdir(), 'cvpp-dl-'));
+    let browserCdp = null;
+    try {
+      browserCdp = await browser.target().createCDPSession();
+      await browserCdp.send('Browser.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: downloadDir,
+        eventsEnabled: true,
+      }).catch(async () => {
+        // Older Chromium — fallback to per-page setting (less reliable).
+        try {
+          const pageCdp = await page.target().createCDPSession();
+          await pageCdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: downloadDir });
+        } catch (_) {}
+      });
+    } catch (_) {}
     const installDownloadBehavior = async (targetPage) => {
+      // Belt-and-suspenders: also try per-page in case Browser.set fails on
+      // some popup. Safe to call multiple times.
       try {
         const cdp = await targetPage.target().createCDPSession();
         await cdp.send('Page.setDownloadBehavior', {
