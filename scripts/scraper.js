@@ -863,8 +863,8 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND description gives enough basis.\n' +
     '- duration: contract length in months or years. Empty string if not stated.\n' +
     '- requirementsForSupplier: concise bullet-style summary. MUST EXTRACT EXACT METRICS: specific ISO certifications (e.g., ISO 27001, 9001), exact financial thresholds, and security/compliance standards. DO NOT invent or generalize.\n' +
-    '- qualificationRequirements: concise bullet-style summary of formal SUPPLIER eligibility requirements (NOT system/technical capabilities). Look specifically for sections titled "Qualification requirements", "Kvalifikasjonskrav", "Kvalifikationskrav", "Vaatimukset tarjoajalle", "Wymagania kwalifikacyjne", "Eignungskriterien", "Critères de sélection", "Requisitos de aptitud", "Requisiti di partecipazione" — and the surrounding tables/lists. These almost always cover four families: (a) LEGAL — company registration (Firmaattest / company certificate / business registry), (b) ECONOMIC — turnover thresholds, credit rating (e.g., "Rating Alfa"), audited annual accounts, (c) TECHNICAL — number and type of reference projects (e.g., "up to 3 reference projects within last 3 years"), required key-person roles and years of experience, (d) QUALITY — ISO certifications (9001, 14001, 27001, etc.). CRITICAL: extract EXACT MEASURABLE METRICS verbatim (numeric thresholds, years, certification numbers, page limits like "max 2 A4 pages per reference"). DO NOT hallucinate. If a section says only "sufficient capacity" without numbers, write that verbatim and note "(no numeric threshold stated)". DO NOT confuse system/technical specifications with supplier qualifications — system specs go into requirementsForSupplier, not here.\n' +
-    '- offerWeighingCriteria: award criteria with weights if present (e.g., "Price 40%, Quality 60%").\n' +
+    '- qualificationRequirements: concise bullet-style summary of formal SUPPLIER eligibility requirements (NOT system/technical capabilities). Look specifically for sections titled "Qualification requirements", "Kvalifikasjonskrav", "Kvalifikacijos reikalavimai", "Tiekėjo kvalifikaciniai reikalavimai", "Kvalifikationskrav", "Vaatimukset tarjoajalle", "Wymagania kwalifikacyjne", "Eignungskriterien", "Critères de sélection", "Requisitos de aptitud", "Requisiti di partecipazione" — and the surrounding tables/lists. These almost always cover four families: (a) LEGAL — company registration (Firmaattest / company certificate / business registry, "Įmonės registracijos pažymėjimas"), (b) ECONOMIC — turnover thresholds, credit rating, audited annual accounts, "Apyvarta", "Finansinė atskaitomybė", (c) TECHNICAL — number and type of reference projects (e.g., "up to 3 reference projects within last 3 years", "ne mažiau X panašių projektų per Y metų"), required key-person roles and years of experience (e.g., "Projekto vadovo patirtis ne mažiau 2 metų", "ne mažiau 1 specialisto su X metų patirtimi"), (d) QUALITY — ISO certifications (9001, 14001, 27001, etc.). CRITICAL: extract EXACT MEASURABLE METRICS verbatim (numeric thresholds, years, certification numbers, page limits like "max 2 A4 pages per reference"). PER-SPECIALIST DETAIL: when the tender lists named specialist roles (Project Manager / Projekto vadovas, Architect / Architektas, Developer / Programuotojas, Tester / Testuotojas, Security Officer / Saugos specialistas, etc.), include EACH role with its minimum-experience requirement. DO NOT hallucinate. If a section says only "sufficient capacity" without numbers, write that verbatim and note "(no numeric threshold stated)". DO NOT confuse system/technical specifications with supplier qualifications — system specs go into requirementsForSupplier, not here.\n' +
+    '- offerWeighingCriteria: award criteria with EXACT WEIGHTS. ALWAYS list every criterion with its percentage/weight verbatim from the tender (e.g., "Price 40%, Quality 60% (subdivided: solution specification 30%, establishment plan 30%)"). For Lithuanian tenders look for "Kainos lyginamasis svoris X%", "Ekonominio naudingumo X%", "Specialistų kvalifikacija ir patirtis X%". If quality sub-criteria are scored individually (Y1, Y2, Y3 etc.), list each with what is measured and the point range (e.g., "Y1 Project manager additional experience: 1 pt per 1 IS project, 2 pts for 2+ projects"). DO NOT lose subdivision detail — these scoring rules drive the award.\n' +
     '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English. SPECIAL CASE: if lotStructure=="partial" AND there are IT/software-development lots, the scope should describe ONLY the IT lots (not the umbrella framework). If lotStructure=="all-required", describe the whole umbrella.\n' +
     '- lotStructure: one of "single" | "partial" | "all-required". Mark "single" if the tender procures one consolidated scope. Mark "partial" for multi-lot tenders where bidders MAY submit for individual lots/categories independently (look for phrases like "Tilbud på deler av oppdraget er tillatt", "Adgang til å gi tilbud på deler", "Det er adgang til å gi tilbud på enkeltkategorier", "Lots: division into lots = yes", "partial bids allowed", "tilbud på enkelte delkontrakter", "anbud på delar"). Mark "all-required" for multi-lot tenders where bidders MUST cover EVERY lot to win (look for phrases like "Det er ikke adgang til å gi tilbud på deler av oppdraget", "no partial bids", "tilbud må omfatte hele leveransen", "bidders must submit for all lots"). When unclear in a multi-lot tender, default to "all-required".\n' +
     '- itLotsScope: ONLY when lotStructure=="partial". A bullet-style list of lots that are software development / web/mobile app dev / bespoke IT system creation. Format: "Lot 2B – Architecture, development, data and integration: <one-line description>". Include ONLY lots we (custom software development firm) could realistically bid for. Empty string if lotStructure!="partial" OR no IT-relevant lots.\n' +
@@ -882,7 +882,9 @@ async function extractFieldsWithAI(text, meta = {}) {
     '   • Multi-lot Framework Without IT Lots: lotStructure=="partial" but NONE of the available lots is custom software development (e.g. all lots are management consulting, legal advisory, HR, surveys, hardware supply). Set rejectReason="framework_no_it_lots".\n' +
     '   AMBIGUOUS PROCUREMENT: If it says "system implementation" but implies configuring an off-the-shelf product → REJECT. ACCEPT (empty rejectReason) ONLY if it is custom software development, web/mobile app dev from scratch, bespoke architecture, or maintenance/evolution of custom systems. For partial-bid multi-lot tenders, ACCEPT (empty rejectReason) when AT LEAST ONE lot is custom software development — itLotsScope must list those lot(s).\n' +
     '- rejectCategory: short machine-readable category matching the rejectReason. Empty string if not rejected.\n' +
-    'Write all field values in English. Use exact numbers from the source.';
+    (meta.outputLanguage === 'lt'
+      ? 'Write the following field values in LITHUANIAN (original language, do not translate): requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement, itLotsScope. Write rejectReason and rejectCategory in English (machine-readable). Use exact numbers from the source.'
+      : 'Write all field values in English. Use exact numbers from the source.');
   const metaLine = [
     meta.title ? `Title: ${meta.title}` : '',
     meta.buyer ? `Buyer: ${meta.buyer}` : '',
@@ -3329,10 +3331,15 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
 
     const harvested = await page.evaluate(() => {
       const RX_FILENAME = /([\wÀ-ſ\-. _()]{3,120}\.(?:pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods))/i;
-      const RX_ONCLICK_FN = /^\s*(?:return\s+)?(addUser|viewCD|downloadDocument|getDocument|viewDocument|showDocument|displayDocument|getFile|downloadFile)\s*\(\s*['"]?(\d{3,15})['"]?\s*[,)]/i;
-      // Bulk ZIP button (Type B layout) — CVPP confirmed log 33:
-      //   <button onclick="downloadZip()">ATSISIŲSTI ZIP FAILĄ</button>
-      const RX_BULK_FN = /^\s*(?:return\s+)?(downloadZip|downloadAllDocuments|downloadAll|getAllDocuments)\s*\(/i;
+      // CVPP confirmed onclick patterns. The "ForAnonymous" suffix
+      // appears on the public/unauthenticated docs view and bypasses
+      // the addUser confirmation popup → direct download with no
+      // login required. We MUCH prefer the anonymous path (cheaper,
+      // more reliable).
+      const RX_ONCLICK_FN = /^\s*(?:return\s+)?(addUser|viewCD|downloadDocument|getDocument|viewDocument|showDocument|displayDocument|getFile|downloadFile|downloadDocForAnonymous|viewCDForAnonymous)\s*\(\s*['"]?(\d{3,15})['"]?\s*[,)]/i;
+      // Bulk ZIP button. Log 33: downloadZip() (post-login). Log 34:
+      // downloadForAnonymousUser() (anonymous — no login needed).
+      const RX_BULK_FN = /^\s*(?:return\s+)?(downloadZip|downloadAllDocuments|downloadAll|getAllDocuments|downloadForAnonymousUser|downloadForAnonymous|downloadAllForAnonymous)\s*\(/i;
       const out = [];
       const seen = new Set();
 
@@ -3721,8 +3728,17 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         continue;
       }
 
-      // INDIVIDUAL path — Type A (addUser anchor) or Type B (viewCD button).
-      // Click the element in-page by docId match in onclick.
+      // INDIVIDUAL path — Type A (addUser anchor) or Type B (viewCD button)
+      // OR Anonymous (downloadDocForAnonymous / viewCDForAnonymous).
+      // For anonymous fnName variants, direct disk-watch works (no popup);
+      // for authenticated variants we still try popup → PASIRINKTI flow.
+      const isAnonymousFn = /ForAnonymous$/i.test(d.fnName);
+
+      // Snapshot files before click — handles both anonymous direct
+      // download AND authenticated post-PASIRINKTI download.
+      let filesBefore = [];
+      try { filesBefore = fs.readdirSync(downloadDir); } catch (_) {}
+
       const clicked = await page.evaluate((docId, fnName, kind) => {
         const selector = kind === 'button' ? 'button[onclick], input[onclick]' : 'a[onclick]';
         const els = Array.from(document.querySelectorAll(selector));
@@ -3737,6 +3753,42 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
 
       if (!clicked) {
         console.log(`    ⚠️  viesiejipirkimai: failed to click doc id=${d.docId} "${d.filename}" (kind=${d.kind})`);
+        continue;
+      }
+
+      // ANONYMOUS path — click triggers direct download (no popup).
+      // Watch disk for the new file.
+      if (isAnonymousFn) {
+        const anonDeadline = Date.now() + 10000;
+        let newFile = null;
+        while (Date.now() < anonDeadline) {
+          await new Promise((r) => setTimeout(r, 500));
+          try {
+            const filesNow = fs.readdirSync(downloadDir);
+            const fresh = filesNow.filter((f) => !filesBefore.includes(f) && !f.endsWith('.crdownload'));
+            for (const fname of fresh) {
+              const fpath = pathLib.join(downloadDir, fname);
+              try {
+                const st = fs.statSync(fpath);
+                if (st.size > 500) { newFile = { name: fname, path: fpath, size: st.size }; break; }
+              } catch (_) {}
+            }
+            if (newFile) break;
+          } catch (_) {}
+        }
+        if (newFile) {
+          try {
+            const buf = fs.readFileSync(newFile.path);
+            captured.set(d.docId, { url: `file://${newFile.path}`, ct: '', buf, ts: Date.now() });
+            console.log(`    🇱🇹 viesiejipirkimai: ✓ captured ${buf.length}B from disk (anonymous): "${newFile.name}"`);
+            try { fs.unlinkSync(newFile.path); } catch (_) {}
+            continue;
+          } catch (e) {
+            console.log(`    ⚠️  viesiejipirkimai: failed to read anonymous download "${newFile.name}": ${e.message}`);
+          }
+        } else {
+          console.log(`    ⚠️  viesiejipirkimai: anonymous click id=${d.docId} didn't produce download within 10s`);
+        }
         continue;
       }
 
@@ -14564,12 +14616,25 @@ async function runScraper() {
           if (pdfLen === 0) {
             console.log(`    ⚠️ no pdfText — AI extract will likely return empty requirements/qualifications`);
           }
+          // 2026-05-26 — language-aware AI output. For Lithuanian tenders
+          // (viesiejipirkimai.lt), keep all extracted fields in LT — user
+          // requested no translation since Vytautas reads LT natively.
+          // For all other countries: English (existing behaviour).
+          const isLithuanianSource =
+            /(^|\.)viesiejipirkimai\.lt$/i.test(dd.sourceHost || '') ||
+            /(^|\.)viesiejipirkimai\.lt$/i.test(dd.sourceUrl || '') ||
+            (dd.country || '').toLowerCase() === 'lithuania';
           const ai = await extractFieldsWithAI(combinedText, {
             title: rawTitle,
             buyer: dd.organisation || '',
             country: dd.country || '',
             referenceNumber: dd.referenceNumber || '',
+            outputLanguage: isLithuanianSource ? 'lt' : 'en',
           });
+          if (isLithuanianSource) {
+            dd._keepOriginalLanguage = true;
+            console.log(`    🇱🇹 LT source detected — AI output will be in Lithuanian (no translation)`);
+          }
           const filled = [];
           if (!dd.maxBudget && ai.maxBudget) { dd.maxBudget = ai.maxBudget; filled.push('maxBudget'); }
           // AI estimate fallback — no explicit budget anywhere, but AI thinks
@@ -14668,7 +14733,9 @@ async function runScraper() {
 
         // 2) Translate title (always — short, heuristika klysta trumpiems).
         //    Jei tekstas jau anglų, Claude grąžins jį beveik identišką.
-        if (rawTitle) {
+        //    LT TENDER SKIP: viesiejipirkimai.lt tenderiams paliekam
+        //    lietuvišką originalą — user explicit request 2026-05-26.
+        if (rawTitle && !dd._keepOriginalLanguage) {
           const titleEn = await translateToEnglish(rawTitle, {
             hint: 'Public tender title',
             skipHeuristic: true,
@@ -14677,17 +14744,23 @@ async function runScraper() {
           if (titleEn && titleEn.trim() === rawTitle.trim() && /[^\x00-\x7F]/.test(rawTitle)) {
             console.log(`    ⚠️ title translation echoed source (likely AI failure): "${rawTitle.slice(0, 60)}"`);
           }
+        } else if (rawTitle && dd._keepOriginalLanguage) {
+          // For LT tenders, write the original title in BOTH "English" (col D)
+          // and "Original" (col E) columns — both cells will be Lithuanian.
+          dd.titleEn = rawTitle;
         }
 
-        // 3) Translate scopeOfAgreement if not already English
-        //    (if AI extract above produced English scope, skip; otherwise translate)
+        // 3) Translate scopeOfAgreement if not already English (LT skip).
         const scopeToTranslate = dd.scopeOfAgreement || rawScope;
-        if (scopeToTranslate) {
+        if (scopeToTranslate && !dd._keepOriginalLanguage) {
           const scopeEn = await translateToEnglish(scopeToTranslate, { hint: 'Public tender scope of agreement' });
           if (scopeEn) dd.scopeOfAgreementEn = scopeEn;
           if (scopeEn && scopeEn.trim() === scopeToTranslate.trim() && /[^\x00-\x7F]/.test(scopeToTranslate)) {
             console.log(`    ℹ️ scope translation skipped/echoed (heuristic flagged as English or AI echoed)`);
           }
+        } else if (scopeToTranslate && dd._keepOriginalLanguage) {
+          // For LT tenders, scope already comes from AI in Lithuanian.
+          dd.scopeOfAgreementEn = scopeToTranslate;
         }
 
         toFetch[i].details = dd;
