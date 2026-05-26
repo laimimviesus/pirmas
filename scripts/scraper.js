@@ -238,15 +238,16 @@ const ALWAYS_LOGIN_HOSTS = [
   // (post-redirect) depending on timing.
   'auftraege.bayern.de',
   'evergabe.bayern.de',
-  // viesiejipirkimai.lt (CVPP) — Lithuanian central public procurement
-  // portal. Anonymous /epps/cft/prepareViewCfTWS.do shows tender title
-  // and buyer info but hides documents behind "Rodyti pirkimo meniu"
-  // toggle that's gated by login. Authenticated /epps/cft/viewTenders.do
-  // requires session cookies. Force login on every viesiejipirkimai URL
-  // so the dedicated fetchViesiejiPirkimaiDocuments handler has auth to
-  // navigate the Dokumentai tab. User registered + creds in
-  // PORTAL_CREDS_JSON (key "viesiejipirkimai.lt") 2026-05-25.
-  'viesiejipirkimai.lt',
+  // viesiejipirkimai.lt — REMOVED 2026-05-26 per user request.
+  //
+  // Login flow triggers excessive email notifications (CVPP auto-
+  // subscribes the authenticated user to all viewed tender updates).
+  // The anonymous flow has its own working download path:
+  //   <a onclick="downloadDocForAnonymous('id')">filename</a>
+  //   <button onclick="downloadForAnonymousUser()">ATSISIŲSTI ZIP</button>
+  // These are wired into fetchViesiejiPirkimaiDocuments harvester and
+  // give us bulk ZIP + individual file downloads without login. See
+  // also explicit skip in attemptPortalLogin branch below.
   // dtvp.de — REMOVED 2026-05-14 (briefly added then reverted same day).
   //
   // The Germany run revealed two facts that make forced-login a NET
@@ -13167,6 +13168,25 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         // prisijungti su PORTAL_CREDS_JSON paslaptyje saugomais
         // credentials'ais; jei pavyksta, persifetchinam šaltinio puslapį
         // ir traukiame qualification laukus iš autentikuoto DOM'o.
+
+        // PER-HOST LOGIN SKIP — user-requested 2026-05-26.
+        // viesiejipirkimai.lt: login triggers excessive email notifications
+        // from CVPP. We deliberately skip login and rely solely on the
+        // anonymous downloadForAnonymousUser bulk-ZIP + downloadDocForAnonymous
+        // per-file flow handled in fetchViesiejiPirkimaiDocuments.
+        const NO_LOGIN_HOSTS = ['viesiejipirkimai.lt'];
+        const srcHost = String(src.sourceHost || '').toLowerCase().replace(/^www\./, '');
+        if (NO_LOGIN_HOSTS.some((h) => srcHost === h || srcHost.endsWith('.' + h))) {
+          console.log(
+            `    ⏭️  source login-gated on ${src.sourceHost}, but host is in NO_LOGIN_HOSTS — ` +
+            `skipping login (anonymous flow only, avoids email spam)`
+          );
+          details.sourceHost = src.sourceHost || null;
+          // Treat as non-gated so downstream pipeline proceeds with whatever
+          // anonymous content the handler already gathered.
+          src.loginGated = false;
+          src.loginOverride = 'no-login-host (anonymous-only policy)';
+        } else {
         console.log(
           `    source login-gated (host: ${src.sourceHost}, markers: ${src.matchedMarkers}, ` +
           `bodyLen: ${src.bodyLength}, passwordField: ${src.hasPasswordField})`
@@ -13303,6 +13323,7 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         } else {
           details.sourceSkipped = 'login-gated';
         }
+        } // close per-host NO_LOGIN_HOSTS else branch (paired with NO_LOGIN_HOSTS skip above)
       } else if (src && !src.error) {
         // Per-field logging — matome ką šaltinio puslapis grąžino
         const srcFieldSummary = {};
