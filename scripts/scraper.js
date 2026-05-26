@@ -3423,9 +3423,10 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
     // Popup handler — when addUser calls window.open(), Puppeteer fires
     // a 'targetcreated' event on the browser. We attach a response
     // listener to the popup page so its binary content gets captured
-    // too. We also try to close the popup after capture to avoid tab
-    // accumulation.
+    // too. We also track popup-by-docId so the per-click harvester
+    // can find the matching popup for in-popup anchor scraping.
     const popupPages = [];
+    const popupByDocId = new Map(); // docId -> page
     const targetCreatedHandler = async (target) => {
       try {
         if (target.type() !== 'page') return;
@@ -3433,9 +3434,66 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         if (!pp) return;
         popupPages.push(pp);
         pp.on('response', (r) => responseHandler(r, `popup[${popupPages.length - 1}]`));
+        // Try to match this popup to a known docId by URL pattern
+        try {
+          const u = pp.url();
+          const mDoc = u.match(/documentId=(\d{3,15})|docId=(\d{3,15})|fileId=(\d{3,15})|attachmentId=(\d{3,15})/i);
+          if (mDoc) {
+            const id = mDoc[1] || mDoc[2] || mDoc[3] || mDoc[4];
+            popupByDocId.set(id, pp);
+          }
+        } catch (_) {}
       } catch (_) {}
     };
     browser.on('targetcreated', targetCreatedHandler);
+
+    // Probe popup for actual download URL. CVPP confirmed flow:
+    //   addUser(id) → window.open(eAssociateUser.do?documentId=X&...)
+    //   eAssociateUser.do is a FULL HTML page (31 sub-resources) that
+    //   shows confirmation/preview + a real download anchor.
+    //
+    // We look for: anchors with file extensions, anchors with
+    // download-like paths, OR a "Atsisiųsti / Download" button.
+    const probePopupForDownload = async (pp) => {
+      try {
+        // Wait for popup to settle — eAssociateUser.do loads many JS
+        // files and renders the actual download anchor only after JS runs.
+        await pp.waitForNetworkIdle({ idleTime: 1500, timeout: 8000 }).catch(() => null);
+        await new Promise((r) => setTimeout(r, 1500));
+        const found = await pp.evaluate(() => {
+          const RX_DL_EXT = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:\?|#|$)/i;
+          const RX_DL_PATH = /downloadFile|displayFile|getFile|FileServlet|FileDownload|getResource|downloadAttachment|downloadDocument|getDocument|viewDocument|showFile|downloadContent|getContent/i;
+          const RX_DL_TEXT = /\b(atsisi[ųu]sti|parsisi[ųu]sti|atidaryti|download)\b/i;
+          const candidates = [];
+          // Anchors first
+          for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+            const href = a.getAttribute('href') || '';
+            if (!href || href === '#') continue;
+            const onclick = a.getAttribute('onclick') || '';
+            let abs = null;
+            try { abs = new URL(href, location.href).toString(); } catch (_) { continue; }
+            const text = (a.innerText || a.textContent || '').trim();
+            if (RX_DL_EXT.test(abs) || RX_DL_PATH.test(abs) || RX_DL_TEXT.test(text) ||
+                RX_DL_PATH.test(onclick)) {
+              candidates.push({ url: abs, text: text.slice(0, 100), tag: 'a-href' });
+            }
+          }
+          // Forms (sometimes the download is a form submit)
+          for (const f of Array.from(document.querySelectorAll('form'))) {
+            const action = f.getAttribute('action') || '';
+            if (!action) continue;
+            if (RX_DL_PATH.test(action)) {
+              try {
+                const abs = new URL(action, location.href).toString();
+                candidates.push({ url: abs, text: 'form-action', tag: 'form' });
+              } catch (_) {}
+            }
+          }
+          return candidates;
+        }).catch(() => []);
+        return found;
+      } catch (_) { return []; }
+    };
 
     for (const d of allDocs.slice(0, 6)) {
       const tStart = Date.now();
@@ -3455,27 +3513,94 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         console.log(`    ⚠️  viesiejipirkimai: failed to click doc id=${d.docId} "${d.filename}"`);
         continue;
       }
-      // Wait up to 10s — increased from 8s for slow popup downloads.
-      const waitDeadline = tStart + 10000;
-      while (Date.now() < waitDeadline) {
-        await new Promise((r) => setTimeout(r, 500));
+
+      // PHASE 1 — quick wait for direct binary response (some docs may
+      // stream directly via window.location.href = ...).
+      const fastDeadline = tStart + 3000;
+      let foundFast = false;
+      while (Date.now() < fastDeadline) {
+        await new Promise((r) => setTimeout(r, 400));
         const fresh = responseCache.find((r) => r.ts >= tStart);
         if (fresh) {
           captured.set(d.docId, fresh);
+          foundFast = true;
           break;
         }
       }
-      if (!captured.has(d.docId)) {
-        // Show what /epps/ requests DID fire after this click, so we
-        // can see whether addUser made any network activity at all.
-        const recentReqs = allEppsRequests.filter((r) => r.ts >= tStart);
-        if (recentReqs.length) {
-          console.log(`    ⚠️  viesiejipirkimai: clicked id=${d.docId} — no binary response, but ${recentReqs.length} /epps/ request(s) fired:`);
-          for (const r of recentReqs.slice(0, 5)) {
-            console.log(`         [${r.frame}] ${r.ct} → ${r.url.slice(-90)}`);
+      if (foundFast) continue;
+
+      // PHASE 2 — popup-based download. addUser → eAssociateUser.do popup
+      // → find real download URL inside popup → fetch.
+      await new Promise((r) => setTimeout(r, 2500));
+      const matchedPopup = popupByDocId.get(d.docId) ||
+        popupPages.find((pp) => {
+          try {
+            const u = pp.url();
+            return u.includes(`documentId=${d.docId}`) || u.includes(`docId=${d.docId}`);
+          } catch (_) { return false; }
+        });
+
+      if (matchedPopup) {
+        const dlCandidates = await probePopupForDownload(matchedPopup);
+        if (dlCandidates.length) {
+          console.log(`    🇱🇹 viesiejipirkimai: popup probe found ${dlCandidates.length} download candidate(s) for id=${d.docId}`);
+          // Try each candidate until one returns binary
+          for (const dc of dlCandidates.slice(0, 5)) {
+            const dlStart = Date.now();
+            const fetchResult = await matchedPopup.evaluate(async (url) => {
+              try {
+                const r = await fetch(url, { credentials: 'include', redirect: 'follow' });
+                if (!r.ok) return { ok: false, status: r.status };
+                const ct = r.headers.get('content-type') || '';
+                const ab = await r.arrayBuffer();
+                return { ok: true, status: r.status, ct, url: r.url || url, data: Array.from(new Uint8Array(ab)) };
+              } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
+            }, dc.url).catch(() => null);
+            if (fetchResult && fetchResult.ok && fetchResult.data && fetchResult.data.length > 500) {
+              const buf = Buffer.from(fetchResult.data);
+              const b0 = buf[0], b1 = buf[1], b2 = buf[2], b3 = buf[3];
+              const isBin = (b0 === 0x25 && b1 === 0x50) ||  // PDF
+                            (b0 === 0x50 && b1 === 0x4B) ||  // ZIP/DOCX
+                            (b0 === 0xD0 && b1 === 0xCF);    // legacy Office
+              if (isBin) {
+                captured.set(d.docId, {
+                  url: fetchResult.url,
+                  ct: fetchResult.ct,
+                  buf,
+                  ts: Date.now(),
+                });
+                console.log(`    🇱🇹 viesiejipirkimai: ✓ fetched ${buf.length}B from popup → ${dc.url.slice(-80)}`);
+                break;
+              }
+            }
           }
         } else {
-          console.log(`    ⚠️  viesiejipirkimai: clicked id=${d.docId} — NO /epps/ requests fired at all (popup blocked? form submit failed? function noop?)`);
+          console.log(`    ⚠️  viesiejipirkimai: popup loaded for id=${d.docId} but no download URL found inside`);
+          // Diagnostic — dump popup body preview
+          try {
+            const popupDiag = await matchedPopup.evaluate(() => {
+              const body = (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+              const anchors = Array.from(document.querySelectorAll('a[href]'))
+                .filter((a) => a.offsetParent !== null)
+                .slice(0, 10)
+                .map((a) => `"${(a.innerText || '').trim().slice(0, 40)}" → ${(a.getAttribute('href') || '').slice(0, 80)}`);
+              return { url: location.href, body, anchors };
+            }).catch(() => null);
+            if (popupDiag) {
+              console.log(`         popup URL: ${popupDiag.url.slice(-100)}`);
+              console.log(`         popup body: ${popupDiag.body.slice(0, 200)}`);
+              for (const a of popupDiag.anchors) console.log(`         a: ${a}`);
+            }
+          } catch (_) {}
+        }
+      }
+
+      if (!captured.has(d.docId)) {
+        const recentReqs = allEppsRequests.filter((r) => r.ts >= tStart);
+        if (recentReqs.length) {
+          console.log(`    ⚠️  viesiejipirkimai: clicked id=${d.docId} — no binary captured, ${recentReqs.length} /epps/ request(s) seen (popup found=${!!matchedPopup})`);
+        } else {
+          console.log(`    ⚠️  viesiejipirkimai: clicked id=${d.docId} — NO /epps/ requests at all`);
         }
       }
     }
