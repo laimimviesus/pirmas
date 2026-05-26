@@ -8521,6 +8521,26 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
   try { mammothLib  = require('mammoth');   } catch (_) {}
   try { admZipLib   = require('adm-zip');   } catch (_) {}
 
+  // 2026-05-26 — CDP download capture for bulk ZIP button.
+  // User-confirmed: doc anchors (#/procurement/X/documents/source-document?
+  // group=B&documentOldId=Y) are Angular UI router routes — direct fetch
+  // returns 2606B SPA shell, not files. Workaround: click the green
+  // "Download published procurement documents" / "Laadi alla avaldatud
+  // hankedokumendid" button which ZIPs ALL docs server-side and streams
+  // via Content-Disposition. Browser-level CDP download config catches it.
+  const fs = require('fs');
+  const pathLib = require('path');
+  const os = require('os');
+  const downloadDir = fs.mkdtempSync(pathLib.join(os.tmpdir(), 'rhr-dl-'));
+  try {
+    const browserCdp = await browser.target().createCDPSession();
+    await browserCdp.send('Browser.setDownloadBehavior', {
+      behavior: 'allow',
+      downloadPath: downloadDir,
+      eventsEnabled: true,
+    }).catch(() => null);
+  } catch (_) {}
+
   let page = null;
   try {
     page = await browser.newPage();
@@ -8534,6 +8554,14 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'et'] });
       });
+    } catch (_) {}
+    // Per-page CDP download config as fallback
+    try {
+      const pageCdp = await page.target().createCDPSession();
+      await pageCdp.send('Page.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: downloadDir,
+      }).catch(() => null);
     } catch (_) {}
 
     // Extract procurement ID from URL — works for both
@@ -8556,13 +8584,119 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
       const docsUrl = `https://riigihanked.riik.ee/rhr-web/#/procurement/${procurementId}/documents?group=B`;
       try {
         await page.evaluate((target) => {
-          // Use SPA-friendly hash routing
           window.location.href = target;
         }, docsUrl);
       } catch (_) {}
       await new Promise((r) => setTimeout(r, 2500));
       try { await page.waitForNetworkIdle({ idleTime: 1500, timeout: 8000 }); } catch (_) {}
       await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    // STEP 2.5 — PREFERRED PATH: click "Download published procurement
+    // documents" button → bulk ZIP server-side. One click → all files
+    // at once → captured via CDP disk watch.
+    let filesBefore = [];
+    try { filesBefore = fs.readdirSync(downloadDir); } catch (_) {}
+
+    const bulkClicked = await page.evaluate(() => {
+      // Match in EN ("Download published procurement documents",
+      // "Download selected documents") and ET ("Laadi alla avaldatud
+      // hankedokumendid", "Laadi alla valitud dokumendid"). Prefer the
+      // "published" / "avaldatud" variant — it's the COMPLETE set with
+      // no checkbox selection needed.
+      const RE_PUBLISHED = /^\s*(download\s+published\s+procurement\s+documents|laadi\s+alla\s+avaldatud\s+hankedokumendid|laadi\s+alla\s+k[oõ]ik\s+dokumendid)\s*$/i;
+      const RE_ANY_DOWNLOAD = /^\s*(download[\s\w]*documents?|laadi[\s\w]*dokumendid)\s*$/i;
+      const candidates = Array.from(document.querySelectorAll(
+        'button, a.btn, [role="button"], input[type="button"], input[type="submit"]'
+      ));
+      // Pass 1 — exact "published" match
+      for (const el of candidates) {
+        if (el.disabled || el.offsetParent === null) continue;
+        const text = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text && RE_PUBLISHED.test(text)) {
+          try { el.scrollIntoView({ block: 'center' }); el.click(); return text.slice(0, 60); } catch (_) {}
+        }
+      }
+      // Pass 2 — any "download...documents" wording
+      for (const el of candidates) {
+        if (el.disabled || el.offsetParent === null) continue;
+        const text = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text && text.length < 80 && RE_ANY_DOWNLOAD.test(text)) {
+          try { el.scrollIntoView({ block: 'center' }); el.click(); return text.slice(0, 60); } catch (_) {}
+        }
+      }
+      return null;
+    }).catch(() => null);
+
+    if (bulkClicked) {
+      console.log(`    🇪🇪 riigihanked: clicked bulk download button "${bulkClicked}" — waiting for ZIP`);
+      // Wait up to 30s for ZIP (procurement bundles can be 5-15MB)
+      const watchDeadline = Date.now() + 30000;
+      let newFile = null;
+      while (Date.now() < watchDeadline) {
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+          const filesNow = fs.readdirSync(downloadDir);
+          const fresh = filesNow.filter((f) => !filesBefore.includes(f) && !f.endsWith('.crdownload'));
+          for (const fname of fresh) {
+            const fpath = pathLib.join(downloadDir, fname);
+            try {
+              const st = fs.statSync(fpath);
+              if (st.size > 1000) { newFile = { name: fname, path: fpath, size: st.size }; break; }
+            } catch (_) {}
+          }
+          if (newFile) break;
+        } catch (_) {}
+      }
+      if (newFile) {
+        try {
+          const buf = fs.readFileSync(newFile.path);
+          console.log(`    🇪🇪 riigihanked: ✓ captured bulk ZIP ${buf.length}B: "${newFile.name}"`);
+          try { fs.unlinkSync(newFile.path); } catch (_) {}
+          // Parse ZIP and return text — bypass legacy per-anchor path
+          const texts = [];
+          if (admZipLib) {
+            try {
+              const zip = new admZipLib(buf);
+              const entries = zip.getEntries().filter((e) => !e.isDirectory).slice(0, 12);
+              for (const z of entries) {
+                const innerBytes = z.getData();
+                const ext = (z.entryName.match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '';
+                let extracted = '';
+                try {
+                  if (ext.toLowerCase() === 'pdf' && pdfParseLib) {
+                    const p = await pdfParseLib(innerBytes);
+                    extracted = (p?.text || '').trim();
+                  } else if (['docx', 'odt'].includes(ext.toLowerCase()) && mammothLib) {
+                    const out = await mammothLib.extractRawText({ buffer: innerBytes });
+                    extracted = (out?.value || '').trim();
+                  }
+                } catch (_) {}
+                if (extracted && extracted.length > 100) {
+                  const clipped = extracted.slice(0, 50000);
+                  texts.push(`--- (zip:${newFile.name}) ${z.entryName} ---\n${clipped}`);
+                  console.log(`    📦 zip entry "${z.entryName}" (${ext}, ${innerBytes.length}B → ${clipped.length}ch)`);
+                }
+              }
+            } catch (e) {
+              console.log(`    ⚠️  riigihanked: ZIP parse failed: ${(e.message || '').slice(0, 80)}`);
+            }
+          }
+          // Cleanup tempdir
+          try {
+            const remaining = fs.readdirSync(downloadDir);
+            for (const f of remaining) { try { fs.unlinkSync(pathLib.join(downloadDir, f)); } catch (_) {} }
+            try { fs.rmdirSync(downloadDir); } catch (_) {}
+          } catch (_) {}
+          if (texts.length) return texts;
+        } catch (e) {
+          console.log(`    ⚠️  riigihanked: failed to read bulk ZIP: ${e.message}`);
+        }
+      } else {
+        console.log(`    ⚠️  riigihanked: bulk click but no ZIP appeared within 30s — falling back to per-anchor scrape`);
+      }
+    } else {
+      console.log(`    ℹ️  riigihanked: bulk download button not found — falling back to per-anchor scrape`);
     }
 
     // STEP 3 — diagnostic snapshot
@@ -8794,6 +8928,12 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
     return [];
   } finally {
     try { if (page) await page.close(); } catch (_) {}
+    // Cleanup temp download dir (may have leftover files if bulk path failed)
+    try {
+      const remaining = fs.readdirSync(downloadDir);
+      for (const f of remaining) { try { fs.unlinkSync(pathLib.join(downloadDir, f)); } catch (_) {} }
+      try { fs.rmdirSync(downloadDir); } catch (_) {}
+    } catch (_) {}
   }
 }
 
