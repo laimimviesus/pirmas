@@ -8599,36 +8599,62 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
     try { filesBefore = fs.readdirSync(downloadDir); } catch (_) {}
 
     const bulkClicked = await page.evaluate(() => {
-      // Match in EN ("Download published procurement documents",
-      // "Download selected documents") and ET ("Laadi alla avaldatud
-      // hankedokumendid", "Laadi alla valitud dokumendid"). Prefer the
-      // "published" / "avaldatud" variant — it's the COMPLETE set with
-      // no checkbox selection needed.
-      const RE_PUBLISHED = /^\s*(download\s+published\s+procurement\s+documents|laadi\s+alla\s+avaldatud\s+hankedokumendid|laadi\s+alla\s+k[oõ]ik\s+dokumendid)\s*$/i;
-      const RE_ANY_DOWNLOAD = /^\s*(download[\s\w]*documents?|laadi[\s\w]*dokumendid)\s*$/i;
+      // Match the PUBLISHED bulk button (all docs at once, no checkbox
+      // selection needed). EN: "Download published procurement documents".
+      // ET: "Laadi alla avaldatud hankedokumendid" / "Laadi alla avaldatud
+      // dokumendid" / variants. Must NOT match "valitud/selected" — that
+      // button needs prior checkbox tick + opens an empty ZIP.
+      //
+      // 2026-05-26 log 36: previous broader regex caught
+      // "Laadi alla valitud dokumendid" (selected) before reaching the
+      // published button → no ZIP produced. Tightened with explicit
+      // "avaldatud" / "published" REQUIREMENT.
+      const RE_REJECT = /\b(valitud|selected|valitut)\b/i;
+      // Must contain BOTH "avaldatud"/"published" AND "dokument"/"document"
+      const RE_PUBLISHED = /\b(avaldatud|published)\b[\s\S]{0,40}\b(dokument|hankedokument)/i;
+      // Anti-fallback: also accept "all documents" wording.
+      const RE_ALL = /\b(k[oõ]ik|all)\b[\s\S]{0,20}\b(dokument|hankedokument)/i;
       const candidates = Array.from(document.querySelectorAll(
         'button, a.btn, [role="button"], input[type="button"], input[type="submit"]'
       ));
-      // Pass 1 — exact "published" match
+      // Pass 1 — strict "avaldatud/published"
       for (const el of candidates) {
         if (el.disabled || el.offsetParent === null) continue;
         const text = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim();
-        if (text && RE_PUBLISHED.test(text)) {
-          try { el.scrollIntoView({ block: 'center' }); el.click(); return text.slice(0, 60); } catch (_) {}
+        if (!text || text.length > 80) continue;
+        if (RE_REJECT.test(text)) continue;
+        if (RE_PUBLISHED.test(text)) {
+          try { el.scrollIntoView({ block: 'center' }); el.click(); return `published:${text.slice(0, 60)}`; } catch (_) {}
         }
       }
-      // Pass 2 — any "download...documents" wording
+      // Pass 2 — "all/kõik documents" variant
       for (const el of candidates) {
         if (el.disabled || el.offsetParent === null) continue;
         const text = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim();
-        if (text && text.length < 80 && RE_ANY_DOWNLOAD.test(text)) {
-          try { el.scrollIntoView({ block: 'center' }); el.click(); return text.slice(0, 60); } catch (_) {}
+        if (!text || text.length > 80) continue;
+        if (RE_REJECT.test(text)) continue;
+        if (RE_ALL.test(text)) {
+          try { el.scrollIntoView({ block: 'center' }); el.click(); return `all:${text.slice(0, 60)}`; } catch (_) {}
         }
       }
-      return null;
+      // Pass 3 — diagnostic dump of ALL visible buttons so we can
+      // refine the regex against the real wording if it's still off.
+      const sample = candidates
+        .filter((el) => el.offsetParent !== null && !el.disabled)
+        .slice(0, 12)
+        .map((el) => ((el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60)))
+        .filter((t) => t);
+      return { failed: true, sample };
     }).catch(() => null);
 
-    if (bulkClicked) {
+    if (bulkClicked && bulkClicked.failed) {
+      console.log(`    ⚠️  riigihanked: no PUBLISHED bulk button matched. Visible buttons (${bulkClicked.sample.length}):`);
+      for (const s of bulkClicked.sample) console.log(`         "${s}"`);
+    }
+
+    // bulkClicked is now: null (eval failed) | string (button text) | {failed:true} (diag)
+    const bulkWasClicked = typeof bulkClicked === 'string';
+    if (bulkWasClicked) {
       console.log(`    🇪🇪 riigihanked: clicked bulk download button "${bulkClicked}" — waiting for ZIP`);
       // Wait up to 30s for ZIP (procurement bundles can be 5-15MB)
       const watchDeadline = Date.now() + 30000;
