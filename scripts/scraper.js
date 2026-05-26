@@ -3447,25 +3447,68 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
     };
     browser.on('targetcreated', targetCreatedHandler);
 
-    // Probe popup for actual download URL. CVPP confirmed flow:
-    //   addUser(id) → window.open(eAssociateUser.do?documentId=X&...)
-    //   eAssociateUser.do is a FULL HTML page (31 sub-resources) that
-    //   shows confirmation/preview + a real download anchor.
+    // Probe popup. CVPP confirmed flow (2026-05-26 log 30):
+    //   addUser(id) → window.open(prepareAssociateUser.do?documentId=X&...)
+    //   prepareAssociateUser.do is the "SUSIETI SU PIRKIMU" (associate
+    //   with procurement) confirmation page — NOT a direct download.
+    //   The user must click "Susieti / Sutinku / Patvirtinti" button,
+    //   which POSTs to a register endpoint AND THEN streams the file.
     //
-    // We look for: anchors with file extensions, anchors with
-    // download-like paths, OR a "Atsisiųsti / Download" button.
+    // So our flow is:
+    //   1. Wait for popup to settle
+    //   2. Click the confirm button INSIDE the popup
+    //   3. Wait for binary response that follows
+    //   4. (Optional) probe for any direct anchor/form action that
+    //      might bypass the confirmation
     const probePopupForDownload = async (pp) => {
       try {
-        // Wait for popup to settle — eAssociateUser.do loads many JS
-        // files and renders the actual download anchor only after JS runs.
         await pp.waitForNetworkIdle({ idleTime: 1500, timeout: 8000 }).catch(() => null);
         await new Promise((r) => setTimeout(r, 1500));
+
+        // PRIMARY PATH — click the "Susieti / Sutinku / Patvirtinti" button.
+        const confirmClicked = await pp.evaluate(() => {
+          // Match LT confirmation verbs: susieti (associate), sutinku
+          // (agree), patvirtinti (confirm), tęsti (continue), atsisiųsti
+          // (download — sometimes used). Plus EN fallbacks.
+          const RE_CONFIRM = /^\s*(susieti|sutinku|patvirtinti|t[ęe]sti|atsisi[ųu]sti|parsisi[ųu]sti|i\s*agree|confirm|continue|accept|download|ok)\b/i;
+          // Anti-pattern — reject "Atšaukti/Cancel/Uždaryti"
+          const RE_REJECT = /^\s*(at[šs]aukti|u[žz]daryti|cancel|close|atgal|back)\b/i;
+          const cands = Array.from(document.querySelectorAll(
+            'button, input[type="submit"], input[type="button"], a.btn, a[role="button"], [role="button"]'
+          ));
+          for (const el of cands) {
+            if (el.disabled || el.offsetParent === null) continue;
+            const text = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!text || text.length > 60) continue;
+            if (RE_REJECT.test(text)) continue;
+            if (RE_CONFIRM.test(text)) {
+              try { el.scrollIntoView({ block: 'center' }); el.click(); return text.slice(0, 60); } catch (_) {}
+            }
+          }
+          return null;
+        }).catch(() => null);
+
+        if (confirmClicked) {
+          console.log(`       popup: clicked confirm button "${confirmClicked}" — waiting for download`);
+          // After confirm click, server may either:
+          //  (a) Stream binary directly in the popup
+          //  (b) Redirect to a download URL (new request fires)
+          //  (c) Close popup and stream in main page
+          // Wait briefly for navigation/network.
+          await Promise.race([
+            pp.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 6000 }).catch(() => null),
+            new Promise((r) => setTimeout(r, 4000)),
+          ]);
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+
+        // SECONDARY PATH — also collect any direct download anchors or
+        // form actions in case the popup already renders them post-confirm.
         const found = await pp.evaluate(() => {
           const RX_DL_EXT = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:\?|#|$)/i;
-          const RX_DL_PATH = /downloadFile|displayFile|getFile|FileServlet|FileDownload|getResource|downloadAttachment|downloadDocument|getDocument|viewDocument|showFile|downloadContent|getContent/i;
+          const RX_DL_PATH = /downloadFile|displayFile|getFile|FileServlet|FileDownload|getResource|downloadAttachment|downloadDocument|getDocument|viewDocument|showFile|downloadContent|getContent|associateUserToDocument|associateUserAction/i;
           const RX_DL_TEXT = /\b(atsisi[ųu]sti|parsisi[ųu]sti|atidaryti|download)\b/i;
           const candidates = [];
-          // Anchors first
           for (const a of Array.from(document.querySelectorAll('a[href]'))) {
             const href = a.getAttribute('href') || '';
             if (!href || href === '#') continue;
@@ -3478,7 +3521,6 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
               candidates.push({ url: abs, text: text.slice(0, 100), tag: 'a-href' });
             }
           }
-          // Forms (sometimes the download is a form submit)
           for (const f of Array.from(document.querySelectorAll('form'))) {
             const action = f.getAttribute('action') || '';
             if (!action) continue;
@@ -3576,20 +3618,50 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           }
         } else {
           console.log(`    ⚠️  viesiejipirkimai: popup loaded for id=${d.docId} but no download URL found inside`);
-          // Diagnostic — dump popup body preview
+          // Diagnostic — dump popup state. Show more body + ALL buttons.
           try {
             const popupDiag = await matchedPopup.evaluate(() => {
-              const body = (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+              const body = (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 1500);
+              const visible = (el) => el && el.offsetParent !== null;
               const anchors = Array.from(document.querySelectorAll('a[href]'))
-                .filter((a) => a.offsetParent !== null)
-                .slice(0, 10)
-                .map((a) => `"${(a.innerText || '').trim().slice(0, 40)}" → ${(a.getAttribute('href') || '').slice(0, 80)}`);
-              return { url: location.href, body, anchors };
+                .filter(visible)
+                .slice(0, 15)
+                .map((a) => ({
+                  text: (a.innerText || '').trim().slice(0, 40),
+                  href: (a.getAttribute('href') || '').slice(0, 80),
+                  onclick: (a.getAttribute('onclick') || '').slice(0, 60),
+                }));
+              const buttons = Array.from(document.querySelectorAll(
+                'button, input[type="submit"], input[type="button"]'
+              ))
+                .filter(visible)
+                .slice(0, 12)
+                .map((b) => ({
+                  tag: b.tagName.toLowerCase(),
+                  text: (b.innerText || b.value || '').trim().slice(0, 60),
+                  type: b.getAttribute('type') || '',
+                  disabled: !!b.disabled,
+                  onclick: (b.getAttribute('onclick') || '').slice(0, 60),
+                }));
+              return { url: location.href, body, anchors, buttons };
             }).catch(() => null);
             if (popupDiag) {
               console.log(`         popup URL: ${popupDiag.url.slice(-100)}`);
-              console.log(`         popup body: ${popupDiag.body.slice(0, 200)}`);
-              for (const a of popupDiag.anchors) console.log(`         a: ${a}`);
+              console.log(`         popup body (first 800ch): ${popupDiag.body.slice(0, 800)}`);
+              if (popupDiag.buttons.length) {
+                console.log(`         popup buttons (${popupDiag.buttons.length}):`);
+                for (const b of popupDiag.buttons) {
+                  const oc = b.onclick ? ` onclick="${b.onclick}"` : '';
+                  console.log(`           <${b.tag}${b.type ? ' type=' + b.type : ''}${b.disabled ? ' DISABLED' : ''}> "${b.text}"${oc}`);
+                }
+              }
+              if (popupDiag.anchors.length) {
+                console.log(`         popup anchors (${popupDiag.anchors.length}):`);
+                for (const a of popupDiag.anchors) {
+                  const oc = a.onclick ? ` onclick="${a.onclick}"` : '';
+                  console.log(`           "${a.text}" → ${a.href}${oc}`);
+                }
+              }
             }
           } catch (_) {}
         }
