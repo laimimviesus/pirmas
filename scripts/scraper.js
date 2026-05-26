@@ -8610,10 +8610,20 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
       // published button → no ZIP produced. Tightened with explicit
       // "avaldatud" / "published" REQUIREMENT.
       const RE_REJECT = /\b(valitud|selected|valitut)\b/i;
-      // Must contain BOTH "avaldatud"/"published" AND "dokument"/"document"
-      const RE_PUBLISHED = /\b(avaldatud|published)\b[\s\S]{0,40}\b(dokument|hankedokument)/i;
-      // Anti-fallback: also accept "all documents" wording.
-      const RE_ALL = /\b(k[oõ]ik|all)\b[\s\S]{0,20}\b(dokument|hankedokument)/i;
+      // Must contain "kehtivad"/"avaldatud"/"published" (= currently
+      // valid / published) + "dokumen" stem.
+      //
+      // 2026-05-26 log 37 confirmed actual ET text: "Laadi alla
+      // kehtivad hanke dokumendid". Notes:
+      //   - "kehtivad" (valid/current), NOT "avaldatud" as guessed
+      //   - "dokumendid" (Estonian plural) NOT "dokumentid" — the "t"
+      //     becomes "d" via consonant gradation. We match the prefix
+      //     "dokumen" so "dokument"/"dokumendi"/"dokumendid"/"documents"
+      //     all hit.
+      // EN "document" (with C) vs ET "dokument" (with K) — match BOTH
+      // via /do[ck]umen/ stem. Covers documents/dokumendid/dokumentide/etc.
+      const RE_PUBLISHED = /\b(kehtivad|kehtivat|avaldatud|published)\b[\s\S]{0,40}\bdo[ck]umen/i;
+      const RE_ALL = /\b(k[oõ]ik|all)\b[\s\S]{0,20}\bdo[ck]umen/i;
       const candidates = Array.from(document.querySelectorAll(
         'button, a.btn, [role="button"], input[type="button"], input[type="submit"]'
       ));
