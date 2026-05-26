@@ -3329,12 +3329,14 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
 
     const harvested = await page.evaluate(() => {
       const RX_FILENAME = /([\wÀ-ſ\-. _()]{3,120}\.(?:pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods))/i;
-      // CVPP confirmed onclick function names (broad — also captures
-      // synonyms like downloadDocument, getDocument). Numeric arg is
-      // the document ID.
-      const RX_ONCLICK_FN = /^\s*(?:return\s+)?(addUser|downloadDocument|getDocument|viewDocument|showDocument|displayDocument|getFile|downloadFile)\s*\(\s*['"]?(\d{3,15})['"]?\s*[,)]/i;
+      const RX_ONCLICK_FN = /^\s*(?:return\s+)?(addUser|viewCD|downloadDocument|getDocument|viewDocument|showDocument|displayDocument|getFile|downloadFile)\s*\(\s*['"]?(\d{3,15})['"]?\s*[,)]/i;
+      // Bulk ZIP button (Type B layout) — CVPP confirmed log 33:
+      //   <button onclick="downloadZip()">ATSISIŲSTI ZIP FAILĄ</button>
+      const RX_BULK_FN = /^\s*(?:return\s+)?(downloadZip|downloadAllDocuments|downloadAll|getAllDocuments)\s*\(/i;
       const out = [];
       const seen = new Set();
+
+      // PASS 1 — anchor-based items (Type A: addUser('id')).
       const anchors = Array.from(document.querySelectorAll('a[onclick]'));
       for (const a of anchors) {
         const onclick = (a.getAttribute('onclick') || '').trim();
@@ -3348,20 +3350,59 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         const key = `${fnName}:${docId}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        out.push({
-          docId,
-          fnName,
-          filename: filename.slice(0, 180),
-          text: text.slice(0, 200),
-          // We pass a CSS-friendly selector descriptor to find this anchor again later
-          onclickSig: onclick.slice(0, 100),
-        });
+        out.push({ docId, fnName, filename: filename.slice(0, 180), text: text.slice(0, 200), kind: 'anchor' });
         if (out.length >= 30) break;
       }
+
+      // PASS 2 — button-based items (Type B: viewCD('id') + downloadZip()).
+      // CVPP confirmed log 33:
+      //   <button onclick="viewCD('8009073')"></button>  — individual file
+      //   <button onclick="downloadZip()">ATSISIŲSTI ZIP</button> — bulk ZIP
+      // We prefer the BULK button when present (one click → all files at once).
+      const buttons = Array.from(document.querySelectorAll('button[onclick], input[onclick]'));
+      let foundBulk = false;
+      for (const b of buttons) {
+        const onclick = (b.getAttribute('onclick') || '').trim();
+        const text = (b.innerText || b.value || b.textContent || '').replace(/\s+/g, ' ').trim();
+        if (RX_BULK_FN.test(onclick)) {
+          out.unshift({
+            docId: 'bulk',
+            fnName: onclick.match(RX_BULK_FN)[1],
+            filename: text || 'ATSISIŲSTI ZIP',
+            text: text.slice(0, 200),
+            kind: 'bulk',
+          });
+          foundBulk = true;
+          continue;
+        }
+        const m = onclick.match(RX_ONCLICK_FN);
+        if (!m) continue;
+        const fnName = m[1];
+        const docId = m[2];
+        const key = `${fnName}:${docId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        // For viewCD-style buttons, the FILENAME comes from the table row's
+        // "Dokumentas" cell — climb up to <tr> and look there.
+        let filename = text;
+        try {
+          const tr = b.closest('tr');
+          if (tr) {
+            const rowText = (tr.innerText || '').replace(/\s+/g, ' ').trim();
+            const fnMatch = rowText.match(RX_FILENAME);
+            if (fnMatch) filename = fnMatch[1];
+          }
+        } catch (_) {}
+        out.push({ docId, fnName, filename: (filename || `document-${docId}`).slice(0, 180), text: text.slice(0, 200), kind: 'button' });
+        if (out.length >= 30) break;
+      }
+
       return out;
     }).catch(() => []);
 
-    console.log(`    🇱🇹 viesiejipirkimai: ${harvested.length} doc anchor(s) found via onclick="addUser/..." pattern (resourceId=${resourceId})`);
+    const bulkCount = harvested.filter((h) => h.kind === 'bulk').length;
+    const itemCount = harvested.length - bulkCount;
+    console.log(`    🇱🇹 viesiejipirkimai: ${harvested.length} item(s) detected (${bulkCount} bulk-ZIP, ${itemCount} individual) for resourceId=${resourceId}`);
 
     if (harvested.length === 0) {
       // No anchors via the addUser pattern — run the full diagnostic.
@@ -3615,20 +3656,87 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
 
     for (const d of allDocs.slice(0, 6)) {
       const tStart = Date.now();
-      // Click the anchor in-page by docId match in onclick.
-      const clicked = await page.evaluate((docId, fnName) => {
-        const anchors = Array.from(document.querySelectorAll('a[onclick]'));
-        for (const a of anchors) {
-          const oc = a.getAttribute('onclick') || '';
+
+      // BULK ZIP path — Type B layout. Click downloadZip() button on
+      // MAIN page (no popup involved), then wait for ZIP file to land in
+      // download dir.
+      if (d.kind === 'bulk') {
+        let filesBefore = [];
+        try { filesBefore = fs.readdirSync(downloadDir); } catch (_) {}
+
+        const bulkClicked = await page.evaluate((fnName) => {
+          const buttons = Array.from(document.querySelectorAll('button[onclick], input[onclick]'));
+          for (const b of buttons) {
+            const oc = b.getAttribute('onclick') || '';
+            if (new RegExp(`\\b${fnName}\\s*\\(`).test(oc)) {
+              try { b.scrollIntoView({ block: 'center' }); b.click(); return true; } catch (_) {}
+            }
+          }
+          return false;
+        }, d.fnName).catch(() => false);
+
+        if (!bulkClicked) {
+          console.log(`    ⚠️  viesiejipirkimai: failed to click bulk button "${d.filename}"`);
+          continue;
+        }
+        console.log(`    🇱🇹 viesiejipirkimai: clicked bulk ZIP button "${d.filename}" — waiting for download`);
+
+        // Wait up to 30s for ZIP — CVPP ZIPs can be multi-MB.
+        const watchDeadline = Date.now() + 30000;
+        let newFile = null;
+        while (Date.now() < watchDeadline) {
+          await new Promise((r) => setTimeout(r, 1000));
+          try {
+            const filesNow = fs.readdirSync(downloadDir);
+            const fresh = filesNow.filter((f) => !filesBefore.includes(f) && !f.endsWith('.crdownload'));
+            for (const fname of fresh) {
+              const fpath = pathLib.join(downloadDir, fname);
+              try {
+                const st = fs.statSync(fpath);
+                if (st.size > 1000) { newFile = { name: fname, path: fpath, size: st.size }; break; }
+              } catch (_) {}
+            }
+            if (newFile) break;
+          } catch (_) {}
+        }
+
+        if (newFile) {
+          try {
+            const buf = fs.readFileSync(newFile.path);
+            captured.set('bulk', { url: `file://${newFile.path}`, ct: 'application/zip', buf, ts: Date.now() });
+            console.log(`    🇱🇹 viesiejipirkimai: ✓ captured bulk ZIP ${buf.length}B: "${newFile.name}"`);
+            try { fs.unlinkSync(newFile.path); } catch (_) {}
+            // Update the doc entry so downstream parser knows it's a ZIP
+            d.url = `file://${newFile.path}`;
+            d._capturedBuf = buf;
+            d._capturedCt = 'application/zip';
+            d.filename = newFile.name;
+            continue;
+          } catch (e) {
+            console.log(`    ⚠️  viesiejipirkimai: failed to read bulk ZIP "${newFile.name}": ${e.message}`);
+          }
+        } else {
+          console.log(`    ⚠️  viesiejipirkimai: bulk ZIP click didn't produce a download within 30s`);
+        }
+        continue;
+      }
+
+      // INDIVIDUAL path — Type A (addUser anchor) or Type B (viewCD button).
+      // Click the element in-page by docId match in onclick.
+      const clicked = await page.evaluate((docId, fnName, kind) => {
+        const selector = kind === 'button' ? 'button[onclick], input[onclick]' : 'a[onclick]';
+        const els = Array.from(document.querySelectorAll(selector));
+        for (const el of els) {
+          const oc = el.getAttribute('onclick') || '';
           if (oc.includes(`'${docId}'`) || oc.includes(`"${docId}"`) || oc.includes(`(${docId})`)) {
-            try { a.scrollIntoView({ block: 'center' }); a.click(); return true; } catch (_) {}
+            try { el.scrollIntoView({ block: 'center' }); el.click(); return true; } catch (_) {}
           }
         }
         return false;
-      }, d.docId, d.fnName).catch(() => false);
+      }, d.docId, d.fnName, d.kind).catch(() => false);
 
       if (!clicked) {
-        console.log(`    ⚠️  viesiejipirkimai: failed to click doc id=${d.docId} "${d.filename}"`);
+        console.log(`    ⚠️  viesiejipirkimai: failed to click doc id=${d.docId} "${d.filename}" (kind=${d.kind})`);
         continue;
       }
 
