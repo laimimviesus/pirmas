@@ -7010,8 +7010,14 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
   let page = null;
   try {
     page = await browser.newPage();
-    page.setDefaultNavigationTimeout(25000);
-    page.setDefaultTimeout(25000);
+    // 2026-05-27 — bumped from 25s to 45s after log 41 showed all 3
+    // kommersannons.se tenders hitting "Navigation timeout of 25000ms".
+    // The portal may have added Cloudflare / anti-bot rules that delay
+    // first response from GitHub Actions IPs. 45s gives the server room
+    // to respond. If still timing out, the real fix is a residential
+    // proxy — this is just a best-effort mitigation.
+    page.setDefaultNavigationTimeout(45000);
+    page.setDefaultTimeout(45000);
     try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
 
     try {
@@ -7022,16 +7028,45 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
         });
       });
       const ua = await page.browser().userAgent();
+      // Hide HeadlessChrome + use realistic Chrome UA string.
       await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+      // Set extra HTTP headers to look more like a real browser session.
+      await page.setExtraHTTPHeaders({
+        'Accept-Language': 'sv-SE,sv;q=0.9,en;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Upgrade-Insecure-Requests': '1',
+      });
     } catch (_) {}
 
-    try {
-      await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-    } catch (e) {
-      console.log(`    🇸🇪 kommersannons: nav warn: ${(e.message || '').slice(0, 80)}`);
+    // 2026-05-27 — retry loop. kommersannons sometimes refuses first
+    // connection (likely Cloudflare bot-check) but succeeds on retry.
+    let navOk = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        navOk = true;
+        break;
+      } catch (e) {
+        const msg = (e.message || '').slice(0, 80);
+        console.log(`    🇸🇪 kommersannons: nav attempt ${attempt}/2 warn: ${msg}`);
+        if (attempt < 2) {
+          // Backoff before retry
+          await new Promise((r) => setTimeout(r, 4000));
+        }
+      }
     }
-    try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
-    await new Promise((r) => setTimeout(r, 1500));
+    if (!navOk) {
+      // Diagnostic: log what we actually landed on
+      const currentUrl = page.url();
+      const isErrorPage = /^(chrome-error|chromewebdata|about:)/i.test(currentUrl);
+      console.log(`    🇸🇪 kommersannons: navigation failed both attempts (landed on: ${currentUrl.slice(0, 80)})`);
+      if (isErrorPage) {
+        console.log(`    ⚠️  kommersannons: chrome error page → likely IP-blocked or DNS issue (residential proxy would help)`);
+        return [];
+      }
+    }
+    try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 2000));
 
     // STEP 0 — click "Intresseanmälan" (Express interest) per-tender.
     //
