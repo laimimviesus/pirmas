@@ -7094,25 +7094,26 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
     try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
     await new Promise((r) => setTimeout(r, 2000));
 
-    // STEP 0 — click "Intresseanmälan" (Express interest) per-tender.
+    // STEP 0 — click "Intresseanmälan" (Express interest) per-tender,
+    // then submit the registration form that opens.
     //
-    // 2026-05-26 — Log 27 audit revealed kommersannons gates doc tabs
-    // behind a per-tender interest declaration. Successful tenders (where
-    // user previously clicked Intresseanmälan) show 7-9 doc anchors on
-    // Appendices tab; tenders without registration return 0 anchors.
+    // 2026-05-27 — Log 42 revealed TWO issues with #102:
+    //   1) Bare "Registration" regex matched the site-wide account-creation
+    //      CTA on pre-login pages → wrong click. Tightened to require an
+    //      explicit "interest" word with "register".
+    //   2) Clicking "Intresseanmälan" navigates to a separate /Register
+    //      form, not a postback. We then have to SUBMIT that form
+    //      (Anmäl intresse / Bekräfta / Skicka button) to actually
+    //      register interest. Without form submit, docs stay hidden.
     //
-    // User explicitly accepted email-notification trade-off (variant A)
-    // for richer doc coverage. We click Intresseanmälan first, then
-    // proceed to tab navigation as before.
-    //
-    // Match labels:
+    // Match labels (STRICT — must contain explicit "interest" wording):
     //   SV: "Intresseanmälan" / "Anmäl intresse"
-    //   EN: "Registration" / "Register interest" / "Express interest"
+    //   EN: "Register interest" / "Express interest"
     //   NO: "Påmeldingsskjema" / "Meld interesse"
-    // Anti-pattern (do NOT click): "Tacka nej" / "Decline"
+    // Anti-pattern (do NOT click): "Tacka nej" / "Decline" / "Registration"
     const interestClick = await page.evaluate(() => {
-      const RE_INTEREST = /^\s*(intresseanm[äa]lan|anm[äa]l\s*intresse|register\s*(interest|now)?|registration|express(?:ing)?\s*interest|p[åa]meldingsskjema|meld\s*interesse)\s*$/i;
-      const RE_REJECT = /^\s*(tacka\s*nej|decline|reject|cancel|avst[åa])\b/i;
+      const RE_INTEREST = /^\s*(intresseanm[äa]lan|anm[äa]l\s*intresse|register\s+(?:my\s+)?interest|express(?:ing)?\s+(?:my\s+)?interest|p[åa]meldingsskjema|meld\s+interesse)\s*$/i;
+      const RE_REJECT = /^\s*(tacka\s*nej|decline|reject|cancel|avst[åa]|registration\s*$|create\s*account|order\s*new\s*password)\b/i;
       const els = Array.from(document.querySelectorAll(
         'a, button, input[type="submit"], input[type="button"], [role="button"]'
       ));
@@ -7132,35 +7133,76 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
       return null;
     }).catch(() => null);
     if (interestClick) {
-      console.log(`    🇸🇪 kommersannons: clicked "${interestClick}" (interest registration) — waiting for state update`);
-      // ASP.NET __doPostBack — wait for navigation or in-place DOM update.
+      console.log(`    🇸🇪 kommersannons: clicked "${interestClick}" (interest registration link) — waiting for state update`);
+      // ASP.NET nav OR client-side route change
       await Promise.race([
         page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => null),
         new Promise((r) => setTimeout(r, 4000)),
       ]);
       await new Promise((r) => setTimeout(r, 1500));
 
-      // Some kommersannons tenants raise a confirmation modal — click
-      // any visible "Ja" / "Bekräfta" / "Yes" button on the result page
-      // to finalize the registration.
-      const confirmClick = await page.evaluate(() => {
-        const RE_OK = /^\s*(ja|yes|bekr[äa]fta|confirm|ok|fortsätt|continue|godk[äa]nn|accept)\s*$/i;
+      // STEP 0.5 — submit the registration FORM that appeared.
+      // The Intresseanmälan link took us to /Notice/Shared/Register... or
+      // /Notice/.../Interest.aspx. Find form submit button. Possible
+      // labels (in priority order):
+      //   "Anmäl intresse" (Submit interest — SV)
+      //   "Skicka" / "Skicka in" (Submit — SV)
+      //   "Bekräfta" / "Confirm" (Confirm — SV/EN)
+      //   "Ja" / "Yes" (basic confirm)
+      //   "Spara" / "Save"
+      //   "Fortsätt" / "Continue"
+      const postClickUrl = page.url();
+      const onRegisterForm = /Register|Interest|Anm[äa]l/i.test(postClickUrl);
+      console.log(`    🇸🇪 kommersannons: post-click URL: ${postClickUrl.slice(-100)} (register-form=${onRegisterForm})`);
+
+      const submitClick = await page.evaluate(() => {
+        const RE_SUBMIT_PRIORITY = /^\s*(anm[äa]l\s*intresse|register\s+interest|express\s+interest|submit\s+interest)\s*$/i;
+        const RE_SUBMIT_FALLBACK = /^\s*(skicka(?:\s*in)?|bekr[äa]fta|confirm|spara|save|submit|fortsätt|continue|godk[äa]nn|accept|ja|yes|ok)\s*$/i;
+        const RE_REJECT = /^\s*(tacka\s*nej|decline|cancel|avbryt|tillbaka|back|stäng|close)\b/i;
         const els = Array.from(document.querySelectorAll(
-          'a, button, input[type="submit"], input[type="button"], [role="button"]'
-        ));
+          'button, input[type="submit"], input[type="button"], a.btn, [role="button"]'
+        )).filter((el) => !el.disabled && el.offsetParent !== null);
+
+        // Pass 1 — exact "anmäl intresse" submit
         for (const el of els) {
-          if (el.disabled || el.offsetParent === null) continue;
           const text = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim();
-          if (!text || text.length > 30) continue;
-          if (RE_OK.test(text)) {
-            try { el.scrollIntoView({ block: 'center' }); el.click(); return text.slice(0, 30); } catch (_) {}
+          if (!text || text.length > 40) continue;
+          if (RE_REJECT.test(text)) continue;
+          if (RE_SUBMIT_PRIORITY.test(text)) {
+            try { el.scrollIntoView({ block: 'center' }); el.click(); return `priority:${text.slice(0, 40)}`; } catch (_) {}
+          }
+        }
+        // Pass 2 — generic submit/confirm
+        for (const el of els) {
+          const text = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (!text || text.length > 40) continue;
+          if (RE_REJECT.test(text)) continue;
+          if (RE_SUBMIT_FALLBACK.test(text)) {
+            try { el.scrollIntoView({ block: 'center' }); el.click(); return `fallback:${text.slice(0, 40)}`; } catch (_) {}
           }
         }
         return null;
       }).catch(() => null);
-      if (confirmClick) {
-        console.log(`    🇸🇪 kommersannons: clicked confirmation "${confirmClick}"`);
-        await new Promise((r) => setTimeout(r, 2500));
+
+      if (submitClick) {
+        console.log(`    🇸🇪 kommersannons: registration form submitted "${submitClick}"`);
+        await Promise.race([
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => null),
+          new Promise((r) => setTimeout(r, 4000)),
+        ]);
+        await new Promise((r) => setTimeout(r, 2000));
+
+        // If after registration we're not back on NoticeOverview /
+        // NoticeDispatch with tabs visible, navigate explicitly.
+        const finalUrl = page.url();
+        if (!/NoticeDispatch|NoticeOverview/i.test(finalUrl) && /NoticeId=/.test(sourceUrl)) {
+          try {
+            await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+            await new Promise((r) => setTimeout(r, 2000));
+          } catch (_) {}
+        }
+      } else {
+        console.log(`    ⚠️  kommersannons: no submit button found on registration form — proceeding with whatever's visible`);
       }
     }
 
