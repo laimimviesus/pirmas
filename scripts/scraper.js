@@ -4366,17 +4366,44 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
     });
     await new Promise((r) => setTimeout(r, 3500));
 
-    // SPA sub-route rewrite: deep links typically end in /general (the
-    // landing tab). Documents tab is reached by navigating to /documents
-    // at the same path. Try that variant if we landed on /general — it's
-    // cheap and forces the documents view to hydrate even when the tab
-    // header isn't a clickable <a>/<button>.
+    // Post-auth deep-link recovery — the BOSA eProcurement SPA does NOT
+    // preserve deep links across the OIDC redirect: after Sign In it
+    // dumps the user on /supplier/enterprises/0/enterprises/overview
+    // regardless of the requested URL. So we detect that drift here and
+    // re-navigate to the ORIGINAL sourceUrl, this time with a valid
+    // session cookie — the second goto succeeds and lands us on the
+    // actual tender workspace.
     try {
-      const currentUrl = page.url();
-      if (/\/tendering-workspaces?\/[^?#]*\/general\b/i.test(currentUrl)) {
-        const docsUrl = currentUrl.replace(/\/general(\b)/i, '/documents$1');
-        console.log(`    🇧🇪 publicprocurement: rewriting /general → /documents and reloading`);
+      const drifted = page.url();
+      const onTender = /\/tendering-workspaces?\//i.test(drifted);
+      if (!onTender && /\/tendering-workspaces?\//i.test(sourceUrl)) {
+        console.log(`    🇧🇪 publicprocurement: SPA dropped deep link (landed on ${drifted.replace(/^https?:\/\/[^/]+/, '')}) — re-navigating to source`);
+        await page.goto(sourceUrl, { waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    } catch (_) {}
+
+    // SPA sub-route rewrite — once on the tender workspace, force the
+    // Documents view by swapping the trailing /general (default tab) for
+    // /documents on the ORIGINAL sourceUrl pattern. We use sourceUrl
+    // (not page.url()) because the SPA may have rewritten the URL via
+    // history.replaceState during hydration and dropped the trailing
+    // segment we need to match.
+    try {
+      if (/\/tendering-workspaces?\/[^?#]*\/(general|overview|summary)\b/i.test(sourceUrl)) {
+        const docsUrl = sourceUrl.replace(/\/(general|overview|summary)(\b)/i, '/documents$2');
+        console.log(`    🇧🇪 publicprocurement: rewriting → /documents (${docsUrl.slice(-80)})`);
         await page.goto(docsUrl, { waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
+        await new Promise((r) => setTimeout(r, 3000));
+      } else if (/\/tendering-workspaces?\/[^?#]*\/[^/]+$/i.test(sourceUrl)) {
+        // Already on some workspace sub-route — try appending /documents
+        // as a sibling. Cheap probe; falls through to tab-click if 404.
+        const u = new URL(sourceUrl);
+        const parts = u.pathname.split('/').filter(Boolean);
+        if (parts.length) parts[parts.length - 1] = 'documents';
+        const docsUrl2 = `${u.origin}/${parts.join('/')}${u.search || ''}`;
+        console.log(`    🇧🇪 publicprocurement: probing /documents sibling (${docsUrl2.slice(-80)})`);
+        await page.goto(docsUrl2, { waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
         await new Promise((r) => setTimeout(r, 3000));
       }
     } catch (_) {}
@@ -4493,16 +4520,26 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
     }
 
     // Fallback — if no anchors but API JSON has tender data, include it
-    // verbatim so AI can extract from API metadata.
-    if (texts.length === 0 && apiResponses.length > 0) {
-      console.log(`    🇧🇪 publicprocurement: no doc anchors but ${apiResponses.length} tender API JSON response(s) — including verbatim for AI`);
-      for (const r of apiResponses.slice(0, 8)) {
+    // verbatim so AI can extract from API metadata. We further drop
+    // localisation/lookup endpoints (countries, currencies, NUTS, doc
+    // type enums, enterprises/categories) — those are public reference
+    // tables that bloat the payload without naming the tender. Without
+    // this filter every BE row gets the same 30KB of dictionary JSON.
+    const IS_LOOKUP_API = (ru) => (
+      /\/(loc|lookup|reference|ref-data|metadata|enums?)\//i.test(ru) ||
+      /\/(countries|currencies|nuts|languages|cpv|cpv-codes|locales|timezones|agreement-document-types|emergency-procedure)\b/i.test(ru) ||
+      /\/(enterprises\/(classes|categories|overview)|suppliers\/touch|enterprises\/0\/enterprises)\b/i.test(ru)
+    );
+    const tenderApiResponses = apiResponses.filter((r) => !IS_LOOKUP_API(r.url));
+    if (texts.length === 0 && tenderApiResponses.length > 0) {
+      console.log(`    🇧🇪 publicprocurement: no doc anchors but ${tenderApiResponses.length} tender API JSON response(s) — including verbatim for AI`);
+      for (const r of tenderApiResponses.slice(0, 8)) {
         console.log(`       api: ${r.url.replace(/^https?:\/\/[^/]+/, '').slice(0, 120)} (${r.body.length}B)`);
       }
       const out = ['--- (publicprocurement API JSON) ---'];
       let totalChars = 0;
       const MAX_API_TOTAL = 80000;
-      for (const r of apiResponses) {
+      for (const r of tenderApiResponses) {
         if (totalChars > MAX_API_TOTAL) break;
         try {
           const parsed = JSON.parse(r.body);
@@ -4514,6 +4551,13 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
         }
       }
       texts.push(out.join('\n\n'));
+    } else if (texts.length === 0 && apiResponses.length > 0) {
+      // We captured APIs but they were ALL lookup/reference data —
+      // worth logging so we can iterate, but not appended to AI input.
+      console.log(`    🇧🇪 publicprocurement: ${apiResponses.length} API response(s) captured, but all are lookup/reference (no tender data) — skipping verbatim dump`);
+      for (const r of apiResponses.slice(0, 6)) {
+        console.log(`       lookup: ${r.url.replace(/^https?:\/\/[^/]+/, '').slice(0, 120)}`);
+      }
     }
 
     // Diagnostic dump if no doc anchors OR no tender API responses —
