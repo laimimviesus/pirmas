@@ -4528,7 +4528,10 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
     const IS_LOOKUP_API = (ru) => (
       /\/(loc|lookup|reference|ref-data|metadata|enums?)\//i.test(ru) ||
       /\/(countries|currencies|nuts|languages|cpv|cpv-codes|locales|timezones|agreement-document-types|emergency-procedure)\b/i.test(ru) ||
-      /\/(enterprises\/(classes|categories|overview)|suppliers\/touch|enterprises\/0\/enterprises)\b/i.test(ru)
+      /\/(enterprises\/(classes|categories|overview)|suppliers\/touch|enterprises\/0\/enterprises)\b/i.test(ru) ||
+      // Session / profile / system endpoints — return the SAME bytes for
+      // every BE row, so they're pure noise from the AI's perspective.
+      /\/(system-alerts|suppliers\/[0-9a-f-]{30,}(?:\/roles)?|users\/me|user\/preferences|session(?:-info)?|auth-info)\b/i.test(ru)
     );
     const tenderApiResponses = apiResponses.filter((r) => !IS_LOOKUP_API(r.url));
     if (texts.length === 0 && tenderApiResponses.length > 0) {
