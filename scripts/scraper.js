@@ -4282,6 +4282,243 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
 }
 
 // =====================================================================
+// fetchPublicProcurementBeDocuments
+// ---------------------------------------------------------------------
+// publicprocurement.be — Belgian federal procurement portal (post-2024
+// replacement for e-Notification + e-Procurement). Angular SPA frontend.
+// URL pattern: /supplier/enterprises/0/tendering-workspaces/<id>/...
+//
+// Flow:
+//   1. Page loads with login-gated content (handled by upstream
+//      attemptPortalLogin — creds in PORTAL_CREDS_JSON)
+//   2. Post-login: SPA hydrates, shows tender workspace tabs
+//   3. Procurement documents live in a "Documents" / "Documents de
+//      marché" / "Opdrachtdocumenten" tab. Click it to load file list.
+//   4. Files are listed as anchors or "Télécharger" buttons.
+//
+// Strategy mirrors fetchArtifikDocuments: capture /api/* JSON during
+// SPA navigation + click Documents tab + harvest anchors with diagnostic.
+// =====================================================================
+async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
+  try {
+    const u = new URL(sourceUrl);
+    if (!/(^|\.)publicprocurement\.be$/i.test(u.hostname)) return [];
+    // Only handle tender-workspace URLs — not the bare login page
+    if (!/\/tendering-workspaces?\//i.test(u.pathname) &&
+        !/\/(notice|opportunity|tender)\//i.test(u.pathname)) {
+      return [];
+    }
+  } catch (_) { return []; }
+
+  let pdfParseLib = null, mammothLib = null, XLSXLib = null;
+  try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { XLSXLib     = require('xlsx');      } catch (_) {}
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(30000);
+    page.setDefaultTimeout(30000);
+    try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
+    try {
+      const ua = await page.browser().userAgent();
+      await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+    } catch (_) {}
+
+    // Capture /api/* JSON responses (Angular SPA usually fetches tender
+    // attachments via REST endpoints).
+    const apiResponses = [];
+    const seenApiUrls = new Set();
+    page.on('response', async (resp) => {
+      try {
+        const ru = resp.url();
+        if (!/\/api\//i.test(ru) && !/\/services\//i.test(ru)) return;
+        if (seenApiUrls.has(ru)) return;
+        seenApiUrls.add(ru);
+        const ct = resp.headers()['content-type'] || '';
+        if (!/json/i.test(ct)) return;
+        const body = await resp.text().catch(() => '');
+        if (body.length > 40 && body.length < 300000) {
+          apiResponses.push({ url: ru, body });
+        }
+      } catch (_) {}
+    });
+
+    await page.goto(sourceUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch((e) => {
+      console.log(`    🇧🇪 publicprocurement: nav warn: ${(e.message || '').slice(0, 80)}`);
+    });
+    await new Promise((r) => setTimeout(r, 3500));
+
+    // Click "Documents" tab — multilingual.
+    //   FR: "Documents", "Documents de marché"
+    //   NL: "Opdrachtdocumenten", "Documenten"
+    //   EN: "Procurement documents", "Documents"
+    //   DE: "Auftragsunterlagen"
+    const tabClicked = await page.evaluate(() => {
+      const RE_TAB = /^\s*(documents?|documents?\s+de\s+march[ée]|procurement\s+documents?|opdrachtdocumenten|documenten|auftragsunterlagen|aanbestedingsdocumenten)\s*$/i;
+      const cands = Array.from(document.querySelectorAll(
+        'a, button, [role="tab"], [role="button"], li, span'
+      ));
+      for (const el of cands) {
+        if (el.offsetParent === null) continue;
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text && RE_TAB.test(text) && text.length < 60) {
+          try { el.scrollIntoView({ block: 'center' }); el.click(); return text.slice(0, 60); } catch (_) {}
+        }
+      }
+      return null;
+    }).catch(() => null);
+    if (tabClicked) {
+      console.log(`    🇧🇪 publicprocurement: clicked "${tabClicked}" tab — waiting for content`);
+      await new Promise((r) => setTimeout(r, 3000));
+      try { await page.waitForNetworkIdle({ idleTime: 1500, timeout: 8000 }); } catch (_) {}
+    }
+
+    // Harvest document anchors. publicprocurement.be typically uses
+    // direct download URLs like /api/files/<id> or /attachments/<id>.
+    const anchors = await page.evaluate(() => {
+      const RX_DL_EXT = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:\?|#|$)/i;
+      const RX_DL_PATH = /\/(?:file|files|attachment|attachments|download|document-download|getDocument|asset)\/[^/]+/i;
+      const RX_DL_TEXT = /\b(t[ée]l[ée]charger|download|downloaden|herunterladen|atsisi[ųu]sti)\b/i;
+      const out = [];
+      const seen = new Set();
+      for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+        const hrefRaw = a.getAttribute('href') || '';
+        if (!hrefRaw || hrefRaw === '#' || /^javascript:/i.test(hrefRaw)) continue;
+        let abs;
+        try { abs = new URL(hrefRaw, location.href).toString(); } catch (_) { continue; }
+        if (seen.has(abs)) continue;
+        const text = (a.innerText || a.textContent || '').trim();
+        const isDl = RX_DL_EXT.test(abs) || RX_DL_PATH.test(abs) || RX_DL_TEXT.test(text);
+        if (!isDl) continue;
+        seen.add(abs);
+        out.push({ url: abs, text: text.slice(0, 200) });
+        if (out.length >= 30) break;
+      }
+      // Also gather elements with onclick patterns that could trigger
+      // downloads (Angular components sometimes use (click) bindings).
+      for (const el of Array.from(document.querySelectorAll('button, [role="button"]'))) {
+        if (el.offsetParent === null) continue;
+        const text = (el.innerText || el.textContent || '').trim();
+        const ariaLabel = el.getAttribute('aria-label') || '';
+        if (RX_DL_TEXT.test(text) || RX_DL_TEXT.test(ariaLabel)) {
+          out.push({ url: '__click__', text: text.slice(0, 200), aria: ariaLabel.slice(0, 100) });
+          if (out.length >= 30) break;
+        }
+      }
+      return out;
+    }).catch(() => []);
+
+    console.log(`    🇧🇪 publicprocurement: ${anchors.length} doc anchor(s) detected, ${apiResponses.length} /api/* response(s) captured`);
+
+    // Pretty-print a sample for visibility
+    for (const a of anchors.slice(0, 6)) {
+      console.log(`       doc: "${a.text.slice(0, 60)}" → ${(a.url || '').slice(-80)}`);
+    }
+
+    // Fetch + parse downloadable anchors (skip __click__ placeholders for now)
+    const texts = [];
+    const detectFmt = (buf) => {
+      if (!buf || buf.length < 4) return 'unknown';
+      if (buf[0] === 0x25 && buf[1] === 0x50) return 'pdf';
+      if (buf[0] === 0x50 && buf[1] === 0x4B) return 'zip';
+      if (buf[0] === 0xD0 && buf[1] === 0xCF) return 'cfb';
+      return 'unknown';
+    };
+    for (const doc of anchors.filter((a) => a.url !== '__click__').slice(0, 6)) {
+      const labelName = (doc.text || doc.url.split('/').pop()).slice(0, 100);
+      const result = await page.evaluate(async (url) => {
+        try {
+          const r = await fetch(url, { credentials: 'include', redirect: 'follow' });
+          if (!r.ok) return { ok: false, status: r.status };
+          const ct = r.headers.get('content-type') || '';
+          const ab = await r.arrayBuffer();
+          return { ok: true, status: r.status, ct, url: r.url || url, data: Array.from(new Uint8Array(ab)) };
+        } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
+      }, doc.url).catch(() => null);
+      if (!result || !result.ok || !result.data || result.data.length < 500) {
+        console.log(`    ⚠️  publicprocurement: fetch failed "${labelName.slice(0, 40)}" (status=${result?.status || '?'})`);
+        continue;
+      }
+      const buf = Buffer.from(result.data);
+      const fmt = detectFmt(buf);
+      let text = '';
+      try {
+        if (fmt === 'pdf' && pdfParseLib) {
+          const p = await pdfParseLib(buf); text = (p?.text || '').trim();
+        } else if (fmt === 'zip' && mammothLib) {
+          // Try DOCX first
+          try { const m = await mammothLib.extractRawText({ buffer: buf }); text = (m?.value || '').trim(); } catch (_) {}
+        }
+      } catch (e) {
+        console.log(`    ⚠️  publicprocurement: parse error "${labelName}": ${(e.message || '').slice(0, 60)}`);
+      }
+      if (text && text.length > 100) {
+        const clipped = text.slice(0, 60000);
+        texts.push(`--- (publicprocurement) ${labelName} ---\n${clipped}`);
+        console.log(`    🇧🇪 publicprocurement: parsed ${fmt.toUpperCase()} "${labelName}" (${buf.length}B → ${clipped.length}ch)`);
+      }
+    }
+
+    // Fallback — if no anchors but API JSON has tender data, include it
+    // verbatim so AI can extract from API metadata.
+    if (texts.length === 0 && apiResponses.length > 0) {
+      console.log(`    🇧🇪 publicprocurement: no doc anchors but ${apiResponses.length} API JSON responses — including verbatim for AI`);
+      const out = ['--- (publicprocurement API JSON) ---'];
+      let totalChars = 0;
+      const MAX_API_TOTAL = 80000;
+      for (const r of apiResponses) {
+        if (totalChars > MAX_API_TOTAL) break;
+        try {
+          const parsed = JSON.parse(r.body);
+          const stringified = JSON.stringify(parsed, null, 2);
+          out.push(`# ${r.url.replace(/^https?:\/\/[^/]+/, '')}\n${stringified.slice(0, 30000)}`);
+          totalChars += stringified.length;
+        } catch (_) {
+          out.push(`# ${r.url.slice(-80)}\n${r.body.slice(0, 30000)}`);
+        }
+      }
+      texts.push(out.join('\n\n'));
+    }
+
+    // Diagnostic dump if nothing harvested
+    if (texts.length === 0) {
+      try {
+        const diag = await page.evaluate(() => {
+          const visible = (el) => el && el.offsetParent !== null;
+          const tabs = Array.from(document.querySelectorAll('[role="tab"], li[class*="tab"], .nav-link, .tab'))
+            .filter(visible).slice(0, 10).map((el) => (el.innerText || '').trim().slice(0, 60)).filter(Boolean);
+          const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+            .filter(visible).slice(0, 8).map((el) => (el.innerText || '').trim().slice(0, 60)).filter(Boolean);
+          return {
+            url: location.href,
+            title: document.title.slice(0, 80),
+            totalAnchors: document.querySelectorAll('a').length,
+            tabs,
+            headings,
+          };
+        }).catch(() => null);
+        if (diag) {
+          console.log(`    🇧🇪 publicprocurement: 0 docs harvested — diag:`);
+          console.log(`       URL: ${diag.url.slice(-100)}`);
+          console.log(`       title: "${diag.title}"`);
+          console.log(`       tabs (${diag.tabs.length}): ${JSON.stringify(diag.tabs)}`);
+          console.log(`       headings (${diag.headings.length}): ${JSON.stringify(diag.headings)}`);
+        }
+      } catch (_) {}
+    }
+
+    return texts;
+  } catch (e) {
+    console.log(`    ⚠️  publicprocurement handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
+// =====================================================================
 async function fetchArtifikDocuments(browser, sourceUrl) {
   let pid = null;
   let host = null;
@@ -11150,6 +11387,26 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     } catch (e) {
       console.log(`    ⚠️ viesiejipirkimai handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // publicprocurement.be (Belgian e-Procurement / TenderingWorkspace) —
+    // Angular SPA that exposes the workspace via /tendering-workspaces/<id>.
+    // The Documents (FR Documents / NL Opdrachtdocumenten / EN Procurement
+    // documents / DE Auftragsunterlagen) tab loads via /api/* JSON; we
+    // click the tab, harvest visible download anchors, and fall back to
+    // API-derived URLs if no DOM links surfaced. No-op for non-BE sources.
+    try {
+      const beTexts = await fetchPublicProcurementBeDocuments(browser, sourceUrl);
+      if (beTexts && beTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + beTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇧🇪 publicprocurement.be: appended ${beTexts.length} doc(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ publicprocurement.be handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     // app.artifik.no Documents handler — Norwegian SaaS tender platform
