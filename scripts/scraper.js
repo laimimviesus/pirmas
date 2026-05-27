@@ -4326,14 +4326,30 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
       await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
     } catch (_) {}
 
-    // Capture /api/* JSON responses (Angular SPA usually fetches tender
-    // attachments via REST endpoints).
+    // Capture tender-specific API JSON responses (Angular SPA fetches
+    // attachments via REST). We INTENTIONALLY exclude Mercell
+    // user-management / notification services that the same SPA also
+    // talks to — those are session metadata, not tender data, and
+    // produce identical 30KB+ payloads across every tender.
     const apiResponses = [];
     const seenApiUrls = new Set();
+    const IS_NOISE_API = (ru) => (
+      /user-management-service|notification-service|free-trial|organization-subscriptions|profile\/licenses|profile\/user|user\/organizations|organization-master-data|notifications\/unread|userinfo|\.well-known/i.test(ru)
+    );
+    const IS_TENDER_API = (ru) => (
+      /tendering[- ]workspace|publication[- ]workspace|tender[- ]?(document|attachment|file)|opportunity[- ]documents|procurement[- ]documents|attachment-service|document-service|files\/[0-9a-f-]{6,}/i.test(ru)
+    );
     page.on('response', async (resp) => {
       try {
         const ru = resp.url();
-        if (!/\/api\//i.test(ru) && !/\/services\//i.test(ru)) return;
+        if (!/\/api\//i.test(ru) && !/\/services?\//i.test(ru)) return;
+        if (IS_NOISE_API(ru)) return;
+        // Strongly prefer same-origin (publicprocurement.be) responses;
+        // accept other origins ONLY when their URL clearly references
+        // tender documents.
+        let isSameOrigin = false;
+        try { isSameOrigin = /(^|\.)publicprocurement\.be$/i.test(new URL(ru).hostname); } catch (_) {}
+        if (!isSameOrigin && !IS_TENDER_API(ru)) return;
         if (seenApiUrls.has(ru)) return;
         seenApiUrls.add(ru);
         const ct = resp.headers()['content-type'] || '';
@@ -4349,6 +4365,21 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
       console.log(`    🇧🇪 publicprocurement: nav warn: ${(e.message || '').slice(0, 80)}`);
     });
     await new Promise((r) => setTimeout(r, 3500));
+
+    // SPA sub-route rewrite: deep links typically end in /general (the
+    // landing tab). Documents tab is reached by navigating to /documents
+    // at the same path. Try that variant if we landed on /general — it's
+    // cheap and forces the documents view to hydrate even when the tab
+    // header isn't a clickable <a>/<button>.
+    try {
+      const currentUrl = page.url();
+      if (/\/tendering-workspaces?\/[^?#]*\/general\b/i.test(currentUrl)) {
+        const docsUrl = currentUrl.replace(/\/general(\b)/i, '/documents$1');
+        console.log(`    🇧🇪 publicprocurement: rewriting /general → /documents and reloading`);
+        await page.goto(docsUrl, { waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    } catch (_) {}
 
     // Click "Documents" tab — multilingual.
     //   FR: "Documents", "Documents de marché"
@@ -4464,7 +4495,10 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
     // Fallback — if no anchors but API JSON has tender data, include it
     // verbatim so AI can extract from API metadata.
     if (texts.length === 0 && apiResponses.length > 0) {
-      console.log(`    🇧🇪 publicprocurement: no doc anchors but ${apiResponses.length} API JSON responses — including verbatim for AI`);
+      console.log(`    🇧🇪 publicprocurement: no doc anchors but ${apiResponses.length} tender API JSON response(s) — including verbatim for AI`);
+      for (const r of apiResponses.slice(0, 8)) {
+        console.log(`       api: ${r.url.replace(/^https?:\/\/[^/]+/, '').slice(0, 120)} (${r.body.length}B)`);
+      }
       const out = ['--- (publicprocurement API JSON) ---'];
       let totalChars = 0;
       const MAX_API_TOTAL = 80000;
@@ -4482,8 +4516,11 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
       texts.push(out.join('\n\n'));
     }
 
-    // Diagnostic dump if nothing harvested
-    if (texts.length === 0) {
+    // Diagnostic dump if no doc anchors OR no tender API responses —
+    // run BOTH branches so we always learn what was on the page when
+    // the harvester came up empty. Cheap and helps us iterate on portal
+    // quirks across runs.
+    if (anchors.length === 0 || apiResponses.length === 0) {
       try {
         const diag = await page.evaluate(() => {
           const visible = (el) => el && el.offsetParent !== null;
