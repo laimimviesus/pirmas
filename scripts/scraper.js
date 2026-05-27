@@ -7033,6 +7033,76 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
     try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
     await new Promise((r) => setTimeout(r, 1500));
 
+    // STEP 0 — click "Intresseanmälan" (Express interest) per-tender.
+    //
+    // 2026-05-26 — Log 27 audit revealed kommersannons gates doc tabs
+    // behind a per-tender interest declaration. Successful tenders (where
+    // user previously clicked Intresseanmälan) show 7-9 doc anchors on
+    // Appendices tab; tenders without registration return 0 anchors.
+    //
+    // User explicitly accepted email-notification trade-off (variant A)
+    // for richer doc coverage. We click Intresseanmälan first, then
+    // proceed to tab navigation as before.
+    //
+    // Match labels:
+    //   SV: "Intresseanmälan" / "Anmäl intresse"
+    //   EN: "Registration" / "Register interest" / "Express interest"
+    //   NO: "Påmeldingsskjema" / "Meld interesse"
+    // Anti-pattern (do NOT click): "Tacka nej" / "Decline"
+    const interestClick = await page.evaluate(() => {
+      const RE_INTEREST = /^\s*(intresseanm[äa]lan|anm[äa]l\s*intresse|register\s*(interest|now)?|registration|express(?:ing)?\s*interest|p[åa]meldingsskjema|meld\s*interesse)\s*$/i;
+      const RE_REJECT = /^\s*(tacka\s*nej|decline|reject|cancel|avst[åa])\b/i;
+      const els = Array.from(document.querySelectorAll(
+        'a, button, input[type="submit"], input[type="button"], [role="button"]'
+      ));
+      for (const el of els) {
+        if (el.disabled || el.offsetParent === null) continue;
+        const text = (el.innerText || el.value || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        if (!text || text.length > 60) continue;
+        if (RE_REJECT.test(text)) continue;
+        if (RE_INTEREST.test(text)) {
+          try {
+            el.scrollIntoView({ block: 'center' });
+            el.click();
+            return text.slice(0, 60);
+          } catch (_) {}
+        }
+      }
+      return null;
+    }).catch(() => null);
+    if (interestClick) {
+      console.log(`    🇸🇪 kommersannons: clicked "${interestClick}" (interest registration) — waiting for state update`);
+      // ASP.NET __doPostBack — wait for navigation or in-place DOM update.
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => null),
+        new Promise((r) => setTimeout(r, 4000)),
+      ]);
+      await new Promise((r) => setTimeout(r, 1500));
+
+      // Some kommersannons tenants raise a confirmation modal — click
+      // any visible "Ja" / "Bekräfta" / "Yes" button on the result page
+      // to finalize the registration.
+      const confirmClick = await page.evaluate(() => {
+        const RE_OK = /^\s*(ja|yes|bekr[äa]fta|confirm|ok|fortsätt|continue|godk[äa]nn|accept)\s*$/i;
+        const els = Array.from(document.querySelectorAll(
+          'a, button, input[type="submit"], input[type="button"], [role="button"]'
+        ));
+        for (const el of els) {
+          if (el.disabled || el.offsetParent === null) continue;
+          const text = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (!text || text.length > 30) continue;
+          if (RE_OK.test(text)) {
+            try { el.scrollIntoView({ block: 'center' }); el.click(); return text.slice(0, 30); } catch (_) {}
+          }
+        }
+        return null;
+      }).catch(() => null);
+      if (confirmClick) {
+        console.log(`    🇸🇪 kommersannons: clicked confirmation "${confirmClick}"`);
+        await new Promise((r) => setTimeout(r, 2500));
+      }
+    }
+
     // STEP 1 — find the document-tab anchors. They're typically <a> with
     // href to a sibling /Notice/<TabName>.aspx?NoticeId=X URL, OR an
     // __doPostBack anchor that triggers a navigate via JS. Match by
@@ -13732,21 +13802,18 @@ async function runRetranslateStale(sheets, SHEET_ID, TAB_NAME) {
     if (!r) continue;
     scanned++;
     const sheetRow = i + 1; // Sheets API rows are 1-indexed
-    // 2026-05-17 column-restructure update:
+    // 2026-05-27 column-restructure update:
     //   col D = TENDER NAME (English)   ← write target
     //   col E = TENDER NAME (Original)  ← source of truth for translation
-    //   col N = SCOPE OF AGREEMENT (orig) ← scope translation source
-    //   col S = Scope of agreement (EN) ← scope translation target
-    const titleEnExisting   = (r[3]  || '').toString();   // col D
-    const titleOriginal     = (r[4]  || '').toString();   // col E
-    const scopeOriginal     = (r[13] || '').toString();   // col N
-    const scopeEnExisting   = (r[18] || '').toString();   // col S
+    //   col N = SCOPE OF AGREEMENT (orig) — read-only; AI handles English
+    //   col S = Komentarai (user notes)  ← DO NOT TOUCH from backfill
+    const titleEnExisting = (r[3]  || '').toString();   // col D
+    const titleOriginal   = (r[4]  || '').toString();   // col E
 
     // Stale = English target is empty OR looks non-English (untranslated).
     // Source must exist for us to translate from.
     const titleStale = titleOriginal && (!titleEnExisting.trim() || looksNonEnglish(titleEnExisting));
-    const scopeStale = scopeOriginal && (!scopeEnExisting.trim() || looksNonEnglish(scopeEnExisting));
-    if (!titleStale && !scopeStale) continue;
+    if (!titleStale) continue;
     candidates++;
 
     // Reset per-row failure flag — _markAiFailure() will re-set it if a
@@ -13773,22 +13840,9 @@ async function runRetranslateStale(sheets, SHEET_ID, TAB_NAME) {
       break;
     }
 
-    if (scopeStale) {
-      const scopeEn = await translateToEnglish(scopeOriginal, { hint: 'Public tender scope of agreement' });
-      if (scopeEn && scopeEn.trim() !== scopeOriginal.trim()) {
-        updates.push({ range: `${TAB_NAME}!S${sheetRow}`, values: [[scopeEn]] });
-        translated++;
-        console.log(`  [${sheetRow}] S: scope translated (${scopeOriginal.length}ch → ${scopeEn.length}ch)`);
-      } else {
-        console.log(`  [${sheetRow}] S: no change (echoed/empty)`);
-      }
-    }
-
-    if (_lastAiNonRetryableError) {
-      console.log(`⛔ AI non-retryable error (${_lastAiNonRetryableError}) — aborting backfill.`);
-      aborted = true;
-      break;
-    }
+    // 2026-05-27 — scope→S backfill REMOVED (user request).
+    // Column S is now "Komentarai" (user comments); the previous
+    // scope-translation write would overwrite user-added notes.
 
     // Periodic flush so partial progress survives a crash.
     if (updates.length >= 50) {
@@ -14723,6 +14777,11 @@ async function runScraper() {
         scopeEnOut || scopeOrigOut,
         reqOut, qualOut, critOut, d.technicalStack || ''
       ]);
+      // 2026-05-27 — row returns ONLY 18 cells (A through R).
+      // Column S = "Komentarai" (user comments) — we DO NOT touch it.
+      // Previously we wrote '' to S as a placeholder, but even an empty
+      // write counts as a cell value to Sheets and prevented users from
+      // confidently editing S without fear of clobber on next run.
       return [
         nowIso,                                                  // A — DATE ADDED
         fmtDate(d.publicationDate || t.publicationDate || ''),   // B — BIDDING ANNOUCEMENT DATE
@@ -14742,7 +14801,7 @@ async function runScraper() {
         d.sourceUrl || '',                                       // P — Source URL
         d.referenceNumber || t.tenderId || '',                   // Q — Reference number
         keywords,                                                // R — Keywords
-        '',                                                      // S — Komentarai (user notes; left empty)
+        // S (Komentarai) intentionally OMITTED — user-only column
       ];
     };
 
