@@ -344,7 +344,10 @@ const LOGIN_URLS = {
 // Currently handles:
 //   - marchespublics.gouv.fr (no hyphen) → marches-publics.gouv.fr
 //   - http://marches-publics.gouv.fr     → https:// (forced HTTPS)
-//   - dtvp.de notice pages without /documents suffix → add /documents
+//   - dtvp.de /Satellite/notice/<id> → /Satellite/notice/<id>/documents
+//   - VMP-Cosinex /VMPSatellite/notice/<id> → /VMPSatellite/notice/<id>/documents
+//     (evergabe.nrw.de, vergabe.metropoleruhr.de, vergabemarktplatz.brandenburg.de,
+//      and similar German Vergabe portals on Cosinex platform)
 //
 // Safe to call repeatedly — operations are idempotent.
 function normalizeSourceUrl(rawUrl) {
@@ -366,11 +369,34 @@ function normalizeSourceUrl(rawUrl) {
     changed = true;
   }
 
-  // dtvp.de — rewrite any notice URL to its /documents endpoint
+  // dtvp.de — rewrite any notice URL to its /documents endpoint.
   if (u.hostname === 'www.dtvp.de' || u.hostname === 'dtvp.de') {
     const noticeMatch = u.pathname.match(/^\/Satellite\/notice\/([A-Z0-9]{6,40})(?:\/.*)?$/i);
     if (noticeMatch && !/\/documents\/?$/i.test(u.pathname)) {
       u.pathname = `/Satellite/notice/${noticeMatch[1]}/documents`;
+      u.search = '';
+      u.hash = '';
+      changed = true;
+    }
+  }
+
+  // 2026-05-27 — VMP-Cosinex /VMPSatellite/notice/<id> rewrite to
+  // /VMPSatellite/notice/<id>/documents. Identical fix pattern as dtvp.de
+  // but for the family of German Vergabe portals built on Cosinex's
+  // Vergabe-Management-Plattform (VMP). Each hosts notice + documents
+  // tabs at the same path scheme; the /documents page is where the
+  // "Alle Dokumente als ZIP-Datei herunterladen" bulk-ZIP link lives.
+  //
+  // Confirmed hosts (log 27 audit):
+  //   evergabe.nrw.de, vergabe.metropoleruhr.de,
+  //   vergabemarktplatz.brandenburg.de, landesverwaltung.vergabe.rlp.de,
+  //   evergabe.sachsen.de, ausschreibungen.landbw.de,
+  //   evergabe.bundesverkehrsverwaltung.de, etc.
+  // We catch the family via any host that exposes /VMPSatellite/notice/.
+  {
+    const vmpNoticeMatch = u.pathname.match(/^\/VMPSatellite\/notice\/([A-Z0-9]{6,40})(?:\/.*)?$/i);
+    if (vmpNoticeMatch && !/\/documents\/?$/i.test(u.pathname)) {
+      u.pathname = `/VMPSatellite/notice/${vmpNoticeMatch[1]}/documents`;
       u.search = '';
       u.hash = '';
       changed = true;
