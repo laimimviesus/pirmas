@@ -4310,10 +4310,29 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
     }
   } catch (_) { return []; }
 
-  let pdfParseLib = null, mammothLib = null, XLSXLib = null;
+  let pdfParseLib = null, mammothLib = null, XLSXLib = null, admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
   try { mammothLib  = require('mammoth');   } catch (_) {}
   try { XLSXLib     = require('xlsx');      } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
+
+  // CDP download capture — the BE bulk "Download all documents" button
+  // streams a server-zipped bundle via Content-Disposition:attachment,
+  // which Chromium routes to the download manager (bypassing fetch).
+  // We configure Browser-level download behavior pointing at a fresh
+  // tempdir, then poll it after the click.
+  const fs = require('fs');
+  const pathLib = require('path');
+  const os = require('os');
+  const downloadDir = fs.mkdtempSync(pathLib.join(os.tmpdir(), 'bosa-dl-'));
+  try {
+    const browserCdp = await browser.target().createCDPSession();
+    await browserCdp.send('Browser.setDownloadBehavior', {
+      behavior: 'allow',
+      downloadPath: downloadDir,
+      eventsEnabled: true,
+    }).catch(() => null);
+  } catch (_) {}
 
   let page = null;
   try {
@@ -4324,6 +4343,15 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
     try {
       const ua = await page.browser().userAgent();
       await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+    } catch (_) {}
+    // Per-page CDP fallback in case the browser-level config didn't
+    // attach to this target yet.
+    try {
+      const pageCdp = await page.target().createCDPSession();
+      await pageCdp.send('Page.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: downloadDir,
+      }).catch(() => null);
     } catch (_) {}
 
     // Capture tender-specific API JSON responses (Angular SPA fetches
@@ -4361,52 +4389,156 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
       } catch (_) {}
     });
 
-    await page.goto(sourceUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch((e) => {
+    // Compute the target URL BEFORE first navigation. Two transforms:
+    //   (1) Substitute the active-enterprise placeholder `/enterprises/0/`
+    //       with the supplier's real numeric enterprise ID. The BOSA
+    //       eProcurement SPA refuses to render publication-workspaces
+    //       under `/0/` and hard-redirects to /enterprises/overview to
+    //       force the user to pick an enterprise. The real numeric ID
+    //       (assigned after company registration) MUST be in the path.
+    //       Configurable via BE_ENTERPRISE_ID env; default 872560 (CCT,
+    //       the registered supplier for the scraper's BOSA account).
+    //   (2) Swap trailing /general → /documents so we land directly on
+    //       the documents view (saves an extra navigation + tab click).
+    const BE_ENTERPRISE_ID = (process.env.BE_ENTERPRISE_ID || '872560').trim();
+    let targetUrl = sourceUrl;
+    try {
+      targetUrl = targetUrl.replace(/\/enterprises\/0(\/)/i, `/enterprises/${BE_ENTERPRISE_ID}$1`);
+      targetUrl = targetUrl.replace(/\/tendering-workspaces\/(publication-workspace-detail|[^/]+)\/([0-9a-f-]{6,})\/(general|overview|summary)(\b|$)/i,
+                                    '/tendering-workspaces/$1/$2/documents$4');
+      if (targetUrl !== sourceUrl) {
+        console.log(`    🇧🇪 publicprocurement: rewrote URL → /enterprises/${BE_ENTERPRISE_ID}/.../documents`);
+      }
+    } catch (_) {}
+
+    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch((e) => {
       console.log(`    🇧🇪 publicprocurement: nav warn: ${(e.message || '').slice(0, 80)}`);
     });
     await new Promise((r) => setTimeout(r, 3500));
 
-    // Post-auth deep-link recovery — the BOSA eProcurement SPA does NOT
-    // preserve deep links across the OIDC redirect: after Sign In it
-    // dumps the user on /supplier/enterprises/0/enterprises/overview
-    // regardless of the requested URL. So we detect that drift here and
-    // re-navigate to the ORIGINAL sourceUrl, this time with a valid
-    // session cookie — the second goto succeeds and lands us on the
-    // actual tender workspace.
+    // Post-auth deep-link recovery — if the SPA still dropped us off
+    // the tender workspace (e.g. session expired mid-flight, or the
+    // enterprise ID was wrong and we got bounced to /enterprises/overview),
+    // re-navigate once. This is a backstop; with the correct
+    // BE_ENTERPRISE_ID the first goto should land us on the workspace.
     try {
       const drifted = page.url();
       const onTender = /\/tendering-workspaces?\//i.test(drifted);
-      if (!onTender && /\/tendering-workspaces?\//i.test(sourceUrl)) {
-        console.log(`    🇧🇪 publicprocurement: SPA dropped deep link (landed on ${drifted.replace(/^https?:\/\/[^/]+/, '')}) — re-navigating to source`);
-        await page.goto(sourceUrl, { waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
+      if (!onTender && /\/tendering-workspaces?\//i.test(targetUrl)) {
+        console.log(`    🇧🇪 publicprocurement: SPA dropped deep link (landed on ${drifted.replace(/^https?:\/\/[^/]+/, '')}) — re-navigating`);
+        await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
         await new Promise((r) => setTimeout(r, 3000));
       }
     } catch (_) {}
 
-    // SPA sub-route rewrite — once on the tender workspace, force the
-    // Documents view by swapping the trailing /general (default tab) for
-    // /documents on the ORIGINAL sourceUrl pattern. We use sourceUrl
-    // (not page.url()) because the SPA may have rewritten the URL via
-    // history.replaceState during hydration and dropped the trailing
-    // segment we need to match.
-    try {
-      if (/\/tendering-workspaces?\/[^?#]*\/(general|overview|summary)\b/i.test(sourceUrl)) {
-        const docsUrl = sourceUrl.replace(/\/(general|overview|summary)(\b)/i, '/documents$2');
-        console.log(`    🇧🇪 publicprocurement: rewriting → /documents (${docsUrl.slice(-80)})`);
-        await page.goto(docsUrl, { waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
-        await new Promise((r) => setTimeout(r, 3000));
-      } else if (/\/tendering-workspaces?\/[^?#]*\/[^/]+$/i.test(sourceUrl)) {
-        // Already on some workspace sub-route — try appending /documents
-        // as a sibling. Cheap probe; falls through to tab-click if 404.
-        const u = new URL(sourceUrl);
-        const parts = u.pathname.split('/').filter(Boolean);
-        if (parts.length) parts[parts.length - 1] = 'documents';
-        const docsUrl2 = `${u.origin}/${parts.join('/')}${u.search || ''}`;
-        console.log(`    🇧🇪 publicprocurement: probing /documents sibling (${docsUrl2.slice(-80)})`);
-        await page.goto(docsUrl2, { waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
-        await new Promise((r) => setTimeout(r, 3000));
+    // PREFERRED PATH — click the "Download all documents" Vuetify button.
+    // The live page exposes a stable Vue test-id selector:
+    //   button[data-cy="action-bar-item-Download all documents"]
+    //   title="Download all documents"
+    // It streams a server-zipped bundle of ALL workspace docs via
+    // Content-Disposition:attachment, captured by our CDP download config.
+    let filesBefore = [];
+    try { filesBefore = fs.readdirSync(downloadDir); } catch (_) {}
+
+    const bulkButtonClicked = await page.evaluate(() => {
+      const RE_TXT = /^\s*(download\s+all\s+documents|t[ée]l[ée]charger\s+tous?\s+les\s+documents|alle\s+documenten\s+downloaden|alle\s+(auftrags)?unterlagen\s+(herunter)?laden)\s*$/i;
+      // Pass 1 — exact data-cy / title match (Vue test-id, stable across i18n)
+      const byTestId = document.querySelector('button[data-cy="action-bar-item-Download all documents"]') ||
+                       document.querySelector('button[title="Download all documents"]') ||
+                       document.querySelector('button[data-cy*="ownload all documents" i]');
+      if (byTestId && byTestId.offsetParent !== null) {
+        try { byTestId.scrollIntoView({ block: 'center' }); byTestId.click(); return `test-id:${(byTestId.title || byTestId.getAttribute('data-cy') || '').slice(0, 60)}`; } catch (_) {}
       }
-    } catch (_) {}
+      // Pass 2 — multilingual visible text match
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"], a.btn'));
+      for (const el of buttons) {
+        if (el.disabled || el.offsetParent === null) continue;
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text && RE_TXT.test(text) && text.length < 80) {
+          try { el.scrollIntoView({ block: 'center' }); el.click(); return `text:${text.slice(0, 60)}`; } catch (_) {}
+        }
+      }
+      return null;
+    }).catch(() => null);
+
+    let zipTexts = [];
+    if (bulkButtonClicked) {
+      console.log(`    🇧🇪 publicprocurement: clicked bulk download (${bulkButtonClicked}) — waiting for ZIP`);
+      // Wait up to 40s for ZIP (BE tender bundles can be 5-25MB)
+      const watchDeadline = Date.now() + 40000;
+      let newFile = null;
+      while (Date.now() < watchDeadline) {
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+          const filesNow = fs.readdirSync(downloadDir);
+          const fresh = filesNow.filter((f) => !filesBefore.includes(f) && !f.endsWith('.crdownload'));
+          for (const fname of fresh) {
+            const fpath = pathLib.join(downloadDir, fname);
+            try {
+              const st = fs.statSync(fpath);
+              if (st.size > 1000) { newFile = { name: fname, path: fpath, size: st.size }; break; }
+            } catch (_) {}
+          }
+          if (newFile) break;
+        } catch (_) {}
+      }
+      if (newFile && admZipLib) {
+        try {
+          const buf = fs.readFileSync(newFile.path);
+          console.log(`    🇧🇪 publicprocurement: ✓ captured bulk ZIP ${buf.length}B: "${newFile.name}"`);
+          try { fs.unlinkSync(newFile.path); } catch (_) {}
+          // Parse ZIP and extract text from common doc types
+          try {
+            const zip = new admZipLib(buf);
+            const entries = zip.getEntries().filter((e) => !e.isDirectory).slice(0, 15);
+            for (const z of entries) {
+              const innerBytes = z.getData();
+              const ext = ((z.entryName.match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '').toLowerCase();
+              let extracted = '';
+              try {
+                if (ext === 'pdf' && pdfParseLib) {
+                  const p = await pdfParseLib(innerBytes); extracted = (p?.text || '').trim();
+                } else if ((ext === 'docx' || ext === 'odt') && mammothLib) {
+                  const out = await mammothLib.extractRawText({ buffer: innerBytes });
+                  extracted = (out?.value || '').trim();
+                } else if ((ext === 'xlsx' || ext === 'xls') && XLSXLib) {
+                  const wb = XLSXLib.read(innerBytes, { type: 'buffer' });
+                  extracted = wb.SheetNames.map((sn) => XLSXLib.utils.sheet_to_csv(wb.Sheets[sn])).join('\n').trim();
+                }
+              } catch (_) {}
+              if (extracted && extracted.length > 100) {
+                // BE bundles often combine NL + FR + EN copies of the
+                // same bestek; bump per-entry cap so we keep one full
+                // language version even with several siblings.
+                const clipped = extracted.slice(0, 60000);
+                zipTexts.push(`--- (zip:${newFile.name}) ${z.entryName} ---\n${clipped}`);
+                console.log(`    📦 zip entry "${z.entryName}" (${ext}, ${innerBytes.length}B → ${clipped.length}ch)`);
+              }
+            }
+          } catch (e) {
+            console.log(`    ⚠️  publicprocurement: ZIP parse failed: ${(e.message || '').slice(0, 80)}`);
+          }
+        } catch (e) {
+          console.log(`    ⚠️  publicprocurement: failed to read bulk ZIP: ${e.message}`);
+        }
+      } else if (!newFile) {
+        console.log(`    ⚠️  publicprocurement: bulk click but no ZIP appeared within 40s — falling back to anchor scrape`);
+      }
+    } else {
+      console.log(`    ℹ️  publicprocurement: "Download all documents" button not found — falling back to anchor scrape`);
+    }
+
+    // If the bulk ZIP path worked, return early — we already have the
+    // tender's actual document contents, no need to scrape anchors or
+    // dump API JSON. Cleanup tempdir on the way out.
+    if (zipTexts.length > 0) {
+      try {
+        const remaining = fs.readdirSync(downloadDir);
+        for (const f of remaining) { try { fs.unlinkSync(pathLib.join(downloadDir, f)); } catch (_) {} }
+        try { fs.rmdirSync(downloadDir); } catch (_) {}
+      } catch (_) {}
+      return zipTexts;
+    }
 
     // Click "Documents" tab — multilingual.
     //   FR: "Documents", "Documents de marché"
@@ -4599,6 +4731,16 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
     return [];
   } finally {
     try { if (page) await page.close(); } catch (_) {}
+    // Clean up the BOSA download tempdir on any exit path (early
+    // return from zipTexts handles it inline; this is for the anchor /
+    // API fallback paths so we don't leak per-tender tempdirs).
+    try {
+      if (downloadDir && fs.existsSync(downloadDir)) {
+        const remaining = fs.readdirSync(downloadDir);
+        for (const f of remaining) { try { fs.unlinkSync(pathLib.join(downloadDir, f)); } catch (_) {} }
+        try { fs.rmdirSync(downloadDir); } catch (_) {}
+      }
+    } catch (_) {}
   }
 }
 
