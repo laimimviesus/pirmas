@@ -5023,6 +5023,273 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
 }
 
 // =====================================================================
+// community.vortal.biz Documents handler — Vortalskin/Vortal SaaS portal
+// used by Portuguese (PT1.NTC.*) and other regional public buyers.
+// The contract-notice-view page is a Vue/Vuetify SPA: a single deep-link
+// URL like
+//   https://community.vortal.biz/Public/contract-notice-view/PT1.NTC.3703261/?SkinName=VortalSkin1&currentLanguage=en
+// renders Summary → ManagingAuthority → Object of Contract A/B →
+// LegalEconomicFinancialAndTechnicalInformation (inline selection
+// criteria — the actual qualification text we want, often present even
+// before any docs are downloaded) → AvailableDocuments table.
+//
+// Strategy (no login — anonymous notice view is public):
+//   1) Normalise the URL: accept `/Public/contract-notice-view/<PT_ID>/...`
+//      directly; for bare `/public` search URLs, give up (Mercell already
+//      knows the PT_ID and points us at the deep-link, so we don't need a
+//      reference search in 99% of cases).
+//   2) Force `currentLanguage=en` to keep the body text consistent.
+//   3) Wait for SPA hydration (Vuetify mounts a `.v-application` root;
+//      AvailableDocuments table populates via XHR shortly after).
+//   4) Scroll the AvailableDocuments anchor into view so any lazy-loaded
+//      child components render.
+//   5) Capture the full body innerText (40K cap) — this includes the
+//      inline LegalEconomicFinancialAndTechnicalInformation section,
+//      which by itself often satisfies the qualifications field.
+//   6) Harvest doc anchors from the AvailableDocuments section and fetch
+//      each in-page (cookieful), parse PDF/DOCX/XLSX, append to output.
+async function fetchCommunityVortalBizDocuments(browser, sourceUrl) {
+  let ptId = null;
+  try {
+    const u = new URL(sourceUrl);
+    if (!/(^|\.)vortal\.biz$/i.test(u.hostname)) return [];
+    // Only handle the contract-notice-view deep-link, not the search page.
+    const m = u.pathname.match(/\/Public\/contract-notice-view\/([^/]+)/i);
+    if (!m) {
+      // Bare `/public` or unknown path — nothing actionable.
+      return [];
+    }
+    ptId = decodeURIComponent(m[1]);
+  } catch (_) { return []; }
+
+  let pdfParseLib = null, mammothLib = null, XLSXLib = null, admZipLib = null;
+  try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { XLSXLib     = require('xlsx');      } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
+
+  // Force English UI to stabilise body innerText across Portuguese /
+  // Spanish / Italian Vortal deployments.
+  let pageUrl = sourceUrl;
+  try {
+    const u2 = new URL(sourceUrl);
+    u2.searchParams.set('currentLanguage', 'en');
+    if (!u2.searchParams.get('SkinName')) u2.searchParams.set('SkinName', 'VortalSkin1');
+    pageUrl = u2.toString();
+  } catch (_) {}
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(30000);
+    page.setDefaultTimeout(30000);
+    try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
+    try {
+      const ua = await page.browser().userAgent();
+      await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+    } catch (_) {}
+
+    try {
+      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (e) {
+      console.log(`    🇵🇹 vortal: nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    // Vue/Vuetify hydration + initial XHR for AvailableDocuments.
+    try { await page.waitForNetworkIdle({ idleTime: 1200, timeout: 15000 }); }
+    catch (_) { /* timeout ok — fall through to settle */ }
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // Scroll the AvailableDocuments section into view to trigger any
+    // lazy mount. The user-confirmed anchor is `#AvailableDocuments` in
+    // the sidebar; the matching section node is typically a
+    // <section id="AvailableDocuments"> or <div id="AvailableDocuments">.
+    await page.evaluate(() => {
+      const targets = ['AvailableDocuments', 'LegalEconomicFinancialAndTechnicalInformation', 'ObjectOfTheContractA'];
+      for (const id of targets) {
+        const el = document.getElementById(id) ||
+          document.querySelector(`[id="${id}"]`) ||
+          document.querySelector(`a[href="#${id}"]`);
+        if (el) {
+          try { el.scrollIntoView({ block: 'start', behavior: 'instant' }); } catch (_) {
+            try { el.scrollIntoView(); } catch (_) {}
+          }
+        }
+      }
+    }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // Diagnostic: report what we landed on.
+    try {
+      const diag = await page.evaluate(() => {
+        const h1 = (document.querySelector('h1, h2')?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+        const sectionIds = Array.from(document.querySelectorAll('[id]'))
+          .map((el) => el.id)
+          .filter((id) => /Contract|Documents|Information|Object|Legal|Eligibility|Evaluation/i.test(id));
+        const anchorTargets = Array.from(document.querySelectorAll('a[href^="#"]'))
+          .map((a) => a.getAttribute('href'))
+          .filter(Boolean)
+          .slice(0, 20);
+        return { h1, sectionIds: sectionIds.slice(0, 20), anchorTargets };
+      }).catch(() => ({}));
+      console.log(`    🇵🇹 vortal: PT_ID=${ptId} h1="${diag.h1 || ''}" sections=${(diag.sectionIds || []).length} sidebar=${(diag.anchorTargets || []).length}`);
+    } catch (_) {}
+
+    // Capture the fully-rendered body innerText. Contract-notice-view
+    // pages on Vortal embed the entire LegalEconomicFinancialAndTechnical
+    // selection criteria inline; in many tenders this body text by itself
+    // is sufficient even when no doc anchors surface.
+    const bodyText = await page.evaluate(() => {
+      const b = document.body;
+      return (b && b.innerText) || '';
+    }).catch(() => '');
+
+    // Harvest doc anchors specifically from the AvailableDocuments section.
+    // The user's HTML inspection confirmed it's a documents-list table.
+    const docHrefs = await page.evaluate(() => {
+      const sect = document.getElementById('AvailableDocuments') ||
+        document.querySelector('[id="AvailableDocuments"]');
+      const scope = sect ? sect.parentElement || sect : document;
+      const out = [];
+      const seen = new Set();
+      const anchors = Array.from(scope.querySelectorAll('a[href]'));
+      for (const a of anchors) {
+        const href = a.getAttribute('href') || '';
+        if (!href || href.startsWith('#') || /^javascript:/i.test(href)) continue;
+        // Filter to plausible document URLs — vortal serves docs through
+        // /Public/document-download/<docId>, /Public/AvailableDocuments,
+        // or direct .pdf/.docx/.xlsx/.zip paths.
+        if (!/document|download|file|attach|\.(pdf|docx?|xlsx?|zip|rar|7z|odt|ods)(\?|$)/i.test(href)) continue;
+        let abs = href;
+        try { abs = new URL(href, location.href).toString(); } catch (_) {}
+        if (seen.has(abs)) continue;
+        seen.add(abs);
+        const label = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        out.push({ href: abs, label });
+      }
+      return out;
+    }).catch(() => []);
+
+    console.log(`    🇵🇹 vortal: PT_ID=${ptId} — body=${bodyText.length}ch, ${docHrefs.length} doc anchor(s) in AvailableDocuments`);
+
+    const out = [];
+    if (bodyText && bodyText.length > 800) {
+      out.push(`--- (vortal contract-notice-view, PT_ID=${ptId}) ---\n${bodyText.slice(0, 40000)}`);
+    }
+
+    // Fetch each document in-page (cookieful, same-origin). Cap total
+    // appended doc content at 80K — typical Vortal notices have 2-6 small
+    // PDFs with the same content as the inline body anyway.
+    const TOTAL_DOC_CAP = 80000;
+    const PER_DOC_CAP = 30000;
+    let docTotal = 0;
+    for (const { href, label } of docHrefs.slice(0, 8)) {
+      if (docTotal >= TOTAL_DOC_CAP) break;
+      try {
+        const fetched = await page.evaluate(async (u) => {
+          try {
+            const r = await fetch(u, { credentials: 'include' });
+            if (!r.ok) return { ok: false, status: r.status };
+            const ab = await r.arrayBuffer();
+            const bytes = Array.from(new Uint8Array(ab));
+            return { ok: true, bytes, len: ab.byteLength };
+          } catch (e) { return { ok: false, err: String(e).slice(0, 100) }; }
+        }, href).catch(() => null);
+        if (!fetched || !fetched.ok) {
+          console.log(`    🇵🇹 vortal: ${label.slice(0, 40)} fetch failed (${fetched?.status || fetched?.err || 'unknown'})`);
+          continue;
+        }
+        const buf = Buffer.from(fetched.bytes);
+        let text = '';
+        // Magic byte detection
+        if (buf.length >= 4 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) {
+          // PDF
+          if (pdfParseLib) {
+            try {
+              const r = await pdfParseLib(buf);
+              text = (r.text || '').trim();
+            } catch (_) {}
+          }
+        } else if (buf.length >= 2 && buf[0] === 0x50 && buf[1] === 0x4B) {
+          // ZIP container (DOCX/XLSX/ZIP). Try DOCX first, then XLSX, then ZIP recurse.
+          if (/\.docx?($|\?)/i.test(href) && mammothLib) {
+            try {
+              const r = await mammothLib.extractRawText({ buffer: buf });
+              text = (r.value || '').trim();
+            } catch (_) {}
+          }
+          if (!text && /\.xlsx?($|\?)/i.test(href) && XLSXLib) {
+            try {
+              const wb = XLSXLib.read(buf, { type: 'buffer' });
+              const parts = [];
+              for (const sheetName of wb.SheetNames) {
+                const sheet = wb.Sheets[sheetName];
+                parts.push(`# ${sheetName}\n${XLSXLib.utils.sheet_to_csv(sheet)}`);
+              }
+              text = parts.join('\n\n').trim();
+            } catch (_) {}
+          }
+          if (!text && admZipLib) {
+            try {
+              const zip = new admZipLib(buf);
+              const entries = zip.getEntries().filter((e) => !e.isDirectory);
+              const innerOut = [];
+              for (const e of entries.slice(0, 10)) {
+                const innerBuf = e.getData();
+                let innerText = '';
+                if (/\.pdf$/i.test(e.entryName) && pdfParseLib) {
+                  try { const r = await pdfParseLib(innerBuf); innerText = (r.text || '').trim(); } catch (_) {}
+                } else if (/\.docx?$/i.test(e.entryName) && mammothLib) {
+                  try { const r = await mammothLib.extractRawText({ buffer: innerBuf }); innerText = (r.value || '').trim(); } catch (_) {}
+                } else if (/\.xlsx?$/i.test(e.entryName) && XLSXLib) {
+                  try {
+                    const wb = XLSXLib.read(innerBuf, { type: 'buffer' });
+                    const parts = [];
+                    for (const sn of wb.SheetNames) {
+                      parts.push(`# ${sn}\n${XLSXLib.utils.sheet_to_csv(wb.Sheets[sn])}`);
+                    }
+                    innerText = parts.join('\n\n').trim();
+                  } catch (_) {}
+                } else if (/\.(txt|csv|xml|html?|json)$/i.test(e.entryName)) {
+                  innerText = innerBuf.toString('utf8').trim();
+                }
+                if (innerText) innerOut.push(`# ${e.entryName}\n${innerText.slice(0, 8000)}`);
+              }
+              text = innerOut.join('\n\n').trim();
+            } catch (_) {}
+          }
+        } else {
+          // Plain text fallback
+          try { text = buf.toString('utf8').trim(); } catch (_) {}
+          if (text && /[\x00-\x08\x0E-\x1F]/.test(text.slice(0, 200))) text = ''; // binary garbage
+        }
+        if (text) {
+          const remaining = TOTAL_DOC_CAP - docTotal;
+          const chunk = text.slice(0, Math.min(PER_DOC_CAP, remaining));
+          out.push(`--- (vortal doc: ${label.slice(0, 80)}) ---\n${chunk}`);
+          docTotal += chunk.length;
+          console.log(`    🇵🇹 vortal: ${label.slice(0, 40)} → ${chunk.length}ch`);
+        } else {
+          console.log(`    🇵🇹 vortal: ${label.slice(0, 40)} → unparseable (${buf.length}b)`);
+        }
+      } catch (e) {
+        console.log(`    🇵🇹 vortal: doc fetch error: ${(e.message || '').slice(0, 80)}`);
+      }
+    }
+
+    if (!out.length) {
+      console.log(`    🇵🇹 vortal: PT_ID=${ptId} — no body or doc content captured`);
+      return [];
+    }
+    return [out.join('\n\n')];
+  } catch (e) {
+    console.log(`    ⚠️  vortal handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
+// =====================================================================
 async function fetchArtifikDocuments(browser, sourceUrl) {
   let pid = null;
   let host = null;
@@ -11959,6 +12226,25 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
       }
     } catch (e) {
       console.log(`    ⚠️ publicprocurement.be handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // community.vortal.biz Documents handler — Vortal SaaS portal
+    // (Portuguese PT1.NTC.* etc). Contract-notice-view is a Vuetify SPA
+    // with inline Legal/Economic/Financial selection criteria + an
+    // AvailableDocuments table. We capture body innerText + per-doc
+    // PDF/DOCX/XLSX parsing. No-op for non-vortal.biz sources.
+    try {
+      const vortalTexts = await fetchCommunityVortalBizDocuments(browser, sourceUrl);
+      if (vortalTexts && vortalTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + vortalTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🇵🇹 vortal: appended ${vortalTexts.length} block(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ vortal handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     // app.artifik.no Documents handler — Norwegian SaaS tender platform
