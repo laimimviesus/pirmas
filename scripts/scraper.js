@@ -5034,10 +5034,14 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
 // before any docs are downloaded) → AvailableDocuments table.
 //
 // Strategy (no login — anonymous notice view is public):
-//   1) Normalise the URL: accept `/Public/contract-notice-view/<PT_ID>/...`
-//      directly; for bare `/public` search URLs, give up (Mercell already
-//      knows the PT_ID and points us at the deep-link, so we don't need a
-//      reference search in 99% of cases).
+//   1) Two URL flavours from Mercell:
+//      (a) /Public/contract-notice-view/<PT_ID>/...   — direct deep-link
+//      (b) /public/  (bare search URL)                — needs search step
+//      Confirmed by run 58: ALL three PT tenders had flavour (b) and
+//      previous handler returned [] for them. For (b) we navigate to the
+//      search page, type the buyer reference into "Reference/Title/Description",
+//      click Search, then click Detail on the matching row to reach the
+//      contract-notice-view URL.
 //   2) Force `currentLanguage=en` to keep the body text consistent.
 //   3) Wait for SPA hydration (Vuetify mounts a `.v-application` root;
 //      AvailableDocuments table populates via XHR shortly after).
@@ -5048,19 +5052,35 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
 //      which by itself often satisfies the qualifications field.
 //   6) Harvest doc anchors from the AvailableDocuments section and fetch
 //      each in-page (cookieful), parse PDF/DOCX/XLSX, append to output.
-async function fetchCommunityVortalBizDocuments(browser, sourceUrl) {
+//
+// ctx = { referenceNumber, title } — propagated from the caller so
+// flavour (b) can search. Falls back to title-keyword search if no
+// reference is available.
+async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
   let ptId = null;
+  let isBarePublic = false;
   try {
     const u = new URL(sourceUrl);
     if (!/(^|\.)vortal\.biz$/i.test(u.hostname)) return [];
-    // Only handle the contract-notice-view deep-link, not the search page.
     const m = u.pathname.match(/\/Public\/contract-notice-view\/([^/]+)/i);
-    if (!m) {
-      // Bare `/public` or unknown path — nothing actionable.
+    if (m) {
+      ptId = decodeURIComponent(m[1]);
+    } else if (/^\/public\/?$/i.test(u.pathname)) {
+      isBarePublic = true;
+    } else {
+      // Unknown path — nothing actionable.
       return [];
     }
-    ptId = decodeURIComponent(m[1]);
   } catch (_) { return []; }
+
+  const refNumber = (ctx.referenceNumber || '').trim();
+  const tenderTitle = (ctx.title || '').trim();
+  // For bare /public/ flavour we MUST have a search term, otherwise the
+  // search page will just show stale default results that aren't our tender.
+  if (isBarePublic && !refNumber && !tenderTitle) {
+    console.log(`    🇵🇹 vortal: bare /public/ URL but no reference or title — skipping`);
+    return [];
+  }
 
   let pdfParseLib = null, mammothLib = null, XLSXLib = null, admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
@@ -5088,6 +5108,165 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl) {
       const ua = await page.browser().userAgent();
       await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
     } catch (_) {}
+
+    // ----- BARE /public/ FLAVOUR: search-by-reference flow -----
+    // Navigate to the search page, type the reference, submit, then click
+    // Detail on the first matching row → that lands on contract-notice-view.
+    if (isBarePublic) {
+      const searchTerm = refNumber || tenderTitle;
+      const searchUrl = 'https://community.vortal.biz/public?currentLanguage=en';
+      console.log(`    🇵🇹 vortal: bare /public/ — searching by "${searchTerm.slice(0, 60)}"`);
+      try {
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } catch (e) {
+        console.log(`    🇵🇹 vortal: search nav warn: ${(e.message || '').slice(0, 80)}`);
+      }
+      try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 12000 }); }
+      catch (_) {}
+      await new Promise((r) => setTimeout(r, 1500));
+
+      // Locate the "Reference/Title/Description" input. Vuetify renders
+      // <v-text-field> as an <input> inside .v-input slot — match by
+      // aria-label, placeholder, label text, or nearest label sibling.
+      const typedOk = await page.evaluate(async (term) => {
+        const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type]), input[type="search"]'));
+        const matchLabel = /reference|t[ií]tulo|title|description|descri[cç][aã]o|asunto/i;
+        let target = null;
+        for (const inp of inputs) {
+          if (inp.offsetParent === null) continue;
+          // Check aria-label, placeholder, name
+          const meta = `${inp.getAttribute('aria-label') || ''} ${inp.placeholder || ''} ${inp.name || ''}`;
+          if (matchLabel.test(meta)) { target = inp; break; }
+          // Check associated <label> via .v-input wrapper
+          let wrap = inp.closest('.v-input, .v-text-field');
+          if (wrap) {
+            const lbl = wrap.querySelector('label, .v-label');
+            if (lbl && matchLabel.test(lbl.textContent || '')) { target = inp; break; }
+          }
+        }
+        // Fallback: first visible text input
+        if (!target) {
+          target = inputs.find((i) => i.offsetParent !== null) || null;
+        }
+        if (!target) return { ok: false, reason: 'no-input' };
+        try { target.focus(); } catch (_) {}
+        // Use native setter so Vue's reactive bindings pick up the value.
+        const proto = Object.getPrototypeOf(target);
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(target, term);
+        else target.value = term;
+        target.dispatchEvent(new Event('input', { bubbles: true }));
+        target.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, name: target.name || target.getAttribute('aria-label') || target.placeholder || 'input' };
+      }, searchTerm).catch((e) => ({ ok: false, reason: String(e).slice(0, 80) }));
+
+      if (!typedOk?.ok) {
+        console.log(`    🇵🇹 vortal: search input not found (${typedOk?.reason || 'unknown'}) — bailing`);
+        return [];
+      }
+      console.log(`    🇵🇹 vortal: typed into "${typedOk.name}"`);
+
+      // Click the Search button. Match by text or by type=submit inside a form.
+      const submitted = await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button, input[type="submit"], a.btn, .v-btn'));
+        const matchSearch = /^\s*(search|pesquisar|buscar|chercher|cerca|rechercher)\s*$/i;
+        for (const b of btns) {
+          if (b.offsetParent === null) continue;
+          const txt = (b.innerText || b.textContent || b.value || '').replace(/\s+/g, ' ').trim();
+          if (matchSearch.test(txt)) {
+            try { b.scrollIntoView({ block: 'center' }); } catch (_) {}
+            try { b.click(); return { ok: true, txt }; } catch (_) {}
+          }
+        }
+        return { ok: false };
+      }).catch(() => ({ ok: false }));
+
+      if (!submitted?.ok) {
+        // Try pressing Enter on the input as a fallback
+        try {
+          await page.keyboard.press('Enter');
+          console.log(`    🇵🇹 vortal: Search button not found — pressed Enter`);
+        } catch (_) {
+          console.log(`    🇵🇹 vortal: could not submit search — bailing`);
+          return [];
+        }
+      } else {
+        console.log(`    🇵🇹 vortal: clicked "${submitted.txt}"`);
+      }
+
+      // Wait for results table to populate
+      try { await page.waitForNetworkIdle({ idleTime: 1200, timeout: 12000 }); }
+      catch (_) {}
+      await new Promise((r) => setTimeout(r, 1500));
+
+      // Find Detail link — Vortal results table renders a "Detail" / "Detalhe"
+      // anchor per row that points at /Public/contract-notice-view/<PT_ID>/...
+      const detailUrl = await page.evaluate((refTerm) => {
+        // Pass 1: anchors whose href already contains the contract-notice-view path
+        const anchors = Array.from(document.querySelectorAll('a[href*="contract-notice-view"]'));
+        if (anchors.length) {
+          // If we have a ref, prefer the row whose text contains it
+          const refLow = (refTerm || '').toLowerCase();
+          if (refLow) {
+            for (const a of anchors) {
+              const row = a.closest('tr, .v-data-table__row, [role="row"]') || a.parentElement;
+              const txt = (row?.innerText || row?.textContent || '').toLowerCase();
+              if (txt.includes(refLow)) {
+                try { return new URL(a.getAttribute('href'), location.href).toString(); } catch (_) { return a.href; }
+              }
+            }
+          }
+          // Fallback: first anchor
+          const a0 = anchors[0];
+          try { return new URL(a0.getAttribute('href'), location.href).toString(); } catch (_) { return a0.href; }
+        }
+        // Pass 2: anchors with text "Detail" / "Detalhe"
+        const all = Array.from(document.querySelectorAll('a[href], button'));
+        const matchDetail = /^\s*(detail|detalhe|details|d[eé]tail|detalle|dettagli)\s*$/i;
+        for (const el of all) {
+          if (el.offsetParent === null) continue;
+          const txt = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (matchDetail.test(txt)) {
+            const href = el.getAttribute && el.getAttribute('href');
+            if (href) {
+              try { return new URL(href, location.href).toString(); } catch (_) { return href; }
+            }
+          }
+        }
+        return null;
+      }, refNumber).catch(() => null);
+
+      if (!detailUrl) {
+        // Diagnostic: dump first 600ch of body + count of result rows
+        try {
+          const diag = await page.evaluate(() => {
+            const body = (document.body?.innerText || '').slice(0, 600);
+            const rows = document.querySelectorAll('tr, .v-data-table__row, [role="row"]').length;
+            const anchors = Array.from(document.querySelectorAll('a[href]')).slice(0, 10).map((a) => ({
+              href: a.getAttribute('href'),
+              txt: (a.innerText || '').slice(0, 60),
+            }));
+            return { body, rows, anchors };
+          });
+          console.log(`    🇵🇹 vortal: 0 detail links found — rows=${diag.rows}, body="${diag.body.slice(0, 200)}", anchors=${JSON.stringify(diag.anchors).slice(0, 300)}`);
+        } catch (_) {}
+        return [];
+      }
+      console.log(`    🇵🇹 vortal: found detail URL ${detailUrl.slice(0, 100)}`);
+
+      // Normalise + force English on the detail URL
+      try {
+        const du = new URL(detailUrl);
+        du.searchParams.set('currentLanguage', 'en');
+        if (!du.searchParams.get('SkinName')) du.searchParams.set('SkinName', 'VortalSkin1');
+        pageUrl = du.toString();
+        const pm = du.pathname.match(/\/Public\/contract-notice-view\/([^/]+)/i);
+        if (pm) ptId = decodeURIComponent(pm[1]);
+      } catch (_) {
+        pageUrl = detailUrl;
+      }
+      // Fall through to the deep-link goto below
+    }
 
     try {
       await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -10835,7 +11014,11 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
   }
 }
 
-async function fetchSourcePageDetails(browser, sourceUrl) {
+async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
+  // ctx may carry { referenceNumber, title } from the caller. Currently
+  // only the community.vortal.biz handler consumes it — bare /public/
+  // URLs need a reference to drive the search step. Other handlers can
+  // start using ctx as needed without further signature changes.
   // URL scheme normalisation — Mercell sometimes returns sourceUrl
   // values like "www.conselleriadefacenda.es/silex" without an
   // http(s):// scheme. Puppeteer's page.goto() rejects those with
@@ -12234,7 +12417,7 @@ async function fetchSourcePageDetails(browser, sourceUrl) {
     // AvailableDocuments table. We capture body innerText + per-doc
     // PDF/DOCX/XLSX parsing. No-op for non-vortal.biz sources.
     try {
-      const vortalTexts = await fetchCommunityVortalBizDocuments(browser, sourceUrl);
+      const vortalTexts = await fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx);
       if (vortalTexts && vortalTexts.length) {
         const SRC_TOTAL_CAP = 200000;
         const existing = result.sourceFilesText || '';
@@ -14507,7 +14690,15 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
     if (details.sourceUrl) {
       console.log(`    → source: ${details.sourceUrl.slice(0, 80)}`);
       const t0 = Date.now();
-      let src = await fetchSourcePageDetails(browser, details.sourceUrl);
+      // Propagate buyer reference + title to handlers that need them
+      // (currently community.vortal.biz, which searches by reference when
+      // Mercell hands us a bare /public/ URL).
+      const srcCtx = {
+        referenceNumber: (details.fileReferenceNumber && details.fileReferenceNumber.trim())
+          || details.referenceNumber || '',
+        title: details.title || '',
+      };
+      let src = await fetchSourcePageDetails(browser, details.sourceUrl, srcCtx);
       const elapsed = Date.now() - t0;
       console.log(`    source done in ${elapsed}ms (host: ${src?.sourceHost || 'n/a'}, err: ${src?.error || 'none'}${src?.skipped ? ', skipped: ' + src.skipped : ''}${src?.placspDocsFound ? `, placsp=${src.placspDocsFound}` : ''})`);
 
@@ -14534,7 +14725,7 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           console.log(`    🔁 dead-site fallback: trying PLACSP federal URL ${altUrl.slice(0, 100)}`);
           try {
             const t1 = Date.now();
-            const src2 = await fetchSourcePageDetails(browser, altUrl);
+            const src2 = await fetchSourcePageDetails(browser, altUrl, srcCtx);
             const elapsed2 = Date.now() - t1;
             console.log(`    🔁 fallback done in ${elapsed2}ms (host: ${src2?.sourceHost || 'n/a'}, err: ${src2?.error || 'none'}${src2?.skipped ? ', skipped: ' + src2.skipped : ''}${src2?.placspDocsFound ? `, placsp=${src2.placspDocsFound}` : ''})`);
             if (src2 && !src2.skipped && !src2.error) {
@@ -14624,7 +14815,7 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           } else if (deepLink && typeof deepLink === 'string') {
             console.log(`    🔁 marches-publics: refetching on deep-link URL`);
             const t1 = Date.now();
-            const src2 = await fetchSourcePageDetails(browser, deepLink);
+            const src2 = await fetchSourcePageDetails(browser, deepLink, srcCtx);
             const elapsed2 = Date.now() - t1;
             console.log(`    🔁 marches-publics deep-link refetch done in ${elapsed2}ms (host: ${src2?.sourceHost || 'n/a'}, err: ${src2?.error || 'none'}${src2?.skipped ? ', skipped: ' + src2.skipped : ''})`);
             if (src2 && !src2.skipped && !src2.error) {
@@ -14787,7 +14978,7 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
             // If direct-download already populated postLoginSrc above, skip
             // the fetchSourcePageDetails roundtrip entirely.
             if (!postLoginSrc) {
-              postLoginSrc = await fetchSourcePageDetails(browser, refetchUrl);
+              postLoginSrc = await fetchSourcePageDetails(browser, refetchUrl, srcCtx);
             }
             console.log(
               `    🔁 post-login source fetch: ${Date.now() - t1}ms ` +
