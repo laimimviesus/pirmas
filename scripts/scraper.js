@@ -4463,10 +4463,24 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           text = (p && p.text ? p.text : '').trim();
           fmt = 'PDF';
         } else if (isZip) {
-          if (mammothLib && (nameL.endsWith('.docx') || !nameL.endsWith('.xlsx'))) {
+          // ZIP magic could mean three different things:
+          //   (a) Single DOCX file (Office Open XML — DOCX is technically a ZIP)
+          //   (b) Single XLSX file (also a ZIP container)
+          //   (c) Generic ZIP archive bundling many files (CVPP bulk
+          //       "Pirkimo dokumentai.zip" — PDF + DOCX + XML siblings).
+          //
+          // CVPP bulk downloads are case (c) — filenames like
+          // "1008_8083405.zip", which are NOT valid DOCX/XLSX. Mammoth
+          // and XLSX.read silently return empty for those. We must
+          // recurse via adm-zip to extract per-file text.
+          const isDocxByName = nameL.endsWith('.docx');
+          const isXlsxByName = nameL.endsWith('.xlsx');
+          // Case (a) — try mammoth ONLY when the filename actually says docx.
+          if (isDocxByName && mammothLib) {
             try { const m = await mammothLib.extractRawText({ buffer: buf }); text = (m?.value || '').trim(); if (text.length > 100) fmt = 'DOCX'; } catch (_) {}
           }
-          if (!text && XLSXLib) {
+          // Case (b) — try XLSX only when filename says xlsx.
+          if (!text && isXlsxByName && XLSXLib) {
             try {
               const wb = XLSXLib.read(buf, { type: 'buffer' });
               const parts = [];
@@ -4475,12 +4489,61 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
               if (text.length > 100) fmt = 'XLSX';
             } catch (_) {}
           }
+          // Case (c) — generic ZIP bundle: enumerate entries with adm-zip
+          // and extract text from each supported inner doc. CVPP bundles
+          // routinely contain 3-15 files (Bestek/PCAP-equivalent, ESPD
+          // request, technical annexes, price tables, contract templates).
+          if (!text && AdmZipLib) {
+            try {
+              const zip = new AdmZipLib(buf);
+              const entries = zip.getEntries().filter((e) => !e.isDirectory);
+              // Filter to text-bearing types and cap at 15 inner files.
+              const RX_TEXTUAL = /\.(pdf|docx?|xlsx?|odt|ods|rtf|txt)$/i;
+              const candidates = entries.filter((e) => RX_TEXTUAL.test(e.entryName)).slice(0, 15);
+              const parts = [];
+              for (const z of candidates) {
+                const innerBytes = z.getData();
+                const inLow = z.entryName.toLowerCase();
+                let innerTxt = '';
+                try {
+                  if (inLow.endsWith('.pdf') && pdfParseLib) {
+                    const p = await pdfParseLib(innerBytes);
+                    innerTxt = (p?.text || '').trim();
+                  } else if (inLow.endsWith('.docx') && mammothLib) {
+                    const m = await mammothLib.extractRawText({ buffer: innerBytes });
+                    innerTxt = (m?.value || '').trim();
+                  } else if ((inLow.endsWith('.xlsx') || inLow.endsWith('.xls')) && XLSXLib) {
+                    const wb = XLSXLib.read(innerBytes, { type: 'buffer' });
+                    const sheetParts = [];
+                    for (const sn of wb.SheetNames) sheetParts.push(`### ${sn}\n${XLSXLib.utils.sheet_to_csv(wb.Sheets[sn])}`);
+                    innerTxt = sheetParts.join('\n\n').trim();
+                  } else if (inLow.endsWith('.txt') || inLow.endsWith('.rtf')) {
+                    innerTxt = Buffer.from(innerBytes).toString('utf8').trim();
+                  }
+                } catch (_) {}
+                if (innerTxt && innerTxt.length > 100) {
+                  // Per-entry cap 60K — CVPP bundles can carry 5+ rich PDFs.
+                  const innerClipped = innerTxt.slice(0, 60000);
+                  parts.push(`--- ${z.entryName.slice(-100)} ---\n${innerClipped}`);
+                  console.log(`    📦 zip entry "${z.entryName.slice(-80)}" (${innerBytes.length}B → ${innerClipped.length}ch)`);
+                }
+              }
+              text = parts.join('\n\n').trim();
+              if (text.length > 100) fmt = `ZIP-bundle(${parts.length})`;
+            } catch (e) {
+              console.log(`    ⚠️  viesiejipirkimai: adm-zip parse failed for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+            }
+          }
         }
       } catch (e) {
         console.log(`    ⚠️  viesiejipirkimai: parse error "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 60)}`);
       }
       if (text && text.length > 100) {
-        const clipped = text.slice(0, 80000);
+        // ZIP bundles aggregate many inner docs — give them more room
+        // (200K) so the qualification document inside survives the cap.
+        // Single PDFs/DOCXs still capped at 80K.
+        const isBundle = String(fmt).startsWith('ZIP-bundle');
+        const clipped = text.slice(0, isBundle ? 200000 : 80000);
         texts.push(`--- (viesiejipirkimai ${fmt}) ${labelName} ---\n${clipped}`);
         console.log(`    🇱🇹 viesiejipirkimai: parsed ${fmt} "${labelName}" (${buf.length}B → ${clipped.length}ch)`);
       } else {
