@@ -238,16 +238,28 @@ const ALWAYS_LOGIN_HOSTS = [
   // (post-redirect) depending on timing.
   'auftraege.bayern.de',
   'evergabe.bayern.de',
-  // viesiejipirkimai.lt — REMOVED 2026-05-26 per user request.
+  // viesiejipirkimai.lt — RE-ADDED 2026-05-28 (Task #119), reversing the
+  // 2026-05-26 removal. Background:
   //
-  // Login flow triggers excessive email notifications (CVPP auto-
-  // subscribes the authenticated user to all viewed tender updates).
-  // The anonymous flow has its own working download path:
+  // 2026-05-26 removal (Task #94): the anonymous flow
   //   <a onclick="downloadDocForAnonymous('id')">filename</a>
   //   <button onclick="downloadForAnonymousUser()">ATSISIŲSTI ZIP</button>
-  // These are wired into fetchViesiejiPirkimaiDocuments harvester and
-  // give us bulk ZIP + individual file downloads without login. See
-  // also explicit skip in attemptPortalLogin branch below.
+  // worked for SOME tenders, and the user wanted to avoid CVPP's auto-
+  // subscription emails that arrive after every authenticated view.
+  //
+  // 2026-05-28 reversal: run 59 LT scan saved 4 high-value tenders
+  // (€502K–€2.64M: jūros dugno DB / TAIS-VYTIS / CPO LT duomenų valdymas /
+  // DNMF IS plėtros) with EMPTY qualifications because the anonymous
+  // endpoint returned a login-redirect HTML shell for them (handler logged
+  // `0 item(s) detected` and anchor list of nav + "Forgot your password?"
+  // only). 36/60 LT tenders in that run hit this case. The user created
+  // a dedicated mailbox to absorb CVPP subscription emails, so the spam
+  // concern is gone. Forcing login lets attemptPortalLogin establish a
+  // CVPP session cookie BEFORE fetchViesiejiPirkimaiDocuments runs; the
+  // existing handler harvester then sees the full tender content
+  // (Pirkimo dokumentai tab + downloadZip/viewCD/eAssociateUser paths)
+  // that anonymous users never get to see.
+  'viesiejipirkimai.lt',
   // dtvp.de — REMOVED 2026-05-14 (briefly added then reverted same day).
   //
   // The Germany run revealed two facts that make forced-login a NET
@@ -14904,12 +14916,21 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         // credentials'ais; jei pavyksta, persifetchinam šaltinio puslapį
         // ir traukiame qualification laukus iš autentikuoto DOM'o.
 
-        // PER-HOST LOGIN SKIP — user-requested 2026-05-26.
-        // viesiejipirkimai.lt: login triggers excessive email notifications
-        // from CVPP. We deliberately skip login and rely solely on the
-        // anonymous downloadForAnonymousUser bulk-ZIP + downloadDocForAnonymous
-        // per-file flow handled in fetchViesiejiPirkimaiDocuments.
-        const NO_LOGIN_HOSTS = ['viesiejipirkimai.lt'];
+        // PER-HOST LOGIN SKIP — historical mechanism kept as a hook.
+        //
+        // 2026-05-26: viesiejipirkimai.lt was added to NO_LOGIN_HOSTS because
+        // CVPP auto-subscribes the authenticated user to all viewed tenders
+        // → mailbox spam. Anonymous downloadForAnonymousUser flow was the
+        // only mechanism used.
+        //
+        // 2026-05-28 (Task #119): REVERTED — user created a dedicated CVPP
+        // mailbox to absorb subscription emails. Login is now allowed again,
+        // because run 59 confirmed ~36/60 LT tenders need authenticated
+        // viewing to produce any file anchors at all (anonymous flow returns
+        // a login-redirect page → 0 item(s) detected → empty qualifications
+        // in the sheet). The list is left empty to make future per-host
+        // skips trivial to add without re-creating the constant.
+        const NO_LOGIN_HOSTS = [];
         const srcHost = String(src.sourceHost || '').toLowerCase().replace(/^www\./, '');
         if (NO_LOGIN_HOSTS.some((h) => srcHost === h || srcHost.endsWith('.' + h))) {
           console.log(
