@@ -8397,9 +8397,29 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
           const rowText = row
             ? (row.innerText || row.textContent || '').replace(/\s+/g, ' ').trim()
             : '';
+          // Also inspect URL query string for tipo/type/cn parameters —
+          // PLACSP servlets sometimes encode the doc type there (e.g.
+          // tipo=PCAP, type=2). Useful when the row text is uninformative.
+          let urlTypeHint = '';
+          try {
+            const parsed = new URL(abs);
+            for (const key of ['tipo', 'type', 'tipoDoc', 'doctype', 'cn', 'docName']) {
+              const v = parsed.searchParams.get(key);
+              if (v) { urlTypeHint += ' ' + v; }
+            }
+          } catch (_) {}
+          // Filename hint from the anchor's own attributes — many PLACSP
+          // anchors set download="<filename>.pdf" or title with the real
+          // filename, which often contains "PCAP"/"PPT" abbreviations
+          // even when the rendered text is just "Pliego".
+          const filenameHint = (
+            (a.getAttribute('download') || '') + ' ' +
+            (a.getAttribute('title')    || '')
+          ).trim();
+          const haystack = `${ownText}  ${rowText}  ${urlTypeHint}  ${filenameHint}`;
           let chosenType = null;
           for (const rt of ROW_TYPE_RE) {
-            if (rt.re.test(rowText) || rt.re.test(ownText)) {
+            if (rt.re.test(haystack)) {
               chosenType = rt;
               break;
             }
@@ -8409,11 +8429,13 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
           out.push({
             url: abs,
             name: chosenType
-              ? `${chosenType.name}: ${(rowText || ownText).slice(0, 100)}`
-              : (ownText || `placsp-doc-${out.length + 1}`).slice(0, 120),
+              ? `${chosenType.name}: ${(filenameHint || rowText || ownText).slice(0, 100)}`
+              : (filenameHint || ownText || `placsp-doc-${out.length + 1}`).slice(0, 120),
             rank: chosenType ? chosenType.rank : 50,
             type: chosenType ? chosenType.name : 'unknown',
             source: sourceLabel,
+            // Carry context for diag — only logged when zero rank≤1 found.
+            _diag: { ownText: ownText.slice(0, 60), rowText: rowText.slice(0, 200), urlTypeHint: urlTypeHint.trim().slice(0, 40), filenameHint: filenameHint.slice(0, 80) },
           });
         }
         return out;
@@ -8487,6 +8509,21 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
         `${d.type}[${d.source.startsWith('iframe') ? 'if' : 'main'}](r=${d.rank})`
       ).join(' | ')
     );
+
+    // Diagnostic dump when no rank≤1 (PCAP/PPT) match found. Run 52 showed
+    // ALL 48 PLACSP tenders fell back to generic Pliego (rank=2) + Anuncio
+    // (rank=3), missing the document that actually contains qualification
+    // criteria. Print every doc's row context so we can iterate the regex.
+    try {
+      const hasRealPCAP = probe.docs.some((d) => d.rank <= 1);
+      if (!hasRealPCAP && probe.docs.length > 0) {
+        console.log(`    🇪🇸 PLACSP: ⚠️ no PCAP/PPT matched (rank≤1) — dumping row context for regex tuning:`);
+        for (const d of probe.docs.slice(0, 10)) {
+          const dx = d._diag || {};
+          console.log(`       [r=${d.rank} ${d.type}] own="${dx.ownText || ''}" | url-type="${dx.urlTypeHint || ''}" | file="${dx.filenameHint || ''}" | row="${(dx.rowText || '').slice(0, 160)}"`);
+        }
+      }
+    } catch (_) {}
 
     // Magic-byte format detection.
     const detectFormat = (buf) => {
