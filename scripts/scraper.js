@@ -3798,7 +3798,58 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           console.log(`    ℹ️  viesiejipirkimai: couldn't read ${d.fnName}() source — falling back to button click`);
         }
 
-        const bulkClicked = await page.evaluate((fnName) => {
+        // 2026-05-28 regression fix (Task #112) —
+        // PRIMARY PATH: navigate the MAIN page directly to the candidate
+        // URL extracted from downloadForAnonymousUser(). The original
+        // popup-based flow (window.open) stopped producing downloads in
+        // headless Chrome (log 52: 14/14 timeouts). By forcing the main
+        // tab to load the URL, CDP's Browser.setDownloadBehavior
+        // intercepts the attachment response and writes the ZIP to disk
+        // reliably. If the server instead serves a confirmation HTML page
+        // (Content-Type: text/html), the page renders normally and we
+        // search it for the real download anchor below.
+        let bulkClicked = false;
+        const candidateUrlForBulk = (fnSource && (fnSource.match(/['"]([^'"\s<>]*\/epps\/[^'"\s<>]+)['"]/i) || [])[1])
+          ? new URL((fnSource.match(/['"]([^'"\s<>]*\/epps\/[^'"\s<>]+)['"]/i) || [])[1], 'https://viesiejipirkimai.lt').toString()
+          : null;
+        if (candidateUrlForBulk) {
+          console.log(`    🇱🇹 viesiejipirkimai: navigating main tab to bulk URL (bypassing window.open popup)`);
+          // page.goto can throw net::ERR_ABORTED when the server returns
+          // Content-Disposition:attachment (download interrupts nav). That's
+          // EXACTLY what we want — the file lands on disk while goto errors.
+          // Swallow the error and let the disk-watch loop below pick up the
+          // ZIP. If goto resolves cleanly, the response was HTML and we'll
+          // look for a download anchor inside that page in the post-wait
+          // branch.
+          try {
+            await page.goto(candidateUrlForBulk, { waitUntil: 'domcontentloaded', timeout: 15000 });
+          } catch (e) {
+            // Expected for attachment responses — treat as success signal.
+            const msg = String(e.message || '');
+            if (/ERR_ABORTED|net::ERR_FAILED|Navigation timeout/i.test(msg)) {
+              console.log(`    🇱🇹 viesiejipirkimai: goto interrupted (likely attachment download — checking disk)`);
+            } else {
+              console.log(`    ⚠️  viesiejipirkimai: goto error: ${msg.slice(0, 100)}`);
+            }
+          }
+          bulkClicked = true;
+        }
+
+        // SECONDARY PATH — also override window.open so any future click
+        // (or rerun on this page) stays on the main tab. Then click the
+        // button as a belt-and-braces fallback. Safe even after a goto
+        // because the override is per-document and the next navigation
+        // resets it.
+        const buttonClicked = await page.evaluate((fnName) => {
+          // Override window.open globally on this page so popup-based
+          // download triggers route through the main frame, where CDP
+          // download config reliably catches the response.
+          try {
+            window.open = function (u, _name, _features) {
+              try { window.location.href = u; } catch (_) {}
+              return window;
+            };
+          } catch (_) {}
           const buttons = Array.from(document.querySelectorAll('button[onclick], input[onclick]'));
           for (const b of buttons) {
             const oc = b.getAttribute('onclick') || '';
@@ -3808,9 +3859,13 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           }
           return false;
         }, d.fnName).catch(() => false);
+        if (buttonClicked) {
+          bulkClicked = true;
+          console.log(`    🇱🇹 viesiejipirkimai: clicked bulk button (window.open patched → main-tab nav)`);
+        }
 
         if (!bulkClicked) {
-          console.log(`    ⚠️  viesiejipirkimai: failed to click bulk button "${d.filename}"`);
+          console.log(`    ⚠️  viesiejipirkimai: failed to trigger bulk download for "${d.filename}"`);
           continue;
         }
         console.log(`    🇱🇹 viesiejipirkimai: clicked bulk ZIP button "${d.filename}" — waiting for download`);
@@ -3851,6 +3906,87 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           }
         } else {
           console.log(`    ⚠️  viesiejipirkimai: bulk ZIP click didn't produce a download within 30s`);
+          // POST-FAILURE DIAGNOSTIC + RETRY — if our goto landed us on an
+          // HTML confirmation page (prepareAnonymousDownload.do can render
+          // a "click to download" intermediate page), inspect it for a
+          // download anchor / form and try one more click. Cheap and
+          // gives us a concrete next-step hint when even that fails.
+          try {
+            const here = page.url();
+            const snap = await page.evaluate(() => {
+              const docAnchor = Array.from(document.querySelectorAll('a[href]')).find((a) => {
+                const h = a.getAttribute('href') || '';
+                return /\.(zip|pdf|docx?|xlsx?)(\?|#|$)|\/download|getDocument|attachment/i.test(h);
+              });
+              const form = document.querySelector('form[action]');
+              const dlBtn = Array.from(document.querySelectorAll('button, input[type="submit"], a')).find((el) => {
+                const t = (el.innerText || el.value || el.textContent || '').trim();
+                return /atsisi[ųu]sti|download|parsisi[ųu]sti|patvirtinti|sutinku/i.test(t);
+              });
+              return {
+                title: document.title.slice(0, 80),
+                bodyPreview: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 240),
+                docAnchorHref: docAnchor ? docAnchor.getAttribute('href') : null,
+                docAnchorText: docAnchor ? (docAnchor.innerText || '').trim().slice(0, 60) : null,
+                formAction: form ? form.getAttribute('action') : null,
+                dlBtnText: dlBtn ? (dlBtn.innerText || dlBtn.value || '').trim().slice(0, 60) : null,
+              };
+            }).catch(() => null);
+            if (snap) {
+              console.log(`    🇱🇹 viesiejipirkimai: diag at ${here.slice(-80)}`);
+              console.log(`       title: "${snap.title}"`);
+              console.log(`       body: "${snap.bodyPreview}"`);
+              if (snap.docAnchorHref) console.log(`       found doc anchor: "${snap.docAnchorText}" → ${snap.docAnchorHref}`);
+              if (snap.formAction) console.log(`       form action: ${snap.formAction}`);
+              if (snap.dlBtnText) console.log(`       download btn: "${snap.dlBtnText}"`);
+              // If we spotted a doc anchor on the confirmation page, click
+              // it once and watch disk again (shorter window — 15s).
+              if (snap.docAnchorHref || snap.dlBtnText) {
+                const retryClicked = await page.evaluate(() => {
+                  const a = Array.from(document.querySelectorAll('a[href]')).find((x) => {
+                    const h = x.getAttribute('href') || '';
+                    return /\.(zip|pdf|docx?|xlsx?)(\?|#|$)|\/download|getDocument|attachment/i.test(h);
+                  });
+                  if (a) { try { a.click(); return 'anchor'; } catch (_) {} }
+                  const btn = Array.from(document.querySelectorAll('button, input[type="submit"]')).find((b) => {
+                    const t = (b.innerText || b.value || '').trim();
+                    return /atsisi[ųu]sti|download|parsisi[ųu]sti|patvirtinti|sutinku/i.test(t);
+                  });
+                  if (btn) { try { btn.click(); return 'btn'; } catch (_) {} }
+                  return null;
+                }).catch(() => null);
+                if (retryClicked) {
+                  console.log(`    🇱🇹 viesiejipirkimai: retry-clicked ${retryClicked} on confirmation page — waiting 15s`);
+                  const retryDeadline = Date.now() + 15000;
+                  let retryFile = null;
+                  while (Date.now() < retryDeadline) {
+                    await new Promise((r) => setTimeout(r, 1000));
+                    try {
+                      const filesNow = fs.readdirSync(downloadDir);
+                      const fresh = filesNow.filter((f) => !filesBefore.includes(f) && !f.endsWith('.crdownload'));
+                      for (const fname of fresh) {
+                        const fpath = pathLib.join(downloadDir, fname);
+                        const st = fs.statSync(fpath);
+                        if (st.size > 1000) { retryFile = { name: fname, path: fpath, size: st.size }; break; }
+                      }
+                      if (retryFile) break;
+                    } catch (_) {}
+                  }
+                  if (retryFile) {
+                    const buf = fs.readFileSync(retryFile.path);
+                    captured.set('bulk', { url: `file://${retryFile.path}`, ct: 'application/zip', buf, ts: Date.now() });
+                    console.log(`    🇱🇹 viesiejipirkimai: ✓ captured bulk ZIP via retry ${buf.length}B: "${retryFile.name}"`);
+                    try { fs.unlinkSync(retryFile.path); } catch (_) {}
+                    d.url = `file://${retryFile.path}`;
+                    d._capturedBuf = buf;
+                    d._capturedCt = 'application/zip';
+                    d.filename = retryFile.name;
+                    continue;
+                  }
+                }
+              }
+            }
+          } catch (_) {}
         }
         continue;
       }
@@ -8226,11 +8362,22 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
         /uri=deeplink:detalle_(?:pliego|anuncio)/i,
       ];
       const ROW_TYPE_RE = [
-        { rank: 0, name: 'PCAP',       re: /pliego\s+cl[aá]usulas\s+administrativas|cl[aá]usulas\s+administrativas\s+particulares/i },
-        { rank: 1, name: 'PPT',        re: /pliego\s+prescripciones\s+t[eé]cnicas|prescripciones\s+t[eé]cnicas\s+particulares/i },
-        { rank: 2, name: 'Pliego',     re: /\bpliego\b/i },
-        { rank: 3, name: 'Anuncio',    re: /anuncio\s+de\s+licitaci[oó]n/i },
-        { rank: 4, name: 'DocPliegos', re: /documento\s+de\s+pliegos/i },
+        // PCAP (rank 0) — strict phrase + abbreviation + flexible
+        // "Pliego administrativo" / "cláusulas particulares" variants
+        // observed across regional PLACSP deployments.
+        { rank: 0, name: 'PCAP',       re: /\bpcap\b|pliego\s+(?:de\s+)?cl[aá]usulas\s+administrativas|cl[aá]usulas\s+administrativas\s+particulares|pliego\s+administrativ[oa]|cl[aá]usulas\s+particulares/i },
+        // PPT (rank 1) — abbreviation + flexible "Pliego técnico" variants.
+        { rank: 1, name: 'PPT',        re: /\bppt\b|pliego\s+(?:de\s+)?prescripciones\s+t[eé]cnicas|prescripciones\s+t[eé]cnicas\s+particulares|pliego\s+t[eé]cnico/i },
+        // DocPliegos (rank 2) — promoted above generic Pliego because the
+        // ZIP bundle USUALLY contains the actual PCAP + PPT + Anexos.
+        // Run 52: zero rank-0 matches across 48 tenders → reach for the
+        // bundle before falling back to whatever's labeled "Pliego".
+        { rank: 2, name: 'DocPliegos', re: /documento\s+de\s+pliegos|pliegos\s+y\s+(?:documento|anex)|documentos?\s+adjuntos?|documentos?\s+asociados?/i },
+        // Generic Pliego (rank 3) — catch-all cover/notice Pliego.
+        { rank: 3, name: 'Pliego',     re: /\bpliego\b/i },
+        // Anuncio (rank 4) — bid notice, usually 3-5 pages, no quals.
+        { rank: 4, name: 'Anuncio',    re: /anuncio\s+de\s+licitaci[oó]n|\banuncio\b/i },
+        // Decreto (rank 5) — least useful (cover decree approving pliego).
         { rank: 5, name: 'Decreto',    re: /decreto\s+aprobando\s+(?:el\s+)?pliego/i },
       ];
       const collectFromRoot = (root, sourceLabel) => {
