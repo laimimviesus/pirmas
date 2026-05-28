@@ -3942,17 +3942,96 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
               // If we spotted a doc anchor on the confirmation page, click
               // it once and watch disk again (shorter window — 15s).
               if (snap.docAnchorHref || snap.dlBtnText) {
+                // 2026-05-28 Task #114 — On the prepareAnonymousDownload.do
+                // CONFIRMATION page, the "ATSISIŲSTI" button invokes a
+                // JS function (typically `download()`) that itself calls
+                // window.open() to spawn the actual file stream popup. We
+                // need to (a) re-patch window.open on THIS page (the
+                // earlier patch was on listContractDocuments.do and was
+                // wiped by page.goto), and (b) dump the function source so
+                // we can see what it does and fall back to direct URL if
+                // it's not a window.open().
+                const fnSrc = await page.evaluate(() => {
+                  try {
+                    const f = window.download;
+                    if (typeof f === 'function') return f.toString().slice(0, 800);
+                  } catch (_) {}
+                  return null;
+                }).catch(() => null);
+                if (fnSrc) {
+                  console.log(`    🇱🇹 viesiejipirkimai: download() source: ${fnSrc.replace(/\s+/g, ' ').slice(0, 400)}`);
+                  // Try to extract a /epps/ URL straight from the function
+                  // body — bypasses the popup entirely. Then page.goto it;
+                  // CDP's download manager will catch the attachment.
+                  const fnUrl = (fnSrc.match(/['"]([^'"\s<>]*\/epps\/[^'"\s<>]+)['"]/i) || [])[1];
+                  if (fnUrl) {
+                    const absDl = new URL(fnUrl, 'https://viesiejipirkimai.lt').toString();
+                    console.log(`    🇱🇹 viesiejipirkimai: extracted download() URL → ${absDl.slice(-100)}`);
+                    let filesBeforeFn = [];
+                    try { filesBeforeFn = fs.readdirSync(downloadDir); } catch (_) {}
+                    try {
+                      await page.goto(absDl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                    } catch (e) {
+                      const m = String(e.message || '');
+                      if (/ERR_ABORTED|net::ERR_FAILED|Navigation/i.test(m)) {
+                        console.log(`    🇱🇹 viesiejipirkimai: goto interrupted (likely attachment — checking disk)`);
+                      }
+                    }
+                    const fnDeadline = Date.now() + 20000;
+                    let fnFile = null;
+                    while (Date.now() < fnDeadline) {
+                      await new Promise((r) => setTimeout(r, 800));
+                      try {
+                        const filesNow = fs.readdirSync(downloadDir);
+                        const fresh = filesNow.filter((f) => !filesBeforeFn.includes(f) && !f.endsWith('.crdownload'));
+                        for (const fname of fresh) {
+                          const fpath = pathLib.join(downloadDir, fname);
+                          const st = fs.statSync(fpath);
+                          if (st.size > 1000) { fnFile = { name: fname, path: fpath, size: st.size }; break; }
+                        }
+                        if (fnFile) break;
+                      } catch (_) {}
+                    }
+                    if (fnFile) {
+                      const buf = fs.readFileSync(fnFile.path);
+                      captured.set('bulk', { url: `file://${fnFile.path}`, ct: 'application/zip', buf, ts: Date.now() });
+                      console.log(`    🇱🇹 viesiejipirkimai: ✓ captured bulk ZIP via download() URL ${buf.length}B: "${fnFile.name}"`);
+                      try { fs.unlinkSync(fnFile.path); } catch (_) {}
+                      d.url = `file://${fnFile.path}`;
+                      d._capturedBuf = buf;
+                      d._capturedCt = 'application/zip';
+                      d.filename = fnFile.name;
+                      continue;
+                    }
+                    console.log(`    ⚠️  viesiejipirkimai: download() URL goto produced no file within 20s — falling through to button retry`);
+                  }
+                }
                 const retryClicked = await page.evaluate(() => {
+                  // Patch window.open on the confirmation page so any
+                  // popup-based download navigates the MAIN tab instead.
+                  try {
+                    window.open = function (u, _name, _features) {
+                      try { if (u) window.location.href = u; } catch (_) {}
+                      return window;
+                    };
+                  } catch (_) {}
                   const a = Array.from(document.querySelectorAll('a[href]')).find((x) => {
                     const h = x.getAttribute('href') || '';
                     return /\.(zip|pdf|docx?|xlsx?)(\?|#|$)|\/download|getDocument|attachment/i.test(h);
                   });
                   if (a) { try { a.click(); return 'anchor'; } catch (_) {} }
-                  const btn = Array.from(document.querySelectorAll('button, input[type="submit"]')).find((b) => {
-                    const t = (b.innerText || b.value || '').trim();
-                    return /atsisi[ųu]sti|download|parsisi[ųu]sti|patvirtinti|sutinku/i.test(t);
-                  });
-                  if (btn) { try { btn.click(); return 'btn'; } catch (_) {} }
+                  // Prefer the ATSISIŲSTI button (download), explicitly
+                  // exclude ATŠAUKTI (cancel) — both share the "atsi-"
+                  // prefix in Lithuanian.
+                  const RE_CANCEL = /at[šs]aukti|cancel|u[žz]daryti|close|atgal|nutraukti/i;
+                  const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"]'));
+                  for (const b of buttons) {
+                    const t = (b.innerText || b.value || b.textContent || '').trim();
+                    if (!t || RE_CANCEL.test(t)) continue;
+                    if (/^atsisi[ųu]sti\b|^download\b|^parsisi[ųu]sti\b|^patvirtinti\b|^sutinku\b/i.test(t)) {
+                      try { b.click(); return `btn:${t.slice(0, 30)}`; } catch (_) {}
+                    }
+                  }
                   return null;
                 }).catch(() => null);
                 if (retryClicked) {
