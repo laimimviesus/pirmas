@@ -5481,6 +5481,357 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
 }
 
 // =====================================================================
+// contractaciopublica.cat Documents handler — Catalan Government public
+// procurement platform ("Plataforma de Serveis de Contractació Pública").
+// Anonymous viewing is allowed; the platform is a Bootstrap-based SSR
+// site with two URL flavours that Mercell gives us:
+//
+//   (a) /ca/perfils-contractant/detall/<buyer_id>  — BUYER profile page
+//       (e.g. "Sistema d'Emergències Mèdiques (SEM)"). Default landing
+//       shows "Select a post type to search" — publications NOT rendered
+//       until a sub-tab is clicked. Sub-tabs under "Tenders":
+//         Future alerts (N) | Tender announcements on time (N) |
+//         Preliminary market inquiries (N) | Files under evaluation (N) |
+//         Previous announcements (N)
+//       After clicking a sub-tab the list of publications renders as:
+//         <li class="list-group-item">
+//           <a class="fw-bold text-black fs-4"
+//              href="/ca/detall-publicacio/300677295">Title</a>
+//         </li>
+//
+//   (b) /ca/detall-publicacio/<publication_id>  — direct deep-link to a
+//       single tender. This is the page we ultimately need, where the
+//       PCAP/PPT/Plec docs live. Mercell rarely hands us this directly;
+//       run 52 example /ca/detall-publicacio/300780298 returned a 404
+//       (publication expired or wrong domain). We'll fall back to flavour
+//       (a) + reference-search to find the live publication.
+//
+// Strategy: for flavour (a), navigate to the buyer profile, click each
+// "open" sub-tab (Tender announcements + Files under evaluation), harvest
+// all publication anchors, filter by ctx.referenceNumber substring (the
+// expediente number, e.g. "Z42-2026-0013", "B196/26"), navigate to the
+// matching /ca/detall-publicacio/ URL, capture body + harvest docs.
+//
+// First-pass implementation includes a diagnostic dump of the detail
+// page DOM so the next run reveals the exact doc anchor pattern — we
+// then tighten the harvester in v2.
+async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}) {
+  let host = null;
+  let publicationId = null;
+  let buyerId = null;
+  try {
+    const u = new URL(sourceUrl);
+    host = u.hostname.toLowerCase().replace(/^www\./, '');
+    if (!/(^|\.)contractaciopublica\.(cat|gencat\.cat)$/i.test(host)) return [];
+    const mPub = u.pathname.match(/\/ca\/detall-publicacio\/([^/?#]+)/i);
+    const mBuy = u.pathname.match(/\/ca\/perfils?-contractant\/detall\/([^/?#]+)/i)
+              || u.pathname.match(/\/perfil\/([^/?#]+)/i);
+    if (mPub) publicationId = decodeURIComponent(mPub[1]);
+    else if (mBuy) buyerId = decodeURIComponent(mBuy[1]);
+    else return [];
+  } catch (_) { return []; }
+
+  const refNumber = (ctx.referenceNumber || '').trim();
+  const tenderTitle = (ctx.title || '').trim();
+
+  let pdfParseLib = null, mammothLib = null, XLSXLib = null, admZipLib = null;
+  try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { XLSXLib     = require('xlsx');      } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
+
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(30000);
+    page.setDefaultTimeout(30000);
+    try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
+    try {
+      const ua = await page.browser().userAgent();
+      await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+    } catch (_) {}
+
+    // ----- BUYER PROFILE FLAVOUR: find publication via sub-tab list -----
+    if (buyerId) {
+      if (!refNumber && !tenderTitle) {
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: buyer profile ${buyerId} but no reference/title — skipping`);
+        return [];
+      }
+      const searchTerm = refNumber || tenderTitle;
+      console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: buyer ${buyerId} — searching by "${searchTerm.slice(0, 60)}"`);
+      try {
+        await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } catch (e) {
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: buyer nav warn: ${(e.message || '').slice(0, 80)}`);
+      }
+      try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+      await new Promise((r) => setTimeout(r, 1200));
+
+      // Click each plausible sub-tab to surface publication list. The
+      // platform lazy-loads each category — clicking different tabs
+      // accumulates anchors in the DOM (each section is added to a
+      // common list-group region).
+      const SUB_TABS = [
+        // Catalan / Spanish / English variants
+        'Anuncis de licitació en termini', 'Anuncios de licitación en plazo', 'Tender announcements on time',
+        'Expedients en avaluació', 'Expedientes en evaluación', 'Files under evaluation',
+        'Anuncis previs', 'Anuncios previos', 'Future alerts',
+        'Consultes preliminars de mercat', 'Consultas preliminares de mercado', 'Preliminary market inquiries',
+      ];
+      const triedTabs = new Set();
+      for (const label of SUB_TABS) {
+        const key = label.toLowerCase();
+        if (triedTabs.has(key)) continue;
+        triedTabs.add(key);
+        const clicked = await page.evaluate((lbl) => {
+          const re = new RegExp(`^\\s*${lbl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s*\\(\\d+\\))?\\s*$`, 'i');
+          const candidates = Array.from(document.querySelectorAll(
+            'a, button, [role="tab"], [role="button"], li, h2, h3, .nav-link, .tab'
+          ));
+          for (const el of candidates) {
+            if (el.offsetParent === null) continue;
+            const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (text && re.test(text)) {
+              try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
+              try { el.click(); return true; } catch (_) {}
+            }
+          }
+          return false;
+        }, label).catch(() => false);
+        if (clicked) {
+          await new Promise((r) => setTimeout(r, 900));
+        }
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+
+      // Harvest publication anchors. The expected pattern is:
+      //   a[href*="/ca/detall-publicacio/"] inside <li class="list-group-item">
+      const pubs = await page.evaluate(() => {
+        const anchors = Array.from(document.querySelectorAll('a[href*="/ca/detall-publicacio/"]'));
+        return anchors.map((a) => {
+          const href = a.getAttribute('href') || '';
+          const label = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
+          // Capture the surrounding row text for substring matching against
+          // the expediente / reference number that may live in sibling divs.
+          const row = a.closest('li, .list-group-item, tr') || a.parentElement;
+          const rowText = (row?.innerText || row?.textContent || '').replace(/\s+/g, ' ').trim();
+          let abs = href;
+          try { abs = new URL(href, location.href).toString(); } catch (_) {}
+          return { href: abs, label: label.slice(0, 200), rowText: rowText.slice(0, 400) };
+        });
+      }).catch(() => []);
+      console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: harvested ${pubs.length} publication link(s) in buyer ${buyerId}`);
+
+      if (!pubs.length) {
+        return [];
+      }
+
+      // Match by reference (or title fragment). Prefer exact ref substring,
+      // fall back to title token overlap. Pick the first match.
+      let matched = null;
+      const needleLow = searchTerm.toLowerCase();
+      // Strip surrounding noise: prefixes like "n.º ", trailing slashes
+      const refStrip = needleLow.replace(/^n\.[º°]\s*/, '').replace(/[/_\s]+/g, '');
+      for (const p of pubs) {
+        const hayLow = (p.rowText + ' ' + p.label).toLowerCase();
+        if (hayLow.includes(needleLow)) { matched = p; break; }
+        const hayStrip = hayLow.replace(/[/_\s]+/g, '');
+        if (refStrip.length >= 4 && hayStrip.includes(refStrip)) { matched = p; break; }
+      }
+      // Fall back to title-token overlap if no direct ref hit (3+ char tokens)
+      if (!matched && tenderTitle) {
+        const tokens = tenderTitle.toLowerCase().split(/\s+/).filter((t) => t.length >= 4);
+        for (const p of pubs) {
+          const hay = (p.label + ' ' + p.rowText).toLowerCase();
+          let hits = 0;
+          for (const t of tokens) if (hay.includes(t)) hits++;
+          if (hits >= 2) { matched = p; break; }
+        }
+      }
+
+      if (!matched) {
+        // Diagnostic: dump first 5 pubs so we can see what reference field
+        // they expose for future regex tightening.
+        const sample = pubs.slice(0, 5).map((p, i) =>
+          `[${i}] ${p.label.slice(0, 60)} | row: ${p.rowText.slice(0, 100)}`).join('\n       ');
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: 0 publication match for ref "${searchTerm.slice(0, 50)}"\n       ${sample}`);
+        return [];
+      }
+      console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: matched → ${matched.label.slice(0, 60)} (${matched.href.slice(-30)})`);
+
+      // Navigate into the publication detail page.
+      const mp = matched.href.match(/\/ca\/detall-publicacio\/([^/?#]+)/i);
+      if (mp) publicationId = decodeURIComponent(mp[1]);
+      try {
+        await page.goto(matched.href, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } catch (e) {
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: pub nav warn: ${(e.message || '').slice(0, 80)}`);
+      }
+      try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+      await new Promise((r) => setTimeout(r, 1500));
+    } else {
+      // ----- DIRECT DEEP-LINK FLAVOUR -----
+      try {
+        await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } catch (e) {
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: pub nav warn: ${(e.message || '').slice(0, 80)}`);
+      }
+      try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    // Diagnostic dump — first-pass we don't yet know the exact doc anchor
+    // pattern on detall-publicacio pages. Capture anchor sample so we can
+    // tighten the harvester in v2 based on real DOM.
+    const diag = await page.evaluate(() => {
+      const h1 = (document.querySelector('h1, h2')?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+      const allAnchors = Array.from(document.querySelectorAll('a[href]'));
+      const docAnchors = allAnchors.filter((a) => {
+        const h = a.getAttribute('href') || '';
+        return /\.(pdf|docx?|xlsx?|zip|rar|odt|ods|7z)(\?|$)/i.test(h) ||
+               /document|descarga|descarrega|pliego|plec|anexo|annex|deuc|fitxer/i.test(h);
+      });
+      return {
+        h1,
+        totalAnchors: allAnchors.length,
+        docAnchorCount: docAnchors.length,
+        sampleDocAnchors: docAnchors.slice(0, 10).map((a) => ({
+          href: (a.getAttribute('href') || '').slice(0, 120),
+          text: (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+        })),
+        sectionHeaders: Array.from(document.querySelectorAll('h2, h3, h4, .card-header, .section-title'))
+          .slice(0, 10)
+          .map((h) => (h.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 60))
+          .filter(Boolean),
+      };
+    }).catch(() => ({}));
+    console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: pub_id=${publicationId} h1="${diag.h1 || ''}" anchors=${diag.totalAnchors || 0} docAnchors=${diag.docAnchorCount || 0}`);
+    if (diag.sectionHeaders && diag.sectionHeaders.length) {
+      console.log(`       sections: ${JSON.stringify(diag.sectionHeaders)}`);
+    }
+    if (diag.sampleDocAnchors && diag.sampleDocAnchors.length) {
+      for (const a of diag.sampleDocAnchors) {
+        console.log(`       doc anchor: "${a.text}" → ${a.href}`);
+      }
+    }
+
+    // Capture full body innerText — Catalan procurement notice pages
+    // usually have the publication summary, contracting authority, scope,
+    // budget, and criteria sections inline (similar to vortal).
+    const bodyText = await page.evaluate(() => {
+      return (document.body && document.body.innerText) || '';
+    }).catch(() => '');
+
+    const out = [];
+    if (bodyText && bodyText.length > 600) {
+      out.push(`--- (contractaciopublica.cat pub=${publicationId}) ---\n${bodyText.slice(0, 40000)}`);
+    }
+
+    // Per-doc fetch: download any anchor with a known extension or matching
+    // a keyword that strongly indicates a tender document. Cap totals to
+    // avoid runaway with multi-MB ZIPs.
+    const docAnchors = await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll('a[href]'));
+      const out = [];
+      const seen = new Set();
+      for (const a of all) {
+        const href = a.getAttribute('href') || '';
+        if (!href || href.startsWith('#') || /^javascript:/i.test(href)) continue;
+        const isExt = /\.(pdf|docx?|xlsx?|zip|rar|odt|ods|7z)(\?|$)/i.test(href);
+        const isKw = /document|descarrega|descarga|pliego|plec|anexo|annex|deuc|fitxer/i.test(href);
+        if (!isExt && !isKw) continue;
+        let abs = href;
+        try { abs = new URL(href, location.href).toString(); } catch (_) {}
+        if (seen.has(abs)) continue;
+        seen.add(abs);
+        const label = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
+        out.push({ href: abs, label: label.slice(0, 120) });
+      }
+      return out;
+    }).catch(() => []);
+
+    const TOTAL_DOC_CAP = 100000;
+    const PER_DOC_CAP = 30000;
+    let docTotal = 0;
+    for (const { href, label } of docAnchors.slice(0, 10)) {
+      if (docTotal >= TOTAL_DOC_CAP) break;
+      try {
+        const fetched = await page.evaluate(async (u) => {
+          try {
+            const r = await fetch(u, { credentials: 'include' });
+            if (!r.ok) return { ok: false, status: r.status };
+            const ab = await r.arrayBuffer();
+            return { ok: true, bytes: Array.from(new Uint8Array(ab)), len: ab.byteLength };
+          } catch (e) { return { ok: false, err: String(e).slice(0, 100) }; }
+        }, href).catch(() => null);
+        if (!fetched || !fetched.ok) {
+          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: "${label.slice(0, 40)}" fetch fail (${fetched?.status || fetched?.err || '?'})`);
+          continue;
+        }
+        const buf = Buffer.from(fetched.bytes);
+        let text = '';
+        if (buf.length >= 4 && buf[0] === 0x25 && buf[1] === 0x50) {
+          if (pdfParseLib) {
+            try { const r = await pdfParseLib(buf); text = (r.text || '').trim(); } catch (_) {}
+          }
+        } else if (buf.length >= 2 && buf[0] === 0x50 && buf[1] === 0x4B) {
+          if (/\.docx?($|\?)/i.test(href) && mammothLib) {
+            try { const r = await mammothLib.extractRawText({ buffer: buf }); text = (r.value || '').trim(); } catch (_) {}
+          }
+          if (!text && /\.xlsx?($|\?)/i.test(href) && XLSXLib) {
+            try {
+              const wb = XLSXLib.read(buf, { type: 'buffer' });
+              const parts = [];
+              for (const sn of wb.SheetNames) parts.push(`# ${sn}\n${XLSXLib.utils.sheet_to_csv(wb.Sheets[sn])}`);
+              text = parts.join('\n\n').trim();
+            } catch (_) {}
+          }
+          if (!text && admZipLib) {
+            try {
+              const zip = new admZipLib(buf);
+              const innerOut = [];
+              for (const e of zip.getEntries().filter((x) => !x.isDirectory).slice(0, 10)) {
+                const ib = e.getData();
+                let it = '';
+                if (/\.pdf$/i.test(e.entryName) && pdfParseLib) {
+                  try { const r = await pdfParseLib(ib); it = (r.text || '').trim(); } catch (_) {}
+                } else if (/\.docx?$/i.test(e.entryName) && mammothLib) {
+                  try { const r = await mammothLib.extractRawText({ buffer: ib }); it = (r.value || '').trim(); } catch (_) {}
+                }
+                if (it) innerOut.push(`# ${e.entryName}\n${it.slice(0, 8000)}`);
+              }
+              text = innerOut.join('\n\n').trim();
+            } catch (_) {}
+          }
+        }
+        if (text) {
+          const remaining = TOTAL_DOC_CAP - docTotal;
+          const chunk = text.slice(0, Math.min(PER_DOC_CAP, remaining));
+          out.push(`--- (contractaciopublica doc: ${label.slice(0, 80)}) ---\n${chunk}`);
+          docTotal += chunk.length;
+          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: "${label.slice(0, 40)}" → ${chunk.length}ch`);
+        } else {
+          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: "${label.slice(0, 40)}" → unparseable (${buf.length}b)`);
+        }
+      } catch (e) {
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: doc fetch error: ${(e.message || '').slice(0, 80)}`);
+      }
+    }
+
+    if (!out.length) {
+      console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: pub_id=${publicationId} — no body or doc content`);
+      return [];
+    }
+    return [out.join('\n\n')];
+  } catch (e) {
+    console.log(`    ⚠️  contractaciopublica handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
+// =====================================================================
 async function fetchArtifikDocuments(browser, sourceUrl) {
   let pid = null;
   let host = null;
@@ -12440,6 +12791,25 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
       }
     } catch (e) {
       console.log(`    ⚠️ vortal handler outer error: ${(e.message || '').slice(0, 100)}`);
+    }
+
+    // contractaciopublica.cat Documents handler — Catalan Government
+    // procurement platform. Bootstrap SSR with buyer-profile and
+    // detall-publicacio URL flavours; handler walks profile sub-tabs
+    // when needed, matches by reference, then captures detail body +
+    // PDF/DOCX/ZIP docs. No-op for non-contractaciopublica.cat sources.
+    try {
+      const cpcTexts = await fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx);
+      if (cpcTexts && cpcTexts.length) {
+        const SRC_TOTAL_CAP = 200000;
+        const existing = result.sourceFilesText || '';
+        const sep = existing ? '\n\n' : '';
+        const combined = (existing + sep + cpcTexts.join('\n\n')).slice(0, SRC_TOTAL_CAP);
+        result.sourceFilesText = combined;
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: appended ${cpcTexts.length} block(s) to sourceFilesText (total ${combined.length}ch)`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️ contractaciopublica handler outer error: ${(e.message || '').slice(0, 100)}`);
     }
 
     // app.artifik.no Documents handler — Norwegian SaaS tender platform
