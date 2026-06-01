@@ -5597,12 +5597,26 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
       // platform lazy-loads each category — clicking different tabs
       // accumulates anchors in the DOM (each section is added to a
       // common list-group region).
+      //
+      // Run 63 lesson: buyer 81774653 returned only 2 pubs (ultrasounds +
+      // vehicles), but the target tender ("enucleación prostática") was
+      // in a different section we hadn't clicked. The Tenders pseudo-tab
+      // has 5 sub-categories AND the page has 5 sibling tabs at the same
+      // level (Awards and formalities, Aggregated publications, etc.).
+      // We now walk both axes to maximise harvested anchors.
       const SUB_TABS = [
-        // Catalan / Spanish / English variants
+        // --- Sub-tabs under "Tenders" main tab ---
+        // Catalan / Spanish / English
         'Anuncis de licitació en termini', 'Anuncios de licitación en plazo', 'Tender announcements on time',
         'Expedients en avaluació', 'Expedientes en evaluación', 'Files under evaluation',
         'Anuncis previs', 'Anuncios previos', 'Future alerts',
         'Consultes preliminars de mercat', 'Consultas preliminares de mercado', 'Preliminary market inquiries',
+        'Anuncis anteriors', 'Anuncios anteriores', 'Previous announcements',
+        // --- Top-level sibling tabs (peer of "Tenders") ---
+        'Publicacions en curs', 'Publicaciones en curso', 'Publications in progress',
+        'Publicacions agregades', 'Publicaciones agregadas', 'Aggregated publications',
+        'Adjudicacions i formalitats', 'Adjudicaciones y formalidades', 'Awards and formalities',
+        'Licitacions', 'Licitaciones', 'Tenders',
       ];
       const triedTabs = new Set();
       for (const label of SUB_TABS) {
@@ -5649,6 +5663,31 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
       console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: harvested ${pubs.length} publication link(s) in buyer ${buyerId}`);
 
       if (!pubs.length) {
+        // 0-pubs diagnostic — dump all visible tab labels + nav anchors so we
+        // can see WHICH tab matcher failed (run 63 buyer 9176738 case). The
+        // SUB_TABS regex needs to match the EXACT label rendered on the page;
+        // platform locale or markup variants may slip past the current list.
+        try {
+          const diag0 = await page.evaluate(() => {
+            const candidates = Array.from(document.querySelectorAll(
+              'a, button, [role="tab"], .nav-link, .tab, h2, h3, li'
+            ));
+            const seen = new Set();
+            const tabs = [];
+            for (const el of candidates) {
+              if (el.offsetParent === null) continue;
+              const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+              if (!t || t.length < 3 || t.length > 80) continue;
+              if (seen.has(t)) continue;
+              seen.add(t);
+              tabs.push(t);
+              if (tabs.length >= 40) break;
+            }
+            return tabs;
+          });
+          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: 0 pubs — visible tab/button text (top 40):`);
+          for (const t of diag0) console.log(`       • ${t.slice(0, 80)}`);
+        } catch (_) {}
         return [];
       }
 
@@ -5664,14 +5703,34 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
         const hayStrip = hayLow.replace(/[/_\s]+/g, '');
         if (refStrip.length >= 4 && hayStrip.includes(refStrip)) { matched = p; break; }
       }
-      // Fall back to title-token overlap if no direct ref hit (3+ char tokens)
+      // Title-token fallback. Run 63 lesson: Mercell's "reference" can be a
+      // TED publication ID (e.g. "00373935-2026") that the Catalan portal
+      // doesn't expose in pub labels — so the only signal is the title.
+      // Use SPECIFIC 5+ char tokens (skips stop words like "para", "del"),
+      // require 1+ hit (was 2+; too strict for short titles or partial
+      // Catalan/Spanish overlap), and prefer multi-hit matches over single.
       if (!matched && tenderTitle) {
-        const tokens = tenderTitle.toLowerCase().split(/\s+/).filter((t) => t.length >= 4);
+        const STOP = new Set([
+          'servicio', 'serveis', 'service', 'services', 'servei',
+          'apoyo', 'suport', 'support',
+          'gestión', 'gestio', 'gestion', 'management',
+          'para', 'pels', 'pour', 'per',
+          'sobre', 'about',
+        ]);
+        const tokens = tenderTitle.toLowerCase()
+          .replace(/[(),.;:!?¿¡"'`]/g, ' ')
+          .split(/\s+/)
+          .filter((t) => t.length >= 5 && !STOP.has(t));
+        let bestHits = 0;
         for (const p of pubs) {
           const hay = (p.label + ' ' + p.rowText).toLowerCase();
           let hits = 0;
           for (const t of tokens) if (hay.includes(t)) hits++;
-          if (hits >= 2) { matched = p; break; }
+          if (hits > bestHits) { bestHits = hits; matched = p; }
+        }
+        if (matched && bestHits < 1) matched = null;
+        if (matched) {
+          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: matched via title-token (${bestHits} hit(s))`);
         }
       }
 
