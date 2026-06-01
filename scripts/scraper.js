@@ -5604,19 +5604,35 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
       // has 5 sub-categories AND the page has 5 sibling tabs at the same
       // level (Awards and formalities, Aggregated publications, etc.).
       // We now walk both axes to maximise harvested anchors.
+      // ORDER MATTERS — run 64 lesson (buyer 9176738):
+      // Sub-tabs ("Anuncis de licitació en termini (1)" etc.) are children
+      // of "Licitacions" main tab and are hidden until the parent is
+      // active. We must click MAIN tabs FIRST so sub-tabs become
+      // interactive (offsetParent !== null), then click each sub-tab.
+      //
+      // Variant-detected via run 64 diag dump: "Publicacions en execució"
+      // (NOT "en curs"); "Adjudicacions i formalitzacions" (with z, not s);
+      // "Anul·lacions" with middle dot — added all observed variants.
       const SUB_TABS = [
-        // --- Sub-tabs under "Tenders" main tab ---
-        // Catalan / Spanish / English
+        // --- MAIN tabs first (so sub-tabs hydrate) ---
+        'Licitacions', 'Licitaciones', 'Tenders',
+        'Adjudicacions i formalitzacions', 'Adjudicacions i formalitats',
+        'Adjudicaciones y formalizaciones', 'Adjudicaciones y formalidades',
+        'Awards and formalities', 'Awards and formalisations',
+        'Publicacions en execució', 'Publicacions en curs',
+        'Publicaciones en ejecución', 'Publicaciones en curso',
+        'Publications in execution', 'Publications in progress',
+        'Publicacions agregades', 'Publicaciones agregadas', 'Aggregated publications',
+        'Acords marc', 'Acuerdos marco', 'Framework agreements',
+        // --- Sub-tabs under "Tenders" main tab (now reachable) ---
         'Anuncis de licitació en termini', 'Anuncios de licitación en plazo', 'Tender announcements on time',
         'Expedients en avaluació', 'Expedientes en evaluación', 'Files under evaluation',
         'Anuncis previs', 'Anuncios previos', 'Future alerts',
-        'Consultes preliminars de mercat', 'Consultas preliminares de mercado', 'Preliminary market inquiries',
+        'Alertes futures', 'Alertas futuras',
+        'Consultes preliminars del mercat', 'Consultes preliminars de mercat',
+        'Consultas preliminares del mercado', 'Consultas preliminares de mercado',
+        'Preliminary market inquiries',
         'Anuncis anteriors', 'Anuncios anteriores', 'Previous announcements',
-        // --- Top-level sibling tabs (peer of "Tenders") ---
-        'Publicacions en curs', 'Publicaciones en curso', 'Publications in progress',
-        'Publicacions agregades', 'Publicaciones agregadas', 'Aggregated publications',
-        'Adjudicacions i formalitats', 'Adjudicaciones y formalidades', 'Awards and formalities',
-        'Licitacions', 'Licitaciones', 'Tenders',
       ];
       const triedTabs = new Set();
       for (const label of SUB_TABS) {
@@ -5706,9 +5722,14 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
       // Title-token fallback. Run 63 lesson: Mercell's "reference" can be a
       // TED publication ID (e.g. "00373935-2026") that the Catalan portal
       // doesn't expose in pub labels — so the only signal is the title.
-      // Use SPECIFIC 5+ char tokens (skips stop words like "para", "del"),
-      // require 1+ hit (was 2+; too strict for short titles or partial
-      // Catalan/Spanish overlap), and prefer multi-hit matches over single.
+      //
+      // Run 64 lesson: "1 hit" was TOO loose — buyer 81774653 had 2 pubs
+      // ("ecògrafs" + "vehicles") and our target tender ("enucleación
+      // prostática") wasn't among them, but a single weak token (e.g.
+      // "hospital" elsewhere on the page) triggered a false positive match.
+      // Tightened: require 2+ token hits OR a single hit on a strong
+      // (8+ char) specific token — domain-specific words like
+      // "enucleación" or "subministrament" are unlikely to false-match.
       if (!matched && tenderTitle) {
         const STOP = new Set([
           'servicio', 'serveis', 'service', 'services', 'servei',
@@ -5716,21 +5737,41 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
           'gestión', 'gestio', 'gestion', 'management',
           'para', 'pels', 'pour', 'per',
           'sobre', 'about',
+          'hospital', 'hospitales', 'hospitals',  // too generic
+          'sistema', 'sistemas', 'sistemes',
+          'centro', 'centre', 'centros', 'centres',
+          'general', 'generales', 'general',
         ]);
         const tokens = tenderTitle.toLowerCase()
           .replace(/[(),.;:!?¿¡"'`]/g, ' ')
           .split(/\s+/)
           .filter((t) => t.length >= 5 && !STOP.has(t));
         let bestHits = 0;
+        let bestPub = null;
+        let bestStrongHit = false;
         for (const p of pubs) {
           const hay = (p.label + ' ' + p.rowText).toLowerCase();
           let hits = 0;
-          for (const t of tokens) if (hay.includes(t)) hits++;
-          if (hits > bestHits) { bestHits = hits; matched = p; }
+          let strongHit = false;
+          for (const t of tokens) {
+            if (hay.includes(t)) {
+              hits++;
+              if (t.length >= 8) strongHit = true;
+            }
+          }
+          // Prefer match with more hits; break ties by presence of a strong hit.
+          if (hits > bestHits || (hits === bestHits && strongHit && !bestStrongHit)) {
+            bestHits = hits;
+            bestPub = p;
+            bestStrongHit = strongHit;
+          }
         }
-        if (matched && bestHits < 1) matched = null;
-        if (matched) {
-          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: matched via title-token (${bestHits} hit(s))`);
+        // Accept only: 2+ generic hits OR 1 strong (8+ char) hit.
+        if (bestPub && (bestHits >= 2 || (bestHits >= 1 && bestStrongHit))) {
+          matched = bestPub;
+          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: matched via title-token (${bestHits} hit(s)${bestStrongHit ? ', strong' : ''})`);
+        } else if (bestPub) {
+          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: title-token best=${bestHits} hit(s) — too weak, rejecting`);
         }
       }
 
