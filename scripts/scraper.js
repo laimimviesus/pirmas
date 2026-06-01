@@ -5540,6 +5540,24 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
   try { XLSXLib     = require('xlsx');      } catch (_) {}
   try { admZipLib   = require('adm-zip');   } catch (_) {}
 
+  // CDP download capture — contractaciopublica.cat docs are rendered as
+  // <button class="btn-link"> elements (not <a href>); the click handler
+  // fires a JS-driven download that lands as Content-Disposition:attachment
+  // via a hidden form post. We configure Browser-level download behavior
+  // pointing at a fresh tempdir, then poll after each button click.
+  const fs = require('fs');
+  const pathLib = require('path');
+  const os = require('os');
+  const downloadDir = fs.mkdtempSync(pathLib.join(os.tmpdir(), 'cpc-dl-'));
+  try {
+    const browserCdp = await browser.target().createCDPSession();
+    await browserCdp.send('Browser.setDownloadBehavior', {
+      behavior: 'allow',
+      downloadPath: downloadDir,
+      eventsEnabled: true,
+    }).catch(() => null);
+  } catch (_) {}
+
   let page = null;
   try {
     page = await browser.newPage();
@@ -5549,6 +5567,14 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
     try {
       const ua = await page.browser().userAgent();
       await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+    } catch (_) {}
+    // Per-page CDP fallback in case browser-level config missed this target.
+    try {
+      const pageCdp = await page.target().createCDPSession();
+      await pageCdp.send('Page.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: downloadDir,
+      }).catch(() => null);
     } catch (_) {}
 
     // ----- BUYER PROFILE FLAVOUR: find publication via sub-tab list -----
@@ -5680,39 +5706,29 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
       await new Promise((r) => setTimeout(r, 1500));
     }
 
-    // Diagnostic dump — first-pass we don't yet know the exact doc anchor
-    // pattern on detall-publicacio pages. Capture anchor sample so we can
-    // tighten the harvester in v2 based on real DOM.
+    // Diagnostic dump — confirm we're on the right page and capture the
+    // section landscape for future tightening.
     const diag = await page.evaluate(() => {
       const h1 = (document.querySelector('h1, h2')?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 100);
-      const allAnchors = Array.from(document.querySelectorAll('a[href]'));
-      const docAnchors = allAnchors.filter((a) => {
-        const h = a.getAttribute('href') || '';
-        return /\.(pdf|docx?|xlsx?|zip|rar|odt|ods|7z)(\?|$)/i.test(h) ||
-               /document|descarga|descarrega|pliego|plec|anexo|annex|deuc|fitxer/i.test(h);
-      });
+      const docButtons = Array.from(document.querySelectorAll('button.btn-link, button.btn'));
+      const docButtonCount = docButtons.filter((b) => {
+        const t = (b.innerText || b.textContent || '');
+        return /\.(pdf|docx?|xlsx?|zip|rar|odt|ods|7z)\b/i.test(t);
+      }).length;
       return {
         h1,
-        totalAnchors: allAnchors.length,
-        docAnchorCount: docAnchors.length,
-        sampleDocAnchors: docAnchors.slice(0, 10).map((a) => ({
-          href: (a.getAttribute('href') || '').slice(0, 120),
-          text: (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
-        })),
+        totalAnchors: document.querySelectorAll('a[href]').length,
+        totalButtons: document.querySelectorAll('button').length,
+        docButtonCount,
         sectionHeaders: Array.from(document.querySelectorAll('h2, h3, h4, .card-header, .section-title'))
           .slice(0, 10)
           .map((h) => (h.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 60))
           .filter(Boolean),
       };
     }).catch(() => ({}));
-    console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: pub_id=${publicationId} h1="${diag.h1 || ''}" anchors=${diag.totalAnchors || 0} docAnchors=${diag.docAnchorCount || 0}`);
+    console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: pub_id=${publicationId} h1="${diag.h1 || ''}" anchors=${diag.totalAnchors || 0} buttons=${diag.totalButtons || 0} docButtons=${diag.docButtonCount || 0}`);
     if (diag.sectionHeaders && diag.sectionHeaders.length) {
       console.log(`       sections: ${JSON.stringify(diag.sectionHeaders)}`);
-    }
-    if (diag.sampleDocAnchors && diag.sampleDocAnchors.length) {
-      for (const a of diag.sampleDocAnchors) {
-        console.log(`       doc anchor: "${a.text}" → ${a.href}`);
-      }
     }
 
     // Capture full body innerText — Catalan procurement notice pages
@@ -5727,94 +5743,167 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
       out.push(`--- (contractaciopublica.cat pub=${publicationId}) ---\n${bodyText.slice(0, 40000)}`);
     }
 
-    // Per-doc fetch: download any anchor with a known extension or matching
-    // a keyword that strongly indicates a tender document. Cap totals to
-    // avoid runaway with multi-MB ZIPs.
-    const docAnchors = await page.evaluate(() => {
-      const all = Array.from(document.querySelectorAll('a[href]'));
+    // Harvest doc BUTTONS — confirmed pattern (user inspection 2026-05-28):
+    //   <div class="d-flex">
+    //     <button type="button" class="btn btn-link p-0 text-truncate">
+    //       <font...>CME23C015Av1 - IN CPM ... .pdf</font>
+    //     </button>
+    //   </div>
+    // The button has no visible href; click triggers an internal JS handler
+    // that fires a Content-Disposition:attachment download. We capture the
+    // resulting file from the CDP download dir.
+    //
+    // Listen for "real" doc-name buttons only — text must include an
+    // extension we recognise; skip generic "Cancel" / "Tornar" / nav buttons.
+    const docButtonHandles = await page.evaluateHandle(() => {
+      const out = [];
+      const buttons = Array.from(document.querySelectorAll('button'));
+      const seen = new Set();
+      for (const b of buttons) {
+        const text = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!text) continue;
+        // Match filename-like text: ends with or contains .pdf/.docx/.xlsx/.zip/etc.
+        if (!/\.(pdf|docx?|xlsx?|zip|rar|odt|ods|7z|odp|pptx?)\b/i.test(text)) continue;
+        // De-dup by visible text + position to avoid clicking the same row twice.
+        const key = text.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ el: b, text: text.slice(0, 200) });
+      }
+      return out;
+    }).catch(() => null);
+
+    // Re-derive in a way puppeteer can both list and click. We'll fetch
+    // labels separately and re-query elements by index when clicking.
+    const docButtons = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button'));
       const out = [];
       const seen = new Set();
-      for (const a of all) {
-        const href = a.getAttribute('href') || '';
-        if (!href || href.startsWith('#') || /^javascript:/i.test(href)) continue;
-        const isExt = /\.(pdf|docx?|xlsx?|zip|rar|odt|ods|7z)(\?|$)/i.test(href);
-        const isKw = /document|descarrega|descarga|pliego|plec|anexo|annex|deuc|fitxer/i.test(href);
-        if (!isExt && !isKw) continue;
-        let abs = href;
-        try { abs = new URL(href, location.href).toString(); } catch (_) {}
-        if (seen.has(abs)) continue;
-        seen.add(abs);
-        const label = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
-        out.push({ href: abs, label: label.slice(0, 120) });
+      for (const b of buttons) {
+        const text = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!text) continue;
+        if (!/\.(pdf|docx?|xlsx?|zip|rar|odt|ods|7z|odp|pptx?)\b/i.test(text)) continue;
+        const key = text.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ text: text.slice(0, 200) });
       }
       return out;
     }).catch(() => []);
+    console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: ${docButtons.length} doc button(s) detected`);
 
     const TOTAL_DOC_CAP = 100000;
     const PER_DOC_CAP = 30000;
     let docTotal = 0;
-    for (const { href, label } of docAnchors.slice(0, 10)) {
+
+    // Snapshot current files so we can identify each new download.
+    const dirAt = (d) => {
+      try { return fs.readdirSync(d); } catch (_) { return []; }
+    };
+
+    for (let i = 0; i < Math.min(docButtons.length, 10); i++) {
       if (docTotal >= TOTAL_DOC_CAP) break;
-      try {
-        const fetched = await page.evaluate(async (u) => {
+      const { text: label } = docButtons[i];
+      // Click the i-th matching button (re-query each iteration; DOM may
+      // re-render between clicks).
+      const filesBefore = dirAt(downloadDir);
+      const clicked = await page.evaluate((idx) => {
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const matched = [];
+        const seen = new Set();
+        for (const b of buttons) {
+          const t = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim();
+          if (!t) continue;
+          if (!/\.(pdf|docx?|xlsx?|zip|rar|odt|ods|7z|odp|pptx?)\b/i.test(t)) continue;
+          const k = t.toLowerCase();
+          if (seen.has(k)) continue;
+          seen.add(k);
+          matched.push(b);
+        }
+        const target = matched[idx];
+        if (!target) return false;
+        try { target.scrollIntoView({ block: 'center' }); } catch (_) {}
+        try { target.click(); return true; } catch (_) { return false; }
+      }, i).catch(() => false);
+      if (!clicked) {
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: failed to click "${label.slice(0, 40)}"`);
+        continue;
+      }
+
+      // Wait up to 20s for a new file to appear in the download dir.
+      let newFile = null;
+      const deadline = Date.now() + 20000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 500));
+        const after = dirAt(downloadDir).filter((f) => !filesBefore.includes(f) && !/\.crdownload$/i.test(f));
+        if (after.length) {
+          const fname = after[0];
+          const fpath = pathLib.join(downloadDir, fname);
           try {
-            const r = await fetch(u, { credentials: 'include' });
-            if (!r.ok) return { ok: false, status: r.status };
-            const ab = await r.arrayBuffer();
-            return { ok: true, bytes: Array.from(new Uint8Array(ab)), len: ab.byteLength };
-          } catch (e) { return { ok: false, err: String(e).slice(0, 100) }; }
-        }, href).catch(() => null);
-        if (!fetched || !fetched.ok) {
-          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: "${label.slice(0, 40)}" fetch fail (${fetched?.status || fetched?.err || '?'})`);
-          continue;
+            const st = fs.statSync(fpath);
+            if (st.size > 0) { newFile = { name: fname, path: fpath, size: st.size }; break; }
+          } catch (_) {}
         }
-        const buf = Buffer.from(fetched.bytes);
-        let text = '';
-        if (buf.length >= 4 && buf[0] === 0x25 && buf[1] === 0x50) {
-          if (pdfParseLib) {
-            try { const r = await pdfParseLib(buf); text = (r.text || '').trim(); } catch (_) {}
-          }
-        } else if (buf.length >= 2 && buf[0] === 0x50 && buf[1] === 0x4B) {
-          if (/\.docx?($|\?)/i.test(href) && mammothLib) {
-            try { const r = await mammothLib.extractRawText({ buffer: buf }); text = (r.value || '').trim(); } catch (_) {}
-          }
-          if (!text && /\.xlsx?($|\?)/i.test(href) && XLSXLib) {
-            try {
-              const wb = XLSXLib.read(buf, { type: 'buffer' });
-              const parts = [];
-              for (const sn of wb.SheetNames) parts.push(`# ${sn}\n${XLSXLib.utils.sheet_to_csv(wb.Sheets[sn])}`);
-              text = parts.join('\n\n').trim();
-            } catch (_) {}
-          }
-          if (!text && admZipLib) {
-            try {
-              const zip = new admZipLib(buf);
-              const innerOut = [];
-              for (const e of zip.getEntries().filter((x) => !x.isDirectory).slice(0, 10)) {
-                const ib = e.getData();
-                let it = '';
-                if (/\.pdf$/i.test(e.entryName) && pdfParseLib) {
-                  try { const r = await pdfParseLib(ib); it = (r.text || '').trim(); } catch (_) {}
-                } else if (/\.docx?$/i.test(e.entryName) && mammothLib) {
-                  try { const r = await mammothLib.extractRawText({ buffer: ib }); it = (r.value || '').trim(); } catch (_) {}
-                }
-                if (it) innerOut.push(`# ${e.entryName}\n${it.slice(0, 8000)}`);
+      }
+      if (!newFile) {
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: "${label.slice(0, 40)}" → no download captured in 20s`);
+        continue;
+      }
+
+      // Parse the captured file
+      let buf, text = '';
+      try { buf = fs.readFileSync(newFile.path); } catch (e) {
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: failed to read "${newFile.name}": ${(e.message || '').slice(0, 60)}`);
+        try { fs.unlinkSync(newFile.path); } catch (_) {}
+        continue;
+      }
+      const ext = (newFile.name.match(/\.([a-z0-9]+)$/i) || [, ''])[1].toLowerCase();
+      if (buf.length >= 4 && buf[0] === 0x25 && buf[1] === 0x50) {
+        if (pdfParseLib) {
+          try { const r = await pdfParseLib(buf); text = (r.text || '').trim(); } catch (_) {}
+        }
+      } else if (buf.length >= 2 && buf[0] === 0x50 && buf[1] === 0x4B) {
+        if (/^docx?$/.test(ext) && mammothLib) {
+          try { const r = await mammothLib.extractRawText({ buffer: buf }); text = (r.value || '').trim(); } catch (_) {}
+        }
+        if (!text && /^xlsx?$/.test(ext) && XLSXLib) {
+          try {
+            const wb = XLSXLib.read(buf, { type: 'buffer' });
+            const parts = [];
+            for (const sn of wb.SheetNames) parts.push(`# ${sn}\n${XLSXLib.utils.sheet_to_csv(wb.Sheets[sn])}`);
+            text = parts.join('\n\n').trim();
+          } catch (_) {}
+        }
+        if (!text && admZipLib) {
+          try {
+            const zip = new admZipLib(buf);
+            const innerOut = [];
+            for (const e of zip.getEntries().filter((x) => !x.isDirectory).slice(0, 10)) {
+              const ib = e.getData();
+              let it = '';
+              if (/\.pdf$/i.test(e.entryName) && pdfParseLib) {
+                try { const r = await pdfParseLib(ib); it = (r.text || '').trim(); } catch (_) {}
+              } else if (/\.docx?$/i.test(e.entryName) && mammothLib) {
+                try { const r = await mammothLib.extractRawText({ buffer: ib }); it = (r.value || '').trim(); } catch (_) {}
               }
-              text = innerOut.join('\n\n').trim();
-            } catch (_) {}
-          }
+              if (it) innerOut.push(`# ${e.entryName}\n${it.slice(0, 8000)}`);
+            }
+            text = innerOut.join('\n\n').trim();
+          } catch (_) {}
         }
-        if (text) {
-          const remaining = TOTAL_DOC_CAP - docTotal;
-          const chunk = text.slice(0, Math.min(PER_DOC_CAP, remaining));
-          out.push(`--- (contractaciopublica doc: ${label.slice(0, 80)}) ---\n${chunk}`);
-          docTotal += chunk.length;
-          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: "${label.slice(0, 40)}" → ${chunk.length}ch`);
-        } else {
-          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: "${label.slice(0, 40)}" → unparseable (${buf.length}b)`);
-        }
-      } catch (e) {
-        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: doc fetch error: ${(e.message || '').slice(0, 80)}`);
+      }
+
+      // Clean up the downloaded file regardless of parse outcome.
+      try { fs.unlinkSync(newFile.path); } catch (_) {}
+
+      if (text) {
+        const remaining = TOTAL_DOC_CAP - docTotal;
+        const chunk = text.slice(0, Math.min(PER_DOC_CAP, remaining));
+        out.push(`--- (contractaciopublica doc: ${label.slice(0, 80)}) ---\n${chunk}`);
+        docTotal += chunk.length;
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: "${label.slice(0, 40)}" → ${chunk.length}ch (${newFile.size}B ${ext || '?'})`);
+      } else {
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: "${label.slice(0, 40)}" → unparseable (${newFile.size}B ${ext || '?'})`);
       }
     }
 
@@ -5828,6 +5917,14 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
     return [];
   } finally {
     try { if (page) await page.close(); } catch (_) {}
+    // Clean up download tempdir
+    try {
+      if (downloadDir && fs.existsSync(downloadDir)) {
+        const remaining = fs.readdirSync(downloadDir);
+        for (const f of remaining) { try { fs.unlinkSync(pathLib.join(downloadDir, f)); } catch (_) {} }
+        try { fs.rmdirSync(downloadDir); } catch (_) {}
+      }
+    } catch (_) {}
   }
 }
 
