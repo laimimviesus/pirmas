@@ -260,6 +260,15 @@ const ALWAYS_LOGIN_HOSTS = [
   // (Pirkimo dokumentai tab + downloadZip/viewCD/eAssociateUser paths)
   // that anonymous users never get to see.
   'viesiejipirkimai.lt',
+  // pmp.b2g.etat.lu — Luxembourg e-Procurement (Plateforme Marchés
+  // Publics). Anonymous fetch of /entreprise/consultation/<id> renders
+  // the catalogue header + "Se connecter" prompt, not the tender detail.
+  // After TAM authentication (see LOGIN_URLS['pmp.b2g.etat.lu']) the
+  // same URL renders the procurement notice with downloadable
+  // "Pièces du dossier" / DCE documents. Creds in PORTAL_CREDS_JSON
+  // (CCT account, registered 2026-06-01).
+  'pmp.b2g.etat.lu',
+  'b2g.etat.lu',
   // dtvp.de — REMOVED 2026-05-14 (briefly added then reverted same day).
   //
   // The Germany run revealed two facts that make forced-login a NET
@@ -343,6 +352,20 @@ const LOGIN_URLS = {
   // popup automatically, so no dedicated URL is needed.
   // tendsign.com keeps its login form on the tender URL via redirect,
   // so the default flow works — no override needed.
+  //
+  // pmp.b2g.etat.lu — Luxembourg e-Procurement (Plateforme Marchés
+  // Publics). Anonymous viewing of /entreprise/consultation/<id> redirects
+  // to a search catalog (not the specific tender). Tender detail +
+  // documents require authentication. Login form is hosted on a SEPARATE
+  // host (login.b2g.etat.lu) via IBM Tivoli Access Manager (TAM) servlet.
+  // After successful TAM auth, the session cookie is set on the parent
+  // domain (b2g.etat.lu) so it works across pmp.* and login.* subdomains.
+  //
+  // The TAM URL itself accepts a redirectUrl parameter — we point it at
+  // /entreprise/login so the post-auth redirect lands inside the supplier
+  // portal. The "TAM_OP=login&AUTHNLEVEL=3" params trigger the username
+  // /password form (rather than smart-card / certificate auth).
+  'pmp.b2g.etat.lu':          'https://login.b2g.etat.lu/login/TAMLoginServlet?TAM_OP=login&AUTHNLEVEL=3&HOSTNAME=pmp.b2g.etat.lu&METHOD=GET&PROTOCOL=https&REFERER=https%3A%2F%2Fpmp.b2g.etat.lu%2Fentreprise&URL=%2Fentreprise%2Flogin&redirectUrl=https%3A%2F%2Fpmp.b2g.etat.lu%2Fentreprise%2Flogin&authMode=UP',
 };
 // ---------------------------------------------------------------------
 // normalizeSourceUrl
@@ -1506,7 +1529,15 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
           for (const el of document.querySelectorAll('input[type="password"]:not([disabled]):not([aria-hidden="true"])')) {
             if (el && el.offsetParent !== null && el.offsetWidth > 0 && el.offsetHeight > 0) return true;
           }
-          const RX_LOGGED = /\b(?:log\s*out|log\s*off|logout|logga\s*ut|sign\s*out|d[eé]connexion|abmelden|cerrar\s*sesi[oó]n|kirjaudu\s*ulos|wyloguj|my\s*pages|my\s*account|min(?:a)?\s*(?:profil|sidor|side)|mein\s*konto|mon\s*compte|mitt\s*konto)\b/i;
+          // 2026-06-01 fix (Task #134): added LT markers — "atsijungti"
+          // (log out) and "Pirkimų valdymas" (procurement management nav
+          // visible to authenticated CVPP users). Run 67 showed 20/21
+          // viesiejipirkimai.lt login attempts failing AFTER 1st success
+          // because session cookie was set but RX_LOGGED couldn't see LT
+          // authenticated body → handler still tried to re-login, mismatching
+          // post-auth nav buttons. Also added "atsijungti" / "Mano paskyra"
+          // / "Mano profilis" Lithuanian variants.
+          const RX_LOGGED = /\b(?:log\s*out|log\s*off|logout|logga\s*ut|sign\s*out|d[eé]connexion|abmelden|cerrar\s*sesi[oó]n|kirjaudu\s*ulos|wyloguj|atsijungti|atsijungimas|my\s*pages|my\s*account|min(?:a)?\s*(?:profil|sidor|side)|mein\s*konto|mon\s*compte|mitt\s*konto|mano\s*(?:paskyra|profilis|pirkim|puslapis)|pirkim[uų]\s*valdymas)\b/i;
           return RX_LOGGED.test(((document.body && document.body.innerText) || '').slice(0, 4000));
         } catch (_) { return false; }
       }, { timeout: 6000, polling: 250 }).catch(() => null);
@@ -1527,7 +1558,12 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         // Same vocabulary as outer LOGGED_IN_MARKER, kept in-sync with
         // additions like "log\s*off" and "my\s*pages" that the e-avrop
         // template uses verbatim.
-        const RX_LOGGED = /\b(?:log\s*out|log\s*off|logout|logga\s*ut|logg\s*ut|cerrar\s*sesi[oó]n|d[eé]connexion|abmelden|uitloggen|kirjaudu\s*ulos|wyloguj|sign\s*out|min(?:a)?\s*(?:profil|sidor|side)|mein\s*konto|mon\s*compte|my\s*account|my\s*pages|mitt\s*konto|moja\s*strona)\b/i;
+        // 2026-06-01 (Task #134): added LT variants — "atsijungti" (log out),
+        // "Mano paskyra/profilis/pirkimai/puslapis", "Pirkimų valdymas"
+        // (CVPP authenticated user nav). Without these, viesiejipirkimai.lt
+        // post-first-login navigations failed to detect already-authenticated
+        // state and re-triggered login, hitting "no password field" errors.
+        const RX_LOGGED = /\b(?:log\s*out|log\s*off|logout|logga\s*ut|logg\s*ut|cerrar\s*sesi[oó]n|d[eé]connexion|abmelden|uitloggen|kirjaudu\s*ulos|wyloguj|atsijungti|atsijungimas|sign\s*out|min(?:a)?\s*(?:profil|sidor|side)|mein\s*konto|mon\s*compte|my\s*account|my\s*pages|mitt\s*konto|moja\s*strona|mano\s*(?:paskyra|profilis|pirkim|puslapis)|pirkim[uų]\s*valdymas)\b/i;
         const text = (document.body && document.body.innerText || '').slice(0, 4000);
         const hasMarker = RX_LOGGED.test(text);
         // visible password input present? (mirrors findVisible logic)
@@ -5634,49 +5670,74 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
         'Preliminary market inquiries',
         'Anuncis anteriors', 'Anuncios anteriores', 'Previous announcements',
       ];
-      const triedTabs = new Set();
-      for (const label of SUB_TABS) {
-        const key = label.toLowerCase();
-        if (triedTabs.has(key)) continue;
-        triedTabs.add(key);
-        const clicked = await page.evaluate((lbl) => {
-          const re = new RegExp(`^\\s*${lbl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s*\\(\\d+\\))?\\s*$`, 'i');
-          const candidates = Array.from(document.querySelectorAll(
-            'a, button, [role="tab"], [role="button"], li, h2, h3, .nav-link, .tab'
-          ));
-          for (const el of candidates) {
-            if (el.offsetParent === null) continue;
-            const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-            if (text && re.test(text)) {
-              try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
-              try { el.click(); return true; } catch (_) {}
-            }
-          }
-          return false;
-        }, label).catch(() => false);
-        if (clicked) {
-          await new Promise((r) => setTimeout(r, 900));
-        }
-      }
-      await new Promise((r) => setTimeout(r, 1500));
+      // INCREMENTAL HARVEST — Run 65 lesson (Salut Sant Joan de Reus
+       // buyer 81774653): some buyers expose only an "Acords marc" main
+       // tab; clicking it puts the page into a state where the previously
+       // visible Tenders sub-tabs disappear from DOM. The end-of-loop
+       // single harvest then sees 0 pubs.
+       //
+       // Fix: harvest pubs into a Set AFTER the initial page load AND
+       // after EVERY successful tab click. We accumulate by href so
+       // duplicates across tabs collapse. This is also more efficient —
+       // if pubs are already visible without any click, we capture them
+       // immediately rather than relying on tab clicks succeeding.
+       const collectedPubs = new Map(); // href → { href, label, rowText }
+       const harvestNow = async () => {
+         const found = await page.evaluate(() => {
+           const anchors = Array.from(document.querySelectorAll('a[href*="/ca/detall-publicacio/"]'));
+           return anchors.map((a) => {
+             const href = a.getAttribute('href') || '';
+             const label = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
+             const row = a.closest('li, .list-group-item, tr') || a.parentElement;
+             const rowText = (row?.innerText || row?.textContent || '').replace(/\s+/g, ' ').trim();
+             let abs = href;
+             try { abs = new URL(href, location.href).toString(); } catch (_) {}
+             return { href: abs, label: label.slice(0, 200), rowText: rowText.slice(0, 400) };
+           });
+         }).catch(() => []);
+         for (const p of found) {
+           if (!collectedPubs.has(p.href)) collectedPubs.set(p.href, p);
+         }
+         return found.length;
+       };
 
-      // Harvest publication anchors. The expected pattern is:
-      //   a[href*="/ca/detall-publicacio/"] inside <li class="list-group-item">
-      const pubs = await page.evaluate(() => {
-        const anchors = Array.from(document.querySelectorAll('a[href*="/ca/detall-publicacio/"]'));
-        return anchors.map((a) => {
-          const href = a.getAttribute('href') || '';
-          const label = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
-          // Capture the surrounding row text for substring matching against
-          // the expediente / reference number that may live in sibling divs.
-          const row = a.closest('li, .list-group-item, tr') || a.parentElement;
-          const rowText = (row?.innerText || row?.textContent || '').replace(/\s+/g, ' ').trim();
-          let abs = href;
-          try { abs = new URL(href, location.href).toString(); } catch (_) {}
-          return { href: abs, label: label.slice(0, 200), rowText: rowText.slice(0, 400) };
-        });
-      }).catch(() => []);
-      console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: harvested ${pubs.length} publication link(s) in buyer ${buyerId}`);
+       // Initial harvest BEFORE any tab clicking — many buyer profiles
+       // surface pubs immediately (default tab is "Tenders").
+       await harvestNow();
+
+       const triedTabs = new Set();
+       for (const label of SUB_TABS) {
+         const key = label.toLowerCase();
+         if (triedTabs.has(key)) continue;
+         triedTabs.add(key);
+         const clicked = await page.evaluate((lbl) => {
+           const re = new RegExp(`^\\s*${lbl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s*\\(\\d+\\))?\\s*$`, 'i');
+           const candidates = Array.from(document.querySelectorAll(
+             'a, button, [role="tab"], [role="button"], li, h2, h3, .nav-link, .tab'
+           ));
+           for (const el of candidates) {
+             if (el.offsetParent === null) continue;
+             const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+             if (text && re.test(text)) {
+               try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
+               try { el.click(); return true; } catch (_) {}
+             }
+           }
+           return false;
+         }, label).catch(() => false);
+         if (clicked) {
+           await new Promise((r) => setTimeout(r, 900));
+           // Harvest immediately after each successful click so we don't
+           // lose pubs if a later click mutates page state.
+           await harvestNow();
+         }
+       }
+       await new Promise((r) => setTimeout(r, 1000));
+       // Final post-settle harvest in case any tab finished loading late.
+       await harvestNow();
+
+       const pubs = Array.from(collectedPubs.values());
+       console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: harvested ${pubs.length} publication link(s) in buyer ${buyerId}`);
 
       if (!pubs.length) {
         // 0-pubs diagnostic — dump all visible tab labels + nav anchors so we
