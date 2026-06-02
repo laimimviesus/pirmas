@@ -925,7 +925,18 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND description gives enough basis.\n' +
     '- duration: contract length in months or years. Empty string if not stated.\n' +
     '- requirementsForSupplier: MANDATORY technical/legal requirements the supplier (company) MUST meet to participate. Examples: "ISO 27001 certified", "Security clearance Level 2", "GDPR DPA in place", "Hosted in EU only", "Native LT-speaking staff". This is NOT a summary of the work to be done — that goes in scopeOfAgreement. DO NOT invent or generalize. If documents do not explicitly list mandatory supplier requirements, write "(no explicit mandatory supplier requirements stated in tender documents)" rather than inferring from scope.\n' +
-    '- qualificationRequirements: FORMAL SUPPLIER COMPANY ELIGIBILITY. This is the supplier-side ENTRY criteria — the bar a bidder must clear to be ALLOWED to submit. It is NOT a description of work, NOT a list of capabilities to deliver, NOT the system features being built. Look for explicit sections titled "Qualification requirements", "Kvalifikasjonskrav", "Kvalifikacijos reikalavimai", "Tiekėjo kvalifikaciniai reikalavimai", "Kvalifikationskrav", "Vaatimukset tarjoajalle", "Wymagania kwalifikacyjne", "Eignungskriterien", "Critères de sélection", "Requisitos de aptitud", "Requisiti di partecipazione" — and the surrounding tables/lists. The four canonical families: (a) LEGAL — company registration ("Įmonės registracijos pažymėjimas", Firmaattest, business registry), (b) ECONOMIC — turnover thresholds ("Apyvarta ne mažiau X EUR per Y metų"), credit rating, audited annual accounts, (c) TECHNICAL — reference projects ("ne mažiau X panašių projektų per Y metų") AND named specialist roles with years of experience ("Projekto vadovas: 2 metai patirties IS projektuose", "Architektas: 5 metai", "Saugos specialistas: ISO 27001 sertifikuotas"), (d) QUALITY — ISO certifications (9001, 14001, 27001). \n' +
+    '- qualificationRequirements: FORMAL SUPPLIER COMPANY ELIGIBILITY. This is the supplier-side ENTRY criteria — the bar a bidder must clear to be ALLOWED to submit. It is NOT a description of work, NOT a list of capabilities to deliver, NOT the system features being built.\n' +
+    '\n' +
+    '   2026-06-02 GUIDANCE — EXTRACT FROM INLINE TEXT, NOT JUST SECTION HEADERS:\n' +
+    '   LT CVPP "Pirkimo dokumentai" / "Specialiosios sąlygos" rarely have a dedicated section header — qualification requirements appear INLINE in numbered lists, tables, or bullet items. EXTRACT them when you see specific numerical/named patterns even WITHOUT a section header. Look for these formulations:\n' +
+    '   • LT phrases: "Tiekėjas turi turėti", "Tiekėjui keliami reikalavimai", "Tiekėjas privalo turėti", "Tiekėjo kvalifikacija turi būti", "Reikalavimai tiekėjų kvalifikacijai", "Tiekėjų kvalifikacijos reikalavimai", "Techninis ir profesinis pajėgumas", "Ekonominis ir finansinis pajėgumas", "Teisė verstis veikla", "Specialistas turi/privalo", "Informacinių sistemų programuotojas... privalo", "Projekto vadovas... privalo", "ne mažiau kaip X (...) specialistas", "per pastaruosius X (...) metus", "vykdė... paslaugas ne mažiau kaip Y sutartyje", "sėkmingai įvykdytoje (baigtoje) sutartyje".\n' +
+    '   • EN: "Supplier must", "Tenderer shall have", "Minimum annual turnover", "Key personnel", "Project manager: minimum X years experience", "At least X reference projects within Y years".\n' +
+    '   • ES: "Solvencia técnica", "Capacidad económica y financiera", "El licitador deberá", "Habilitación profesional", "Volumen anual de negocios ≥ X EUR".\n' +
+    '   • FR: "Capacité économique et financière", "Capacité technique et professionnelle", "Le candidat doit justifier", "Chiffre d\'affaires annuel ≥ X EUR", "Références exigées".\n' +
+    '   • DE: "Eignungskriterien", "Bieter muss", "Mindestjahresumsatz", "Referenzen", "Schlüsselpersonal".\n' +
+    '   Also look for explicit sections titled "Qualification requirements", "Kvalifikasjonskrav", "Kvalifikacijos reikalavimai", "Tiekėjo kvalifikaciniai reikalavimai", "Kvalifikationskrav", "Vaatimukset tarjoajalle", "Wymagania kwalifikacyjne", "Requisitos de aptitud", "Requisiti di partecipazione".\n' +
+    '\n' +
+    '   The four canonical families: (a) LEGAL — company registration ("Įmonės registracijos pažymėjimas", Firmaattest, business registry), (b) ECONOMIC — turnover thresholds ("Apyvarta ne mažiau X EUR per Y metų"), credit rating, audited annual accounts, (c) TECHNICAL — reference projects ("ne mažiau X panašių projektų per Y metų") AND named specialist roles with years of experience ("Projekto vadovas: 2 metai patirties IS projektuose", "Architektas: 5 metai", "Saugos specialistas: ISO 27001 sertifikuotas"), (d) QUALITY — ISO certifications (9001, 14001, 27001).\n' +
     '\n' +
     '   ❌ ANTI-PATTERNS — do NOT put these in qualifications field (they belong in scopeOfAgreement):\n' +
     '     ✗ "Software development and system integration capabilities" ← this is SCOPE, not qualification\n' +
@@ -937,11 +948,14 @@ async function extractFieldsWithAI(text, meta = {}) {
     '   ✅ ACCEPTABLE patterns — these are real supplier qualifications:\n' +
     '     ✓ "Įmonės metinė apyvarta ne mažiau 500 000 EUR per pastaruosius 3 metus"\n' +
     '     ✓ "Projekto vadovas: minimum 2 metai patirties analogiškuose IS projektuose"\n' +
+    '     ✓ "Informacinių sistemų programuotojas Nr. 1 (ne mažiau kaip 1 specialistas) privalo: per pastaruosius 3 metus vykdė mobiliosios aplikacijos vystymo „front-end" paslaugas ne mažiau kaip 1 sėkmingai įvykdytoje sutartyje"\n' +
     '     ✓ "Ne mažiau 2 reference projektai per 3 metus tame pačiame domene"\n' +
     '     ✓ "ISO 27001 ir ISO 9001 sertifikatai"\n' +
     '     ✓ "Ekonominis pajėgumas 30% sutarties vertės"\n' +
     '\n' +
-    '   CRITICAL RULE: If documents do NOT explicitly list supplier qualification criteria (years, numbers, certifications, named roles), DO NOT generate text from scope. Instead write EXACTLY: "(no explicit supplier qualification requirements stated in tender documents)". Leaving this field empty is better than filling with scope-like content. PER-SPECIALIST DETAIL: when documents DO list named specialist roles (Projekto vadovas, Architektas, Programuotojas, Testuotojas, Saugos specialistas), include EACH role with its minimum-experience requirement verbatim from source.\n' +
+    '   PER-SPECIALIST DETAIL: when documents list named specialist roles (Projekto vadovas, Architektas, Informacinių sistemų programuotojas Nr. 1/Nr. 2, Testuotojas, Analytikas, Saugos specialistas), include EACH role separately with its minimum-experience requirement verbatim from source. Concatenate with semicolons. Source language preserved if outputLanguage==lt.\n' +
+    '\n' +
+    '   FALLBACK RULE: Only write "(no explicit supplier qualification requirements stated in tender documents)" if you have CAREFULLY scanned the DOCUMENTS section AND found NO supplier-eligibility pattern matching ANY language variant above (turnover number, year count, specialist role with experience years, ISO certification, reference project count). Do NOT use this placeholder when the documents contain clear quantitative supplier criteria — extract those even if they appear in numbered lists without a section header. Leaving this field empty is better than filling with scope-like content, BUT extracting verbatim numbered/named supplier criteria is ALWAYS better than the placeholder.\n' +
     '- offerWeighingCriteria: award criteria with EXACT WEIGHTS. ALWAYS list every criterion with its percentage/weight verbatim from the tender (e.g., "Price 40%, Quality 60% (subdivided: solution specification 30%, establishment plan 30%)"). For Lithuanian tenders look for "Kainos lyginamasis svoris X%", "Ekonominio naudingumo X%", "Specialistų kvalifikacija ir patirtis X%". If quality sub-criteria are scored individually (Y1, Y2, Y3 etc.), list each with what is measured and the point range (e.g., "Y1 Project manager additional experience: 1 pt per 1 IS project, 2 pts for 2+ projects"). DO NOT lose subdivision detail — these scoring rules drive the award.\n' +
     '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English. SPECIAL CASE: if lotStructure=="partial" AND there are IT/software-development lots, the scope should describe ONLY the IT lots (not the umbrella framework). If lotStructure=="all-required", describe the whole umbrella.\n' +
     '- lotStructure: one of "single" | "partial" | "all-required". Mark "single" if the tender procures one consolidated scope. Mark "partial" for multi-lot tenders where bidders MAY submit for individual lots/categories independently (look for phrases like "Tilbud på deler av oppdraget er tillatt", "Adgang til å gi tilbud på deler", "Det er adgang til å gi tilbud på enkeltkategorier", "Lots: division into lots = yes", "partial bids allowed", "tilbud på enkelte delkontrakter", "anbud på delar"). Mark "all-required" for multi-lot tenders where bidders MUST cover EVERY lot to win (look for phrases like "Det er ikke adgang til å gi tilbud på deler av oppdraget", "no partial bids", "tilbud må omfatte hele leveransen", "bidders must submit for all lots"). When unclear in a multi-lot tender, default to "all-required".\n' +
@@ -7746,10 +7760,11 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
     }
   } catch (_) { return []; }
 
-  let pdfParseLib = null, mammothLib = null, admZipLib = null;
+  let pdfParseLib = null, mammothLib = null, admZipLib = null, XLSXLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
   try { mammothLib  = require('mammoth');   } catch (_) {}
   try { admZipLib   = require('adm-zip');   } catch (_) {}
+  try { XLSXLib     = require('xlsx');      } catch (_) {}
 
   let page = null;
   try {
@@ -8359,8 +8374,30 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
       const isDocx = ctL.includes('officedocument.wordprocessingml')
         || /\.docx?$/i.test(filenameHint)
         || (buf[0] === 0x50 && buf[1] === 0x4b && /\.docx(?:[?#]|$)/i.test(doc.url));
-      const isZip = !isDocx && buf[0] === 0x50 && buf[1] === 0x4b
+      // 2026-06-01 (Task #136) — XLSX/XLSB/XLS detection. Run 67 UiT Norges
+      // tenderyje 4 Vedlegg (.xlsb) failai liko neapdoroti, nes nei isDocx
+      // (filename ne .docx), nei isZip (no .zip in URL/filename) nepagavo.
+      // XLSB/XLSX/XLSM yra ZIP container — magic bytes 0x50 0x4B. SheetJS
+      // (XLSXLib) palaiko XLSB su `type: "buffer"` auto-detect (.xlsb
+      // tikrai dekoduojamas, jei buffer'is yra tikras XLSB binary, ne
+      // HTML response page).
+      const isXlsx = !isDocx && buf[0] === 0x50 && buf[1] === 0x4b
+        && (ctL.includes('spreadsheetml')
+            || ctL.includes('ms-excel')
+            || /\.(xlsx?|xlsb|xlsm)$/i.test(filenameHint)
+            || /\.(xlsx?|xlsb|xlsm)(?:[?#]|$)/i.test(doc.url));
+      const isZip = !isDocx && !isXlsx && buf[0] === 0x50 && buf[1] === 0x4b
         && (ctL.includes('zip') || /\.zip(?:[?#]|$)/i.test(doc.url) || /\.zip$/i.test(filenameHint));
+      // Detect HTML response disguised as a download (tendsign sometimes
+      // returns a login redirect page with ct=text/html — buffer starts
+      // with "<!DOCTYPE" or "<html". This is the root cause of UiT XLSB
+      // "extracted text too short" failures: serveris grąžino HTML, ne
+      // XLSB binary, todėl magic bytes nepasitaikė ir parsing'as praleido.
+      const isHtmlBlob = (ctL.includes('text/html') || ctL.includes('html'))
+        && buf.length >= 9
+        && (buf.slice(0, 9).toString('ascii').toLowerCase().startsWith('<!doctype')
+            || buf.slice(0, 5).toString('ascii').toLowerCase().startsWith('<html')
+            || buf.slice(0, 5).toString('ascii').toLowerCase().startsWith('<?xml'));
       try {
         let text = '';
         if (isPdf && pdfParseLib) {
@@ -8369,6 +8406,21 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
         } else if (isDocx && mammothLib) {
           const out = await mammothLib.extractRawText({ buffer: buf });
           text = ((out && out.value) || '').trim();
+        } else if (isXlsx && XLSXLib) {
+          // XLSX/XLSB/XLSM/XLS via SheetJS — dump each sheet as CSV.
+          // Cap per-sheet at ~10K chars to avoid running away on big
+          // Excel personnel/CV templates.
+          try {
+            const wb = XLSXLib.read(buf, { type: 'buffer' });
+            const parts = [];
+            for (const sn of wb.SheetNames) {
+              const csv = XLSXLib.utils.sheet_to_csv(wb.Sheets[sn]) || '';
+              if (csv.trim()) parts.push(`### ${sn}\n${csv.slice(0, 10000)}`);
+            }
+            text = parts.join('\n\n').trim();
+          } catch (e) {
+            console.log(`    ⚠️  tendsign: XLSX/XLSB parse error for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+          }
         } else if (isZip && admZipLib) {
           // ZIP fallback — Bilagor sometimes ship as a single archive.
           // Parse first 4 PDF/DOCX entries, concatenate.
@@ -8396,9 +8448,19 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
           texts.push(`--- (tendsign) ${labelName} ---\n${clipped}`);
           console.log(`    🇸🇪 tendsign: parsed "${labelName}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
         } else {
+          // 2026-06-01 (Task #136) — augmented diag: show isXlsx + first
+          // 4 bytes as hex + isHtmlBlob flag, so we can distinguish "binary
+          // download fail" (need URL rewrite or login) from "ZIP container
+          // we don't yet handle" (need new parsing branch).
+          const magic = Array.from(buf.slice(0, 4))
+            .map((b) => b.toString(16).padStart(2, '0')).join(' ');
+          const htmlSnip = isHtmlBlob
+            ? ` htmlSnip="${buf.slice(0, 120).toString('utf8').replace(/\s+/g, ' ').slice(0, 80)}"`
+            : '';
           console.log(
             `    ⚠️  tendsign: "${labelName}" extracted text too short ` +
-            `(${text.length}ch, isPdf=${isPdf}, isDocx=${isDocx}, isZip=${isZip}, ct=${ctL.slice(0, 40)})`
+            `(${text.length}ch, isPdf=${isPdf}, isDocx=${isDocx}, isXlsx=${isXlsx}, ` +
+            `isZip=${isZip}, isHtml=${isHtmlBlob}, magic=${magic}, ct=${ctL.slice(0, 40)})${htmlSnip}`
           );
         }
       } catch (e) {
