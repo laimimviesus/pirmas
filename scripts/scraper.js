@@ -919,10 +919,11 @@ async function extractFieldsWithAI(text, meta = {}) {
     'You extract structured procurement tender fields from free-form notice text plus attached document text. ' +
     'The user message has sections labeled TITLE / DESCRIPTION / MERCELL_PAGE / DOCUMENTS. Scan ALL sections thoroughly. ' +
     'Return ONLY a JSON object (no prose, no markdown fences) with these keys: ' +
-    'maxBudget, estimatedBudgetEur, duration, requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement, lotStructure, itLotsScope, rejectReason, rejectCategory.\n' +
+    'maxBudget, estimatedBudgetEur, budgetSource, duration, requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement, lotStructure, itLotsScope, rejectReason, rejectCategory.\n' +
     'Rules:\n' +
     '- maxBudget: total ceiling / max contract value AS STATED in the tender. Empty string if not explicitly stated.\n' +
     '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND description gives enough basis.\n' +
+    '- budgetSource: WHERE the budget value was found. The DOCUMENTS section of the user message has headers like "--- (handler-name) filename.ext ---" before each parsed file. Identify which one carries the budget number you used. Values: (a) "Document: <filename>" — when budget number appears inside any parsed document (use the exact filename from the nearest "--- (...) filename ---" header BEFORE the matched text); (b) "Source page" — when budget number is in the MERCELL_PAGE section but not in any document; (c) "Mercell tender notice" — when budget number is only in the TITLE/DESCRIPTION sections (Mercell API JSON); (d) "AI estimate" — when maxBudget is empty and you populated estimatedBudgetEur from description context only. Empty string if neither maxBudget nor estimatedBudgetEur was set.\n' +
     '- duration: contract length in months or years. Empty string if not stated.\n' +
     '- requirementsForSupplier: MANDATORY technical/legal requirements the supplier (company) MUST meet to participate. Examples: "ISO 27001 certified", "Security clearance Level 2", "GDPR DPA in place", "Hosted in EU only", "Native LT-speaking staff". This is NOT a summary of the work to be done — that goes in scopeOfAgreement. DO NOT invent or generalize. If documents do not explicitly list mandatory supplier requirements, write "(no explicit mandatory supplier requirements stated in tender documents)" rather than inferring from scope.\n' +
     '- qualificationRequirements: FORMAL SUPPLIER COMPANY ELIGIBILITY. This is the supplier-side ENTRY criteria — the bar a bidder must clear to be ALLOWED to submit. It is NOT a description of work, NOT a list of capabilities to deliver, NOT the system features being built.\n' +
@@ -962,7 +963,45 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- itLotsScope: ONLY when lotStructure=="partial". A bullet-style list of lots that are software development / web/mobile app dev / bespoke IT system creation. Format: "Lot 2B – Architecture, development, data and integration: <one-line description>". Include ONLY lots we (custom software development firm) could realistically bid for. Empty string if lotStructure!="partial" OR no IT-relevant lots.\n' +
     '- rejectReason: short English string (≤120 chars) explaining WHY this tender is a poor fit, OR empty string if a good fit. We are a custom-software development firm that BUILDS systems from scratch. Reject (set rejectReason) when ANY of these apply:\n' +
     '   • SaaS Provision/Creation: Tender procures a SaaS subscription, or asks to build a SaaS platform for them to resell. Set rejectReason="saas_provision_or_creation".\n' +
-    '   • Off-The-Shelf (COTS) Implementation: Tender is for deploying, configuring, maintaining or licensing an existing finished product/platform (e.g., Salesforce, SAP, Dynamics, ServiceNow, Oracle, standard CMS). Set rejectReason="cots_implementation_or_licenses".\n' +
+    '   • Off-The-Shelf (COTS) — Existing Market Solution: The CORE TEST is semantic, NOT brand-list:\n' +
+    '     ❓ KEY QUESTION: "Is the buyer procuring an EXISTING software product / system / service / environment from a market vendor (paying to receive or operate a finished thing), OR is the buyer commissioning a CUSTOM-BUILT solution (paying engineers to design and construct something new)?"\n' +
+    '     If the answer is "existing market solution" → set rejectReason="cots_implementation_or_licenses". This applies whether the product is named (Atlassian, SAP, Microsoft Dynamics, SharePoint, Power BI, SSRS, etc.) or unnamed but clearly a market product (e.g. "ERP system", "GIS platform", "Document Management System", "case management system", "library system", "BI environment", "ticketing system" as catalog purchases).\n' +
+    '\n' +
+    '     ✅ POSITIVE SIGNALS — custom development (DO NOT reject as COTS):\n' +
+    '       ✓ "Develop a new <thing>", "Build from scratch", "Create a bespoke <X>"\n' +
+    '       ✓ "Architecture, design AND development", "Software engineering from requirements"\n' +
+    '       ✓ "Custom-built solution", "Tailored <X>", "Sukurti naują <X>", "Sukūrimas"\n' +
+    '       ✓ The IP / source code is OWNED by the buyer after delivery\n' +
+    '       ✓ Required roles are GENERIC software engineering: Backend Developer, Frontend Developer, Software Architect, DevOps Engineer, QA / Test Engineer, UI/UX Designer — with technology stack expressed as open standards (Java, .NET, Python, React, Angular, PostgreSQL, Kubernetes, REST/SOAP, microservices, OAuth2)\n' +
+    '       ✓ Reference projects required are "similar custom development engagements", "previous bespoke software delivery"\n' +
+    '\n' +
+    '     ❌ NEGATIVE SIGNALS — existing market solution (REJECT as COTS):\n' +
+    '       ✗ Scope verbs are SUPPLY-CENTRIC: "procurement of <X> licenses/subscriptions", "supply", "acquisition", "renewal of licenses", "purchase of <X> software"\n' +
+    '       ✗ Scope verbs are EXISTING-SOLUTION operation: "implementation and configuration of <X>", "deployment of <X>", "installation of <X>", "migration to <X>", "upgrade of <X>", "modernisation of <X> environment", "maintenance of <X> system", "support and operation of <X>"\n' +
+    '       ✗ Scope verbs are MODIFICATION-OF-EXISTING: "customisation of <X>", "extending <X> functionality", "configuration of <X> workflows", "developing additional modules within <X>", "report-authoring in <X>", "data-modeling in <X>", "developing on the existing <X> platform"\n' +
+    '       ✗ "Expert consulting for <X> environment / platform / system" — the work is admin / config / authoring inside a vendor product\n' +
+    '       ✗ "Maintain and develop the existing <X>" — extending vendor product, not building new\n' +
+    '       ✗ "Integration with existing <X> system" as the PRIMARY scope (when integration IS the project, not just a sub-task of new build)\n' +
+    '       ✗ Title or description names a specific product or product category as the THING being bought ("HTA software", "ERP solution", "case management system" as catalog purchases)\n' +
+    '       ✗ Requirements list VENDOR PARTNER STATUS as mandatory: "Platinum / Gold / Premier / Crest / Summit Partner with <Vendor>", "Certified <Vendor> Partner", "Authorized Reseller of <Vendor>"\n' +
+    '       ✗ Requirements list VENDOR-SPECIFIC CERTIFICATIONS: certification codes like "ACP-XXX", "MS-XXX / AZ-XXX / MB-XXX / PL-XXX / DP-XXX", "SAP C_XXX", "AWS Certified ...", "Cisco CCNA/CCNP", "Salesforce Certified Administrator/Developer", "Oracle OCP", "RHCE", or any "<Brand> Certified" credential as REQUIRED for bidders\n' +
+    '       ✗ Required roles are PRODUCT-ADMIN, not engineering: "<Brand> Administrator", "<Brand> Consultant", "<Brand> Specialist", "BI Developer (Power BI / Tableau)", "Solution Architect (SAP / Salesforce)", "Atlassian Admin", "SharePoint Administrator", "Salesforce Configurator"\n' +
+    '       ✗ Multi-lot tender where EVERY lot is scoped to the same named product family (Lot 1 = X licenses, Lot 2 = X expert services for X) — license-supply vs partner-services split within the SAME product\n' +
+    '\n' +
+    '     🧠 DECISION ALGORITHM (apply in order):\n' +
+    '       1. Does the description name a specific software product, brand, system, environment, or platform as the THING BEING BOUGHT or as the WORKING CONTEXT? If yes, go to step 2; otherwise → likely not COTS.\n' +
+    '       2. Are the scope verbs supply-centric / operation-centric / modification-of-existing (from NEGATIVE SIGNALS)? If yes → COTS. If verbs are construction-centric (build / develop new / design from scratch) → not COTS.\n' +
+    '       3. Do qualification requirements demand Vendor Partner Status or vendor-specific certifications (not generic ISO certifications)? If yes → COTS (regardless of scope wording).\n' +
+    '       4. Multi-lot edge case: if ALL lots reference the same named product family, → COTS, not framework_no_it_lots.\n' +
+    '       5. When in doubt and the tender clearly involves an existing market product the buyer expects to receive or operate, prefer COTS over accepting.\n' +
+    '\n' +
+    '     CONCRETE EXAMPLES (apply same algorithm to similar wording):\n' +
+    '       Example 1 — "Procurement of Atlassian software Cloud licenses and expert services" with requirement "Atlassian Platinum or Gold Solution Partner" + "ACP certifications": NEGATIVE supply verb + vendor partner status → COTS.\n' +
+    '       Example 2 — "MSBI expert consulting services to maintain and develop their on-premise BI environment, including design and implementation of new reporting solutions, integration with source systems, data modeling": MSBI is Microsoft BI product, "maintain and develop existing environment" + "reporting solutions in MSBI" + "data modeling" = work inside the vendor product → COTS.\n' +
+    '       Example 3 — "Care Needs Assessment (HTA) Software for Wellbeing Area ... must facilitate care needs assessment ... integrate with the Lifecare patient information system": named product category + integration with existing system → COTS.\n' +
+    '       Example 4 — "Custom development of mission-critical infrastructure integration management platform including system architecture, software development, DevOps, database design, security, UI, testing, documentation": construction verbs + generic engineering roles + bespoke architecture → NOT COTS (accept).\n' +
+    '       Example 5 — "Maintenance and development services for EMDE information system, including consultation, bug fixes, application improvements" with team roles "Backend Developer", "Frontend Developer", "Architect", "QA": engineering roles + maintenance/development of buyer-owned custom system → NOT COTS (accept, this is custom-system evolution).\n' +
+    '     Set rejectReason="cots_implementation_or_licenses" whenever the decision algorithm lands on COTS.\n' +
     '   • Existing Software Purchase (vertical-domain / named product): Tender procures an EXISTING software product/system — either by brand name OR by referring to a specific vertical-domain solution that buyers shop for as a market product, rather than commissioning a build. Hallmarks: (a) the title/description names a SPECIFIC software category as the thing being procured ("HTA software", "EHR system", "LMS platform", "ERP solution", "CRM system", "DMS solution", "case management system" as a market category), (b) scope is "supply + implementation + integration with existing buyer systems (e.g., Lifecare PIS, X-Road, SAP)", (c) text uses language like "the software must support X feature", "the solution shall replace current Y" — implying the buyer expects to RECEIVE a working product, not pay for its development. INCLUDES: healthcare HTA/EHR/PACS software, legal practice management systems, library management systems, school information systems, accounting/HR ERP suites, document management platforms, CRM/CMS/LMS solutions sold as products. Pavyzdys: "Care Needs Assessment (HTA) Software for Wellbeing Area ... must facilitate care needs assessment ... integrate with the Lifecare patient information system" → set rejectReason="existing_software_purchase". DIFFERENCE from "cots_implementation_or_licenses": COTS targets named global enterprise platforms; existing_software_purchase targets vertical/niche domain products including those that may have multiple vendor implementations. DIFFERENCE from "saas_provision_or_creation": SaaS is subscription-style; this is product-purchase style. WHEN IN DOUBT — if the tender is a one-off PROCUREMENT of an already-existing solution category (not a build-from-scratch project), reject as existing_software_purchase.\n' +
     '   • Helpdesk/Support Only: Primary scope is L1/L2 helpdesk, end-user support, client management, or continuous maintenance of systems we did not build. Set rejectReason="helpdesk_support_only".\n' +
     '   • Training/Workshops: Scope is purely delivering educational courses, IT training, or workshops without software development. Set rejectReason="training_workshops_only".\n' +
@@ -15883,9 +15922,9 @@ async function runRetranslateStale(sheets, SHEET_ID, TAB_NAME) {
   }
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    // 2026-05-17: extended to A1:S to read 19-col schema (incl. E=Original
-    // title and S=Scope of agreement EN). Backfill writes to D and S.
-    range: `${TAB_NAME}!A1:S`,
+    // 2026-06-02 (Task #142): extended to A1:T to read 20-col schema after
+    // J="Source of the budget" inserted. Backfill writes to D (titleEN) only.
+    range: `${TAB_NAME}!A1:T`,
   });
   const rows = resp.data.values || [];
   if (rows.length === 0) {
@@ -16562,16 +16601,17 @@ async function runScraper() {
       'BIDDING DEADLINE DATE',           // G
       'COUNTRY',                         // H
       'MAX BUDGET EUR without VAT',      // I
-      'DURATION OF AGREEMENT (months)',  // J
-      'REQUIREMENTS FOR SUPPLIER',       // K
-      'QUALIFICATION REQUIREMENTS',      // L
-      'OFFER WEIGHING CRITERIA',         // M
-      'SCOPE OF AGREEMENT',              // N
-      'TECHNICAL STACK',                 // O
-      'Source URL',                      // P
-      'Reference number',                // Q
-      'KEYWORDS',                        // R
-      'Scope of agreement (EN)',         // S
+      'Source of the budget',            // J ★ NEW (Task #142)
+      'DURATION OF AGREEMENT (months)',  // K
+      'REQUIREMENTS FOR SUPPLIER',       // L
+      'QUALIFICATION REQUIREMENTS',      // M
+      'OFFER WEIGHING CRITERIA',         // N
+      'SCOPE OF AGREEMENT',              // O
+      'TECHNICAL STACK',                 // P
+      'Source URL',                      // Q
+      'Reference number',                // R
+      'KEYWORDS',                        // S
+      // T = Komentarai (user-only, not initialized by scraper)
     ];
 
     let existingIds = new Set();
@@ -16594,8 +16634,11 @@ async function runScraper() {
         spreadsheetId: SHEET_ID,
         // Read full row width — we now need columns C (link) and E
         // (original title) for dedup, plus we may extend further in
-        // future without re-touching this range.
-        range: `${TAB_NAME}!A1:S`,
+        // future without re-touching this range. Range expanded to A1:T
+        // 2026-06-02 (Task #142) — after column J "Source of the budget"
+        // was inserted, schema is now 20 columns (A-S filled by scraper,
+        // T = user-only "Komentarai").
+        range: `${TAB_NAME}!A1:T`,
       });
       const rows = existing.data.values || [];
       const hasHeader = rows[0] && rows[0][0] === SHEET_HEADERS[0];
@@ -16611,9 +16654,11 @@ async function runScraper() {
       }
 
       for (let i = hasHeader ? 1 : 0; i < rows.length; i++) {
-        // Column C (index 2) = primary LINK; column O (index 14) was
-        // historical Source URL position before the schema swap.
-        const link = rows[i][2] || rows[i][14] || '';
+        // Column C (index 2) = primary LINK; column Q (index 16) = current
+        // Source URL position (post Task #142 — was P=15 before column J
+        // "Source of the budget" was inserted). Column O (index 14) is
+        // legacy fallback for very old rows from earlier schema versions.
+        const link = rows[i][2] || rows[i][16] || rows[i][14] || '';
         const id = extractTenderId(link);
         if (id) existingIds.add(id);
         // Column E (index 4) = TENDER NAME (Original) post-Task #55 swap.
@@ -16908,11 +16953,10 @@ async function runScraper() {
         scopeEnOut || scopeOrigOut,
         reqOut, qualOut, critOut, d.technicalStack || ''
       ]);
-      // 2026-05-27 — row returns ONLY 18 cells (A through R).
-      // Column S = "Komentarai" (user comments) — we DO NOT touch it.
-      // Previously we wrote '' to S as a placeholder, but even an empty
-      // write counts as a cell value to Sheets and prevented users from
-      // confidently editing S without fear of clobber on next run.
+      // 2026-06-02 (Task #142) — row now returns 19 cells (A through S).
+      // New column J = "Source of the budget" inserted after I (MAX BUDGET).
+      // Schema shifted: old J(DURATION)→K, K(REQ)→L, L(QUAL)→M, etc.
+      // Column T = "Komentarai" (user comments) — we DO NOT touch it.
       return [
         nowIso,                                                  // A — DATE ADDED
         fmtDate(d.publicationDate || t.publicationDate || ''),   // B — BIDDING ANNOUCEMENT DATE
@@ -16923,16 +16967,17 @@ async function runScraper() {
         fmtDate(d.deadline || t.deadlineRaw || ''),              // G — BIDDING DEADLINE
         d.country || t.country || '',                            // H — COUNTRY
         formatEurBudget(d.maxBudget),                            // I — MAX BUDGET EUR
-        d.duration || '',                                        // J — DURATION
-        reqOut,                                                  // K — REQUIREMENTS FOR SUPPLIER
-        qualOut,                                                 // L — QUALIFICATION REQUIREMENTS
-        critOut,                                                 // M — OFFER WEIGHING CRITERIA
-        scopeOrigOut,                                            // N — SCOPE OF AGREEMENT
-        d.technicalStack || '',                                  // O — TECHNICAL STACK
-        d.sourceUrl || '',                                       // P — Source URL
-        d.referenceNumber || t.tenderId || '',                   // Q — Reference number
-        keywords,                                                // R — Keywords
-        // S (Komentarai) intentionally OMITTED — user-only column
+        d.budgetSource || '',                                    // J — SOURCE OF THE BUDGET ★ NEW
+        d.duration || '',                                        // K — DURATION
+        reqOut,                                                  // L — REQUIREMENTS FOR SUPPLIER
+        qualOut,                                                 // M — QUALIFICATION REQUIREMENTS
+        critOut,                                                 // N — OFFER WEIGHING CRITERIA
+        scopeOrigOut,                                            // O — SCOPE OF AGREEMENT
+        d.technicalStack || '',                                  // P — TECHNICAL STACK
+        d.sourceUrl || '',                                       // Q — Source URL
+        d.referenceNumber || t.tenderId || '',                   // R — Reference number
+        keywords,                                                // S — Keywords
+        // T (Komentarai) intentionally OMITTED — user-only column
       ];
     };
 
@@ -17194,6 +17239,14 @@ async function runScraper() {
               filled.push('maxBudget(EST)');
             }
           }
+          // 2026-06-02 (Task #142) — budget source tracking (J column).
+          // AI returns budgetSource as one of: "Document: <filename>",
+          // "Source page", "Mercell tender notice", "AI estimate", or "".
+          // Carry through to row.J. Only assign if NOT already set (avoid
+          // overwriting cached source from a previous AI call on same row).
+          if (!dd.budgetSource && ai.budgetSource) {
+            dd.budgetSource = String(ai.budgetSource).slice(0, 200);
+          }
           if (!dd.duration && ai.duration) { dd.duration = ai.duration; filled.push('duration'); }
           if (!dd.requirementsForSupplier && ai.requirementsForSupplier) { dd.requirementsForSupplier = ai.requirementsForSupplier; filled.push('requirements'); }
           if (!dd.qualificationRequirements && ai.qualificationRequirements) { dd.qualificationRequirements = ai.qualificationRequirements; filled.push('qualifications'); }
@@ -17349,14 +17402,16 @@ async function runScraper() {
 
       // Build & buffer
       const row = buildRow(toFetch[i]);
-      // 2026-06-02 (Task #138) — dual-sheet routing:
-      // Rows with REAL K (Requirements) OR L (Qualifications) → Sheet1.
+      // 2026-06-02 (Task #138 + #142) — dual-sheet routing:
+      // Rows with REAL L (Requirements) OR M (Qualifications) → Sheet1.
       // Rows where BOTH are placeholders ("(no explicit ... stated in
       // tender documents)") → "For training" sheet for handler review.
-      // Row indices: 10 = K (requirements), 11 = L (qualifications).
-      const kIsPlaceholder = isPlaceholder(row[10]);
-      const lIsPlaceholder = isPlaceholder(row[11]);
-      const isTrainingRow = kIsPlaceholder && lIsPlaceholder;
+      // 2026-06-02 (Task #142): row schema shifted by 1 — Source of Budget
+      // inserted at J (index 9), so REQUIREMENTS moved 10→11, QUALIFICATIONS
+      // moved 11→12.
+      const reqIsPlaceholder = isPlaceholder(row[11]);
+      const qualIsPlaceholder = isPlaceholder(row[12]);
+      const isTrainingRow = reqIsPlaceholder && qualIsPlaceholder;
       if (isTrainingRow) {
         pendingTrainingRows.push(row);
         console.log(`    📚 routing to "For training" sheet — K+L both placeholder for "${(row[3] || row[4] || '').slice(0, 50)}"`);
