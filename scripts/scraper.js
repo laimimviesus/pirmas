@@ -3324,6 +3324,19 @@ const _collectDriveFile = (filename, buf) => {
   _driveFileCollector.push({ filename: String(filename).slice(0, 240), buf });
 };
 
+// 2026-06-02 (Task #148 fix) — Drive context mailbox.
+// fetchTenderDetails() runs at module scope but the Drive config (root
+// folder ID + helper closures) lives inside the (async () => { ... })()
+// IIFE in runScraper. JS lexical scoping makes those inaccessible from
+// fetchTenderDetails — referencing DRIVE_ROOT_FOLDER_ID directly threw
+// ReferenceError which the outer try/catch swallowed and returned
+// { error } so EVERY tender lost its title/pdfText/sourceFilesText.
+// Run 72 symptom: all 9 tenders had pdfText=0ch in AI inputs despite
+// PLACSP appending 41981ch into src.sourceFilesText.
+// Fix: main() writes config to this module-level mailbox after Drive
+// setup; fetchTenderDetails reads it (null when Drive is disabled).
+let _DRIVE_CTX = null;
+
 async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
   let resourceId = null;
   try {
@@ -15506,28 +15519,33 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       const elapsed = Date.now() - t0;
       console.log(`    source done in ${elapsed}ms (host: ${src?.sourceHost || 'n/a'}, err: ${src?.error || 'none'}${src?.skipped ? ', skipped: ' + src.skipped : ''}${src?.placspDocsFound ? `, placsp=${src.placspDocsFound}` : ''})`);
 
-      // 2026-06-02 (Task #143) — drain collected files to Drive. Runs
-      // once per tender right after fetchSourcePageDetails. If Drive is
-      // not configured, this is a no-op. driveFiles map: filename → link.
-      // Saved on details so buildRow() (which has access to d.driveFiles
-      // through d) can synthesize Q/J column links from the AI's returned
-      // qualificationsSourceFile / budgetSource filenames.
+      // 2026-06-02 (Task #143 + #148 scope fix) — drain collected files
+      // to Drive via the module-level _DRIVE_CTX mailbox written by
+      // main() after Drive setup. Helpers (getOrCreateTenderFolder,
+      // uploadToDrive) live inside runScraper's IIFE and are NOT visible
+      // here without the mailbox. driveFiles map: filename → link.
+      // Saved on details so buildRow() can synthesize Q/J column links
+      // from the AI's returned qualificationsSourceFile / budgetSource.
       details.driveFiles = {};
       details.driveFolderLink = '';
-      if (DRIVE_ROOT_FOLDER_ID && src?.collectedFiles?.length) {
-        const refForFolder = srcCtx.referenceNumber || details.tenderId || '';
-        const folderId = await getOrCreateTenderFolder(refForFolder);
-        if (folderId) {
-          details.driveFolderLink = `https://drive.google.com/drive/folders/${folderId}`;
-          let uploaded = 0;
-          for (const { filename, buf } of src.collectedFiles) {
-            const res = await uploadToDrive(folderId, filename, buf);
-            if (res && res.webViewLink) {
-              details.driveFiles[filename] = res.webViewLink;
-              uploaded++;
+      if (_DRIVE_CTX && _DRIVE_CTX.rootFolderId && src?.collectedFiles?.length) {
+        try {
+          const refForFolder = srcCtx.referenceNumber || details.tenderId || '';
+          const folderId = await _DRIVE_CTX.getOrCreateTenderFolder(refForFolder);
+          if (folderId) {
+            details.driveFolderLink = `https://drive.google.com/drive/folders/${folderId}`;
+            let uploaded = 0;
+            for (const { filename, buf } of src.collectedFiles) {
+              const res = await _DRIVE_CTX.uploadToDrive(folderId, filename, buf);
+              if (res && res.webViewLink) {
+                details.driveFiles[filename] = res.webViewLink;
+                uploaded++;
+              }
             }
+            console.log(`    📁 Drive: uploaded ${uploaded}/${src.collectedFiles.length} file(s) to ${refForFolder} folder`);
           }
-          console.log(`    📁 Drive: uploaded ${uploaded}/${src.collectedFiles.length} file(s) to ${refForFolder} folder`);
+        } catch (e) {
+          console.log(`    ⚠️ Drive upload step failed: ${(e.message || '').slice(0, 100)}`);
         }
       }
 
@@ -16766,6 +16784,17 @@ async function runScraper() {
         return null;
       }
     };
+
+    // 2026-06-02 (Task #148 fix) — expose Drive helpers to module-level
+    // fetchTenderDetails via the _DRIVE_CTX mailbox. fetchTenderDetails
+    // is declared at module scope, so the const helpers above (defined
+    // inside this IIFE) are NOT lexically visible there. Without this
+    // bridge, referencing DRIVE_ROOT_FOLDER_ID inside fetchTenderDetails
+    // threw ReferenceError, which the outer try/catch caught and
+    // converted into { error } — losing title/pdfText for every tender.
+    _DRIVE_CTX = DRIVE_ROOT_FOLDER_ID
+      ? { rootFolderId: DRIVE_ROOT_FOLDER_ID, getOrCreateTenderFolder, uploadToDrive }
+      : null;
 
     const SHEET_HEADERS = [
       'DATE OF WHEN ADDED TO THE LIST',  // A
