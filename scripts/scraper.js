@@ -963,6 +963,7 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- rejectReason: short English string (≤120 chars) explaining WHY this tender is a poor fit, OR empty string if a good fit. We are a custom-software development firm that BUILDS systems from scratch. Reject (set rejectReason) when ANY of these apply:\n' +
     '   • SaaS Provision/Creation: Tender procures a SaaS subscription, or asks to build a SaaS platform for them to resell. Set rejectReason="saas_provision_or_creation".\n' +
     '   • Off-The-Shelf (COTS) Implementation: Tender is for deploying, configuring, maintaining or licensing an existing finished product/platform (e.g., Salesforce, SAP, Dynamics, ServiceNow, Oracle, standard CMS). Set rejectReason="cots_implementation_or_licenses".\n' +
+    '   • Existing Software Purchase (vertical-domain / named product): Tender procures an EXISTING software product/system — either by brand name OR by referring to a specific vertical-domain solution that buyers shop for as a market product, rather than commissioning a build. Hallmarks: (a) the title/description names a SPECIFIC software category as the thing being procured ("HTA software", "EHR system", "LMS platform", "ERP solution", "CRM system", "DMS solution", "case management system" as a market category), (b) scope is "supply + implementation + integration with existing buyer systems (e.g., Lifecare PIS, X-Road, SAP)", (c) text uses language like "the software must support X feature", "the solution shall replace current Y" — implying the buyer expects to RECEIVE a working product, not pay for its development. INCLUDES: healthcare HTA/EHR/PACS software, legal practice management systems, library management systems, school information systems, accounting/HR ERP suites, document management platforms, CRM/CMS/LMS solutions sold as products. Pavyzdys: "Care Needs Assessment (HTA) Software for Wellbeing Area ... must facilitate care needs assessment ... integrate with the Lifecare patient information system" → set rejectReason="existing_software_purchase". DIFFERENCE from "cots_implementation_or_licenses": COTS targets named global enterprise platforms; existing_software_purchase targets vertical/niche domain products including those that may have multiple vendor implementations. DIFFERENCE from "saas_provision_or_creation": SaaS is subscription-style; this is product-purchase style. WHEN IN DOUBT — if the tender is a one-off PROCUREMENT of an already-existing solution category (not a build-from-scratch project), reject as existing_software_purchase.\n' +
     '   • Helpdesk/Support Only: Primary scope is L1/L2 helpdesk, end-user support, client management, or continuous maintenance of systems we did not build. Set rejectReason="helpdesk_support_only".\n' +
     '   • Training/Workshops: Scope is purely delivering educational courses, IT training, or workshops without software development. Set rejectReason="training_workshops_only".\n' +
     '   • Non-IT / Construction: Construction, physical engineering, physical security, cleaning. Set rejectReason="non_it_construction".\n' +
@@ -4157,6 +4158,36 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
 
       if (!clicked) {
         console.log(`    ⚠️  viesiejipirkimai: failed to click doc id=${d.docId} "${d.filename}" (kind=${d.kind})`);
+        // 2026-06-02 (Task #141) — diagnostic when click selector misses.
+        // Run 69 tenderis 7918455: harvest detected button-type docs
+        // (viewCD/Pirkimo_dokumentai.zip) but click matcher couldn't find
+        // them. Dump visible buttons + their onclick attrs to find pattern
+        // mismatch (data-* attrs, event listeners, alternate ID format).
+        try {
+          const diag = await page.evaluate((needleId) => {
+            const buttons = Array.from(document.querySelectorAll('button, input[type="button"], a[onclick]'));
+            const sample = [];
+            const matches = [];
+            for (const el of buttons) {
+              if (el.offsetParent === null) continue;
+              const oc = el.getAttribute('onclick') || '';
+              const dataset = JSON.stringify(el.dataset || {});
+              const txt = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+              const tag = el.tagName.toLowerCase();
+              if (oc && oc.includes(needleId)) matches.push(`<${tag}> "${txt}" onclick=${oc.slice(0, 100)}`);
+              if (sample.length < 8 && oc) sample.push(`<${tag}> "${txt}" onclick=${oc.slice(0, 80)} data=${dataset.slice(0, 60)}`);
+            }
+            return { matches, sample, totalButtons: buttons.length };
+          }, String(d.docId)).catch(() => null);
+          if (diag) {
+            console.log(`       click-fail diag: totalButtons=${diag.totalButtons}, matches=${diag.matches.length}`);
+            for (const m of diag.matches.slice(0, 3)) console.log(`         match: ${m}`);
+            if (diag.matches.length === 0) {
+              console.log(`         (no element with onclick containing "${d.docId}"; sample of visible clickables:)`);
+              for (const s of diag.sample.slice(0, 5)) console.log(`         sample: ${s}`);
+            }
+          }
+        } catch (_) {}
         continue;
       }
 
@@ -16905,13 +16936,59 @@ async function runScraper() {
       ];
     };
 
+    // 2026-06-02 (Task #138) — dual-sheet routing.
+    //
+    // Sheet1: rows with REAL qualifications or requirements content.
+    // "For training": rows where BOTH K (REQUIREMENTS) and L
+    // (QUALIFICATIONS) are placeholders like "(no explicit supplier
+    // qualification requirements stated in tender documents)". These
+    // are tenders where the handler/AI pipeline couldn't extract
+    // formal supplier criteria — kept separately so Sheet1 stays
+    // actionable while "For training" surfaces handler-improvement
+    // candidates.
+    const TRAINING_TAB_NAME = 'For training';
+    const PLACEHOLDER_RE = /^\s*\(no explicit (?:mandatory supplier requirements|supplier qualification requirements)? ?(?:stated in tender documents)?\)\s*$/i;
+    const isPlaceholder = (v) => !v || !String(v).trim() || PLACEHOLDER_RE.test(String(v));
+
     // Pending buffer + totals shared su signal handler'iu.
     const pendingRows = [];
+    const pendingTrainingRows = [];
     let totalAppended = 0;
+    let totalAppendedTraining = 0;
     let flushInFlight = false;
 
+    const doAppend = async (tabName, batch) => {
+      return await sheets.spreadsheets.values.append({
+        spreadsheetId: SHEET_ID,
+        range: `${tabName}!A:A`,
+        valueInputOption: 'RAW',
+        insertDataOption: 'INSERT_ROWS',
+        requestBody: { values: batch },
+      });
+    };
+
+    const flushPendingTraining = async (label) => {
+      if (pendingTrainingRows.length === 0) return;
+      const batch = pendingTrainingRows.splice(0, pendingTrainingRows.length);
+      try {
+        const res = await doAppend(TRAINING_TAB_NAME, batch);
+        totalAppendedTraining += batch.length;
+        console.log(
+          `✓ ${label || 'Flush[training]'}: +${batch.length} rows to "${TRAINING_TAB_NAME}" (cumulative ${totalAppendedTraining}) range=${res.data.updates?.updatedRange}`
+        );
+      } catch (e) {
+        pendingTrainingRows.unshift(...batch);
+        console.log(`✗ Training flush failed (${label}): ${e.message}; ${batch.length} rows kept in buffer`);
+        // Non-fatal: continue with main sheet flush.
+      }
+    };
+
     const flushPending = async (label) => {
-      if (pendingRows.length === 0) return;
+      if (pendingRows.length === 0) {
+        // Still flush training rows if any.
+        if (pendingTrainingRows.length > 0) await flushPendingTraining(label + '[training]');
+        return;
+      }
       if (flushInFlight) return; // viena flush operacija vienu metu
       flushInFlight = true;
       const batch = pendingRows.splice(0, pendingRows.length);
@@ -16954,6 +17031,11 @@ async function runScraper() {
       } finally {
         flushInFlight = false;
       }
+      // Also flush training rows on every main flush (independent failure
+      // mode — training-tab append failing should NOT prevent Sheet1 writes).
+      if (pendingTrainingRows.length > 0) {
+        await flushPendingTraining(label + '[training]');
+      }
     };
 
     // SIGTERM/SIGINT — GitHub Actions cancel siunčia SIGTERM ir duoda ~10s
@@ -16962,8 +17044,14 @@ async function runScraper() {
     const onShutdown = async (signal) => {
       if (shuttingDown) return;
       shuttingDown = true;
-      console.log(`\n⚠️ ${signal} received — flushing ${pendingRows.length} pending rows before exit`);
+      console.log(`\n⚠️ ${signal} received — flushing ${pendingRows.length} main + ${pendingTrainingRows.length} training pending rows before exit`);
       try { await flushPending(`${signal}-flush`); } catch (e) { console.log('Shutdown flush error:', e.message); }
+      // flushPending pulls training along, but if main was empty it skips
+      // training. Belt-and-braces flush here.
+      if (pendingTrainingRows.length > 0) {
+        try { await flushPendingTraining(`${signal}-flush[training]`); }
+        catch (e) { console.log('Shutdown training flush error:', e.message); }
+      }
       try { await browser.close(); } catch (_) {}
       process.exit(0);
     };
@@ -17261,15 +17349,28 @@ async function runScraper() {
 
       // Build & buffer
       const row = buildRow(toFetch[i]);
-      pendingRows.push(row);
+      // 2026-06-02 (Task #138) — dual-sheet routing:
+      // Rows with REAL K (Requirements) OR L (Qualifications) → Sheet1.
+      // Rows where BOTH are placeholders ("(no explicit ... stated in
+      // tender documents)") → "For training" sheet for handler review.
+      // Row indices: 10 = K (requirements), 11 = L (qualifications).
+      const kIsPlaceholder = isPlaceholder(row[10]);
+      const lIsPlaceholder = isPlaceholder(row[11]);
+      const isTrainingRow = kIsPlaceholder && lIsPlaceholder;
+      if (isTrainingRow) {
+        pendingTrainingRows.push(row);
+        console.log(`    📚 routing to "For training" sheet — K+L both placeholder for "${(row[3] || row[4] || '').slice(0, 50)}"`);
+      } else {
+        pendingRows.push(row);
+      }
 
       if (!sampleLogged) {
         console.log('Sample row:', JSON.stringify(row).slice(0, 500));
         sampleLogged = true;
       }
 
-      // Flush batch
-      if (pendingRows.length >= FLUSH_BATCH) {
+      // Flush batch — based on EITHER queue reaching threshold.
+      if (pendingRows.length >= FLUSH_BATCH || pendingTrainingRows.length >= FLUSH_BATCH) {
         try {
           await flushPending(`batch@${i + 1}`);
         } catch (e) {
@@ -17281,11 +17382,18 @@ async function runScraper() {
       await new Promise(r => setTimeout(r, 400));
     }
 
-    // Galutinis flush
-    if (pendingRows.length > 0) {
+    // Galutinis flush — abu buferiai.
+    if (pendingRows.length > 0 || pendingTrainingRows.length > 0) {
       try { await flushPending('final'); }
       catch (e) { console.log('Final flush error:', e.message); }
-    } else if (totalAppended === 0) {
+      // flushPending tries Sheet1 first; training flush runs in finally
+      // even if Sheet1 failed. But if Sheet1 had nothing, training won't
+      // be triggered — handle that case here.
+      if (pendingTrainingRows.length > 0) {
+        try { await flushPendingTraining('final[training]'); }
+        catch (e) { console.log('Final training flush error:', e.message); }
+      }
+    } else if (totalAppended === 0 && totalAppendedTraining === 0) {
       console.log('Nothing to append');
     }
 
@@ -17293,6 +17401,7 @@ async function runScraper() {
     console.log(`Total tenders found: ${allTenders.length}`);
     console.log(`New tenders: ${newTenders.length}`);
     console.log(`Rows appended: ${totalAppended}`);
+    console.log(`Rows appended to "For training": ${totalAppendedTraining}`);
     console.log(`Budget-filtered (<500K EUR): ${budgetFilteredCount}`);
     console.log(`Content-filtered (poor fit):  ${contentFilteredCount}`);
     console.log(`AI-deferred (retry next run): ${aiDeferredCount}`);
