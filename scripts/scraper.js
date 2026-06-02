@@ -919,7 +919,7 @@ async function extractFieldsWithAI(text, meta = {}) {
     'You extract structured procurement tender fields from free-form notice text plus attached document text. ' +
     'The user message has sections labeled TITLE / DESCRIPTION / MERCELL_PAGE / DOCUMENTS. Scan ALL sections thoroughly. ' +
     'Return ONLY a JSON object (no prose, no markdown fences) with these keys: ' +
-    'maxBudget, estimatedBudgetEur, budgetSource, duration, requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement, lotStructure, itLotsScope, rejectReason, rejectCategory.\n' +
+    'maxBudget, estimatedBudgetEur, budgetSource, duration, requirementsForSupplier, qualificationRequirements, qualificationsSourceFile, offerWeighingCriteria, scopeOfAgreement, lotStructure, itLotsScope, rejectReason, rejectCategory.\n' +
     'Rules:\n' +
     '- maxBudget: total ceiling / max contract value AS STATED in the tender. Empty string if not explicitly stated.\n' +
     '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND description gives enough basis.\n' +
@@ -957,6 +957,7 @@ async function extractFieldsWithAI(text, meta = {}) {
     '   PER-SPECIALIST DETAIL: when documents list named specialist roles (Projekto vadovas, Architektas, Informacinių sistemų programuotojas Nr. 1/Nr. 2, Testuotojas, Analytikas, Saugos specialistas), include EACH role separately with its minimum-experience requirement verbatim from source. Concatenate with semicolons. Source language preserved if outputLanguage==lt.\n' +
     '\n' +
     '   FALLBACK RULE: Only write "(no explicit supplier qualification requirements stated in tender documents)" if you have CAREFULLY scanned the DOCUMENTS section AND found NO supplier-eligibility pattern matching ANY language variant above (turnover number, year count, specialist role with experience years, ISO certification, reference project count). Do NOT use this placeholder when the documents contain clear quantitative supplier criteria — extract those even if they appear in numbered lists without a section header. Leaving this field empty is better than filling with scope-like content, BUT extracting verbatim numbered/named supplier criteria is ALWAYS better than the placeholder.\n' +
+    '- qualificationsSourceFile: WHICH parsed document the qualifications were extracted from. The DOCUMENTS section has headers like "--- (handler-name) filename.ext ---" before each parsed file body. Identify the NEAREST header BEFORE the qualification text you extracted, and return ONLY the filename (no handler prefix, no path). Examples: "4_priedas_Reikalavimai tiekėjų kvalifikacijai.docx", "PCAP_LICITACION.pdf", "Annex IV - PQQ.pdf". If qualifications come from multiple files, return the PRIMARY one (richest source). Empty string if qualifications were not extracted from documents (placeholder used) or only from the source page / Mercell notice.\n' +
     '- offerWeighingCriteria: award criteria with EXACT WEIGHTS. ALWAYS list every criterion with its percentage/weight verbatim from the tender (e.g., "Price 40%, Quality 60% (subdivided: solution specification 30%, establishment plan 30%)"). For Lithuanian tenders look for "Kainos lyginamasis svoris X%", "Ekonominio naudingumo X%", "Specialistų kvalifikacija ir patirtis X%". If quality sub-criteria are scored individually (Y1, Y2, Y3 etc.), list each with what is measured and the point range (e.g., "Y1 Project manager additional experience: 1 pt per 1 IS project, 2 pts for 2+ projects"). DO NOT lose subdivision detail — these scoring rules drive the award.\n' +
     '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English. SPECIAL CASE: if lotStructure=="partial" AND there are IT/software-development lots, the scope should describe ONLY the IT lots (not the umbrella framework). If lotStructure=="all-required", describe the whole umbrella.\n' +
     '- lotStructure: one of "single" | "partial" | "all-required". Mark "single" if the tender procures one consolidated scope. Mark "partial" for multi-lot tenders where bidders MAY submit for individual lots/categories independently (look for phrases like "Tilbud på deler av oppdraget er tillatt", "Adgang til å gi tilbud på deler", "Det er adgang til å gi tilbud på enkeltkategorier", "Lots: division into lots = yes", "partial bids allowed", "tilbud på enkelte delkontrakter", "anbud på delar"). Mark "all-required" for multi-lot tenders where bidders MUST cover EVERY lot to win (look for phrases like "Det er ikke adgang til å gi tilbud på deler av oppdraget", "no partial bids", "tilbud må omfatte hele leveransen", "bidders must submit for all lots"). When unclear in a multi-lot tender, default to "all-required".\n' +
@@ -3309,6 +3310,20 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
 // diagnostic dump (top 20 anchor texts) when nothing matches — so we
 // can refine selectors over multiple runs.
 // =====================================================================
+// 2026-06-02 (Task #143) — module-level collector for Drive upload.
+// fetchSourcePageDetails resets this at the start of each tender; handlers
+// push {filename, buf} after each successful parse. After the source-page
+// pipeline finishes, the centralised upload step drains the collector,
+// uploads each buffer to the tender's Drive folder, and stores the
+// resulting filename→link map on details.driveFiles for Q/J column use.
+// Sequential per-tender processing means a single module-level array is
+// safe (no concurrent fetchSourcePageDetails calls).
+const _driveFileCollector = [];
+const _collectDriveFile = (filename, buf) => {
+  if (!filename || !buf || !buf.length) return;
+  _driveFileCollector.push({ filename: String(filename).slice(0, 240), buf });
+};
+
 async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
   let resourceId = null;
   try {
@@ -4678,6 +4693,11 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         const clipped = text.slice(0, isBundle ? 200000 : 80000);
         texts.push(`--- (viesiejipirkimai ${fmt}) ${labelName} ---\n${clipped}`);
         console.log(`    🇱🇹 viesiejipirkimai: parsed ${fmt} "${labelName}" (${buf.length}B → ${clipped.length}ch)`);
+        // 2026-06-02 (Task #143) — collect for Drive upload. Only the OUTER
+        // file (the ZIP container or single PDF/DOCX). Inner ZIP entries
+        // are parsed for AI text but the bundle is what the user wants in
+        // Drive (one file per source row, not 10+ extracted children).
+        _collectDriveFile(labelName, buf);
       } else {
         console.log(`    ⚠️  viesiejipirkimai: extracted text too short for "${labelName}" (${text.length}ch, fmt=${fmt})`);
       }
@@ -11772,6 +11792,13 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
   // only the community.vortal.biz handler consumes it — bare /public/
   // URLs need a reference to drive the search step. Other handlers can
   // start using ctx as needed without further signature changes.
+  //
+  // 2026-06-02 (Task #143) — reset module-level Drive collector at the
+  // start of each tender. Handlers (viesiejipirkimai for now; others to
+  // follow incrementally) push parsed binary buffers via
+  // _collectDriveFile() so the centralised upload step in the caller can
+  // drain them and store the filename→Drive-link map on details.
+  _driveFileCollector.length = 0;
   // URL scheme normalisation — Mercell sometimes returns sourceUrl
   // values like "www.conselleriadefacenda.es/silex" without an
   // http(s):// scheme. Puppeteer's page.goto() rejects those with
@@ -13376,6 +13403,11 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
 
     srcPage.off('request', blockHandler);
     try { await srcPage.setRequestInterception(false); } catch (_) {}
+    // 2026-06-02 (Task #143) — surface collected files for caller-side
+    // Drive upload. Caller iterates result.collectedFiles, uploads each
+    // buffer to the per-tender Drive folder, then populates the Q column
+    // link from the resulting filename→link map.
+    result.collectedFiles = _driveFileCollector.slice();
     return result;
   } catch (e) {
     const msg = e.message || String(e);
@@ -15474,6 +15506,31 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       const elapsed = Date.now() - t0;
       console.log(`    source done in ${elapsed}ms (host: ${src?.sourceHost || 'n/a'}, err: ${src?.error || 'none'}${src?.skipped ? ', skipped: ' + src.skipped : ''}${src?.placspDocsFound ? `, placsp=${src.placspDocsFound}` : ''})`);
 
+      // 2026-06-02 (Task #143) — drain collected files to Drive. Runs
+      // once per tender right after fetchSourcePageDetails. If Drive is
+      // not configured, this is a no-op. driveFiles map: filename → link.
+      // Saved on details so buildRow() (which has access to d.driveFiles
+      // through d) can synthesize Q/J column links from the AI's returned
+      // qualificationsSourceFile / budgetSource filenames.
+      details.driveFiles = {};
+      details.driveFolderLink = '';
+      if (DRIVE_ROOT_FOLDER_ID && src?.collectedFiles?.length) {
+        const refForFolder = srcCtx.referenceNumber || details.tenderId || '';
+        const folderId = await getOrCreateTenderFolder(refForFolder);
+        if (folderId) {
+          details.driveFolderLink = `https://drive.google.com/drive/folders/${folderId}`;
+          let uploaded = 0;
+          for (const { filename, buf } of src.collectedFiles) {
+            const res = await uploadToDrive(folderId, filename, buf);
+            if (res && res.webViewLink) {
+              details.driveFiles[filename] = res.webViewLink;
+              uploaded++;
+            }
+          }
+          console.log(`    📁 Drive: uploaded ${uploaded}/${src.collectedFiles.length} file(s) to ${refForFolder} folder`);
+        }
+      }
+
       // DEAD-SITE FALLBACK — Spanish regional portals.
       //
       // 2026-05-12 ES run: 2/9 tenders hit DNS death at
@@ -16578,18 +16635,137 @@ async function runScraper() {
       console.log('Sample tender:', JSON.stringify(allTenders[0], null, 2));
     }
 
-    // ---- GOOGLE SHEETS SETUP ----
-    console.log('--- GOOGLE SHEETS ---');
+    // ---- GOOGLE SHEETS + DRIVE SETUP ----
+    // 2026-06-02 (Task #143) — added Drive scope so the scraper can create
+    // per-tender folders + upload parsed tender documents (PDF/DOCX/XLSX/
+    // ZIP) into a shared Drive root folder. The root folder is owned by a
+    // separate Google account but shared with this service account (Editor
+    // role) so files land in that account's Drive quota. The folder ID
+    // comes from GOOGLE_DRIVE_ROOT_FOLDER_ID env var.
+    console.log('--- GOOGLE SHEETS + DRIVE ---');
     const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
     const jwt = new google.auth.JWT({
       email: serviceAccount.client_email,
       key: serviceAccount.private_key,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+      scopes: [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive',
+      ],
     });
     await jwt.authorize();
     const sheets = google.sheets({ version: 'v4', auth: jwt });
+    const drive  = google.drive({ version: 'v3', auth: jwt });
     const SHEET_ID = process.env.GOOGLE_SHEET_ID;
     const TAB_NAME = process.env.SHEET_TAB_NAME || 'Sheet1';
+    const DRIVE_ROOT_FOLDER_ID = process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID || '';
+    if (DRIVE_ROOT_FOLDER_ID) {
+      console.log(`✓ Drive enabled, root folder: ${DRIVE_ROOT_FOLDER_ID}`);
+    } else {
+      console.log('⚠️  GOOGLE_DRIVE_ROOT_FOLDER_ID not set — Drive upload disabled');
+    }
+
+    // ---- DRIVE HELPERS ----
+    // In-memory cache for per-tender folder IDs (keyed by reference number)
+    // so we don't list/search Drive on every uploaded file in the same run.
+    const _driveFolderCache = new Map();
+
+    /**
+     * Find or create a per-tender folder inside the root Drive folder.
+     * Folder name = reference number (e.g. "7918455" or "00373935-2026").
+     * Returns the folder ID, or null if Drive is disabled or call fails.
+     */
+    const getOrCreateTenderFolder = async (referenceNumber) => {
+      if (!DRIVE_ROOT_FOLDER_ID || !referenceNumber) return null;
+      const refStr = String(referenceNumber).trim();
+      if (!refStr) return null;
+      if (_driveFolderCache.has(refStr)) return _driveFolderCache.get(refStr);
+      try {
+        // Search for existing subfolder with this name in the root folder
+        const q = `name = '${refStr.replace(/'/g, "\\'")}' and '${DRIVE_ROOT_FOLDER_ID}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+        const list = await drive.files.list({
+          q, fields: 'files(id, name)', pageSize: 1, supportsAllDrives: true, includeItemsFromAllDrives: true,
+        });
+        let folderId = list.data.files?.[0]?.id;
+        if (!folderId) {
+          // Create new
+          const created = await drive.files.create({
+            requestBody: {
+              name: refStr,
+              mimeType: 'application/vnd.google-apps.folder',
+              parents: [DRIVE_ROOT_FOLDER_ID],
+            },
+            fields: 'id',
+            supportsAllDrives: true,
+          });
+          folderId = created.data.id;
+          console.log(`    📁 Drive: created tender folder ${refStr} → ${folderId}`);
+        }
+        _driveFolderCache.set(refStr, folderId);
+        return folderId;
+      } catch (e) {
+        console.log(`    ⚠️  Drive: folder create/find failed for ${refStr}: ${(e.message || '').slice(0, 100)}`);
+        return null;
+      }
+    };
+
+    /**
+     * Upload a single buffer to a Drive folder. Returns { id, webViewLink }
+     * or null on failure.
+     * - parentFolderId: from getOrCreateTenderFolder
+     * - filename: sanitized basename (no path)
+     * - buf: Buffer
+     * - mimeType: optional override (auto-detect from extension if absent)
+     */
+    const uploadToDrive = async (parentFolderId, filename, buf, mimeType) => {
+      if (!parentFolderId || !filename || !buf || !buf.length) return null;
+      const safeName = String(filename).replace(/[\/\\:*?"<>|\x00-\x1f]/g, '_').slice(0, 240);
+      const mt = mimeType || (() => {
+        const ext = (safeName.match(/\.([a-z0-9]+)$/i) || [, ''])[1].toLowerCase();
+        const map = {
+          pdf: 'application/pdf',
+          docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          doc: 'application/msword',
+          xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          xls: 'application/vnd.ms-excel',
+          xlsb: 'application/vnd.ms-excel.sheet.binary.macroEnabled.12',
+          xlsm: 'application/vnd.ms-excel.sheet.macroEnabled.12',
+          zip: 'application/zip',
+          rar: 'application/vnd.rar',
+          xml: 'application/xml',
+          txt: 'text/plain',
+          json: 'application/json',
+          csv: 'text/csv',
+          odt: 'application/vnd.oasis.opendocument.text',
+          ods: 'application/vnd.oasis.opendocument.spreadsheet',
+        };
+        return map[ext] || 'application/octet-stream';
+      })();
+      try {
+        // Skip duplicate uploads — check if a file with this name already
+        // exists in the parent folder (idempotent re-runs).
+        const dupQ = `name = '${safeName.replace(/'/g, "\\'")}' and '${parentFolderId}' in parents and trashed = false`;
+        const dup = await drive.files.list({
+          q: dupQ, fields: 'files(id, webViewLink)', pageSize: 1,
+          supportsAllDrives: true, includeItemsFromAllDrives: true,
+        }).catch(() => ({ data: { files: [] } }));
+        if (dup.data.files?.[0]?.id) {
+          return { id: dup.data.files[0].id, webViewLink: dup.data.files[0].webViewLink || `https://drive.google.com/file/d/${dup.data.files[0].id}/view` };
+        }
+        const stream = require('stream');
+        const bufStream = new stream.PassThrough();
+        bufStream.end(buf);
+        const res = await drive.files.create({
+          requestBody: { name: safeName, parents: [parentFolderId] },
+          media: { mimeType: mt, body: bufStream },
+          fields: 'id, webViewLink',
+          supportsAllDrives: true,
+        });
+        return { id: res.data.id, webViewLink: res.data.webViewLink || `https://drive.google.com/file/d/${res.data.id}/view` };
+      } catch (e) {
+        console.log(`    ⚠️  Drive: upload "${safeName.slice(0, 40)}" failed: ${(e.message || '').slice(0, 120)}`);
+        return null;
+      }
+    };
 
     const SHEET_HEADERS = [
       'DATE OF WHEN ADDED TO THE LIST',  // A
@@ -16957,6 +17133,33 @@ async function runScraper() {
       // New column J = "Source of the budget" inserted after I (MAX BUDGET).
       // Schema shifted: old J(DURATION)→K, K(REQ)→L, L(QUAL)→M, etc.
       // Column T = "Komentarai" (user comments) — we DO NOT touch it.
+      //
+      // 2026-06-02 (Task #143) — Drive integration: when uploads happened,
+      // d.driveFiles maps filename → Drive web link, d.driveFolderLink is
+      // the per-tender folder URL. We use these to enrich:
+      //   • J (Source of the budget): if AI returned "Document: X.pdf",
+      //     try to swap "Document: X.pdf" with "X.pdf — <drive-link>".
+      //   • Q (Source URL): prefer link to the specific qualifications
+      //     doc; fall back to tender folder; fall back to original
+      //     Mercell source URL.
+      const driveFiles = d.driveFiles || {};
+      const driveFolderLink = d.driveFolderLink || '';
+      // Resolve a filename like "Document: 4_priedas.docx" → "4_priedas.docx"
+      const stripDocPrefix = (s) => String(s || '').replace(/^\s*Document:\s*/i, '').trim();
+      // J — replace placeholder "Document: X" with "X — <link>" if upload exists
+      let budgetSourceOut = d.budgetSource || '';
+      const budgetFilename = stripDocPrefix(budgetSourceOut);
+      if (budgetFilename && driveFiles[budgetFilename]) {
+        budgetSourceOut = `${budgetFilename} — ${driveFiles[budgetFilename]}`;
+      }
+      // Q — Source URL link logic: AI-named qualifications file > tender folder > Mercell sourceUrl
+      const qualSourceFile = (d.qualificationsSourceFile || '').trim();
+      let sourceUrlOut = d.sourceUrl || '';
+      if (qualSourceFile && driveFiles[qualSourceFile]) {
+        sourceUrlOut = driveFiles[qualSourceFile];
+      } else if (driveFolderLink) {
+        sourceUrlOut = driveFolderLink;
+      }
       return [
         nowIso,                                                  // A — DATE ADDED
         fmtDate(d.publicationDate || t.publicationDate || ''),   // B — BIDDING ANNOUCEMENT DATE
@@ -16967,14 +17170,14 @@ async function runScraper() {
         fmtDate(d.deadline || t.deadlineRaw || ''),              // G — BIDDING DEADLINE
         d.country || t.country || '',                            // H — COUNTRY
         formatEurBudget(d.maxBudget),                            // I — MAX BUDGET EUR
-        d.budgetSource || '',                                    // J — SOURCE OF THE BUDGET ★ NEW
+        budgetSourceOut,                                         // J — SOURCE OF THE BUDGET ★ + Drive link if available
         d.duration || '',                                        // K — DURATION
         reqOut,                                                  // L — REQUIREMENTS FOR SUPPLIER
         qualOut,                                                 // M — QUALIFICATION REQUIREMENTS
         critOut,                                                 // N — OFFER WEIGHING CRITERIA
         scopeOrigOut,                                            // O — SCOPE OF AGREEMENT
         d.technicalStack || '',                                  // P — TECHNICAL STACK
-        d.sourceUrl || '',                                       // Q — Source URL
+        sourceUrlOut,                                            // Q — Source URL ★ Drive link if qualifications doc uploaded
         d.referenceNumber || t.tenderId || '',                   // R — Reference number
         keywords,                                                // S — Keywords
         // T (Komentarai) intentionally OMITTED — user-only column
@@ -17250,6 +17453,14 @@ async function runScraper() {
           if (!dd.duration && ai.duration) { dd.duration = ai.duration; filled.push('duration'); }
           if (!dd.requirementsForSupplier && ai.requirementsForSupplier) { dd.requirementsForSupplier = ai.requirementsForSupplier; filled.push('requirements'); }
           if (!dd.qualificationRequirements && ai.qualificationRequirements) { dd.qualificationRequirements = ai.qualificationRequirements; filled.push('qualifications'); }
+          // 2026-06-02 (Task #143) — qualifications source file tracking.
+          // AI returns the filename where qualifications were found (e.g.
+          // "4_priedas_Reikalavimai tiekėjų kvalifikacijai.docx"). Used
+          // post-Drive-upload to construct the Q column link directly to
+          // that document inside the per-tender Drive folder.
+          if (!dd.qualificationsSourceFile && ai.qualificationsSourceFile) {
+            dd.qualificationsSourceFile = String(ai.qualificationsSourceFile).slice(0, 240);
+          }
           if (!dd.offerWeighingCriteria && ai.offerWeighingCriteria) { dd.offerWeighingCriteria = ai.offerWeighingCriteria; filled.push('criteria'); }
           // scopeOfAgreement: AI's English summary overrides native-language description
           if (ai.scopeOfAgreement) { dd.scopeOfAgreement = ai.scopeOfAgreement; filled.push('scope'); }
