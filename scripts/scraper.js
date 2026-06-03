@@ -11476,7 +11476,11 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         console.log(`    🟦 mercell-tender: detected my.mercell.com logon page`);
 
         // ─── Path A: SSO Login anchor (modern flow) ──────────────────
-        const ssoClicked = await page.evaluate(() => {
+        // 2026-06-03 (Task #154) — declared with `let` so the SSO
+        // diagnostic+fallback block below can re-set it to `null` if
+        // the SSO landing page has no embedded redirect URL, falling
+        // through to the classic email/password Path B that follows.
+        let ssoClicked = await page.evaluate(() => {
           // Match by href pattern (most reliable — survives label changes)
           const ssoAnchor = document.querySelector('a[href*="SsoLogOn"]')
             || document.querySelector('a[href*="SsoLogon"]')
