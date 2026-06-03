@@ -941,10 +941,16 @@ async function extractFieldsWithAI(text, meta = {}) {
     'You extract structured procurement tender fields from free-form notice text plus attached document text. ' +
     'The user message has sections labeled TITLE / DESCRIPTION / MERCELL_PAGE / DOCUMENTS. Scan ALL sections thoroughly. ' +
     'Return ONLY a JSON object (no prose, no markdown fences) with these keys: ' +
-    'maxBudget, estimatedBudgetEur, budgetSource, duration, requirementsForSupplier, requirementsSourceFile, qualificationRequirements, qualificationsSourceFile, offerWeighingCriteria, scopeOfAgreement, lotStructure, itLotsScope, rejectReason, rejectCategory.\n' +
+    'maxBudget, estimatedBudgetEur, estimationConfidence, estimationReasoning, budgetSource, duration, requirementsForSupplier, requirementsSourceFile, qualificationRequirements, qualificationsSourceFile, offerWeighingCriteria, scopeOfAgreement, lotStructure, itLotsScope, rejectReason, rejectCategory.\n' +
     'Rules:\n' +
     '- maxBudget: total ceiling / max contract value AS STATED in the tender. Empty string if not explicitly stated.\n' +
-    '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND description gives enough basis.\n' +
+    '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND description gives enough basis. Use conservative market rates for comparable EU government IT contracts: web/CMS dev 24mo €0.5-2M; framework agreement multi-year €2-10M; enterprise system 36mo €3-15M; security/audit single 12mo €0.2-0.8M; small support contract €0.1-0.4M. Multiply by duration. Empty string if confidence is low (see below).\n' +
+    '- estimationConfidence: "high" | "medium" | "low" | "" (empty if maxBudget was stated, not estimated). Criteria:\n' +
+    '   • HIGH: detailed scope (≥1000ch of substantive description in DOCUMENTS), duration known, lot structure clear, deliverables enumerated, comparable public benchmarks support the estimate within ±30%. Example: detailed RFT with quantified deliverables ("3 web portals", "10 microservices", "24 months operations") AND duration → numeric estimate is meaningful.\n' +
+    '   • MEDIUM: scope outlined but vague on deliverables, duration known, no comparable benchmark or numeric anchors. Estimate may be off by 2-3×.\n' +
+    '   • LOW: short description (<500ch), no clear duration, ambiguous scope, no quantification, or multi-lot framework where individual lot sizes are unknown. Estimate is essentially a guess.\n' +
+    '   • Empty string: maxBudget was directly stated (no estimation needed) or estimatedBudgetEur is empty.\n' +
+    '- estimationReasoning: 1 short sentence (≤140 chars) explaining the estimate basis IF estimationConfidence is high/medium. Examples: "24mo CMS dev + maintenance, comparable to NL gov web portal ~€2.4M". Empty otherwise.\n' +
     '- budgetSource: WHERE the budget value was found. The DOCUMENTS section of the user message has headers like "--- (handler-name) filename.ext ---" before each parsed file. Identify which one carries the budget number you used. Values: (a) "Document: <filename>" — when budget number appears inside any parsed document (use the exact filename from the nearest "--- (...) filename ---" header BEFORE the matched text); (b) "Source page" — when budget number is in the MERCELL_PAGE section but not in any document; (c) "Mercell tender notice" — when budget number is only in the TITLE/DESCRIPTION sections (Mercell API JSON); (d) "AI estimate" — when maxBudget is empty and you populated estimatedBudgetEur from description context only. Empty string if neither maxBudget nor estimatedBudgetEur was set.\n' +
     '- duration: contract length in months or years. Empty string if not stated.\n' +
     '- requirementsForSupplier: MANDATORY technical/legal requirements the supplier (company) MUST meet to participate. Examples: "ISO 27001 certified", "Security clearance Level 2", "GDPR DPA in place", "Hosted in EU only", "Native LT-speaking staff". This is NOT a summary of the work to be done — that goes in scopeOfAgreement. DO NOT invent or generalize. If documents do not explicitly list mandatory supplier requirements, write "(no explicit mandatory supplier requirements stated in tender documents)" rather than inferring from scope.\n' +
@@ -1039,7 +1045,14 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- rejectCategory: short machine-readable category matching the rejectReason. Empty string if not rejected.\n' +
     (meta.outputLanguage === 'lt'
       ? 'Write the following field values in LITHUANIAN (original language, do not translate): requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement, itLotsScope. Write rejectReason and rejectCategory in English (machine-readable). Use exact numbers from the source.'
-      : 'Write all field values in English. Use exact numbers from the source.');
+      : 'Write all field values in English. Use exact numbers from the source.') +
+    // 2026-06-04 (Task #171) — historical benchmark injection. When AI
+    // estimates budget, anchor it on prior tenders with stated budgets
+    // (loaded from Sheet1 at boot). Same country + similar scope/duration
+    // = closest analog.
+    (_BUDGET_BENCHMARKS.promptSnippet
+      ? `\n\n${_BUDGET_BENCHMARKS.promptSnippet}\n\nWhen estimating budget, FIRST scan the benchmarks above for a similar country + scope + duration. Anchor your estimate within ±50% of the closest analog. Cite the matching benchmark briefly in estimationReasoning (e.g. "anchor: NL 28mo CMS dev €13M").`
+      : '');
   const metaLine = [
     meta.title ? `Title: ${meta.title}` : '',
     meta.buyer ? `Buyer: ${meta.buyer}` : '',
@@ -1114,6 +1127,8 @@ async function extractFieldsWithAI(text, meta = {}) {
     return {
       maxBudget: (parsed.maxBudget || '').toString().trim(),
       estimatedBudgetEur: (parsed.estimatedBudgetEur || '').toString().trim(),
+      estimationConfidence: (parsed.estimationConfidence || '').toString().trim().toLowerCase(),
+      estimationReasoning: (parsed.estimationReasoning || '').toString().trim().slice(0, 200),
       duration: (parsed.duration || '').toString().trim(),
       requirementsForSupplier: (parsed.requirementsForSupplier || '').toString().trim(),
       qualificationRequirements: (parsed.qualificationRequirements || '').toString().trim(),
@@ -3477,6 +3492,14 @@ let _DRIVE_CTX = null;
 // the substantial-content skip and trigger attemptPortalLogin + re-fetch
 // with authenticated session. Reset per tender by fetchTenderDetails.
 let _SOURCE_HANDLER_NEEDS_AUTH = false;
+
+// 2026-06-04 (Task #171) — historical budget benchmarks from Sheet1.
+// At scraper boot we read past tenders with stated budgets and build a
+// compact table the AI can use as few-shot reference when estimating
+// budgets for new tenders without a stated value. Rebuilt once per run.
+// Format: array of {country, duration, scopeKeyword, budgetEur} objects,
+// plus a pre-rendered Markdown snippet for direct prompt injection.
+let _BUDGET_BENCHMARKS = { rows: [], promptSnippet: '' };
 
 async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
   let resourceId = null;
@@ -17401,6 +17424,62 @@ async function runScraper() {
       ? { rootFolderId: DRIVE_ROOT_FOLDER_ID, getOrCreateTenderFolder, uploadToDrive }
       : null;
 
+    // 2026-06-04 (Task #171) — load historical budget benchmarks from
+    // Sheet1. AI uses these as few-shot anchors when estimating budgets
+    // for new tenders without a stated value. Columns of interest:
+    //   D (title-en), H (country), I (max budget EUR), K (duration),
+    //   O (scope summary EN). We keep rows where I is a parsable EUR
+    //   number (skips "EST ...", placeholders, and empty cells).
+    try {
+      const benchResp = await sheets.spreadsheets.values.get({
+        spreadsheetId: SHEET_ID,
+        range: `${TAB_NAME}!D2:O`,
+        valueRenderOption: 'UNFORMATTED_VALUE',
+      }).catch(() => null);
+      const benchRows = benchResp?.data?.values || [];
+      const parsed = [];
+      for (const r of benchRows) {
+        // D=0 title, E=1 origtitle, F=2 buyer, G=3 deadline, H=4 country,
+        // I=5 budget, J=6 source, K=7 duration, L=8 req, M=9 qual, N=10 crit, O=11 scope
+        const titleEn = String(r[0] || '').trim();
+        const country = String(r[4] || '').trim();
+        const budgetRaw = String(r[5] || '').trim();
+        const duration = String(r[7] || '').trim();
+        const scope = String(r[11] || '').trim();
+        if (!titleEn || !country || !budgetRaw) continue;
+        if (/^est\b|^not defined/i.test(budgetRaw)) continue;
+        // Parse EUR number. Accepts "EUR 2,610,000 (30 000 000 NOK)" / "2610000" / "€2,610,000".
+        const m = budgetRaw.match(/(?:eur|€)?\s*([\d.,\s]{4,})/i);
+        if (!m) continue;
+        const numStr = m[1].replace(/[.\s]/g, '').replace(',', '.');
+        const eur = parseFloat(numStr);
+        if (!Number.isFinite(eur) || eur < 50000 || eur > 500000000) continue;
+        parsed.push({ titleEn, country, budgetEur: Math.round(eur), duration, scope });
+      }
+      // Cap at 40 most recent rows (Mercell appends newest at bottom).
+      const recent = parsed.slice(-40);
+      _BUDGET_BENCHMARKS.rows = recent;
+      if (recent.length >= 5) {
+        // Compact one-line-per-row markdown table for prompt injection.
+        const lines = recent.map((b) => {
+          const eur = b.budgetEur >= 1_000_000
+            ? `€${(b.budgetEur / 1_000_000).toFixed(1)}M`
+            : `€${Math.round(b.budgetEur / 1000)}K`;
+          const dur = b.duration ? ` | ${b.duration.slice(0, 30)}` : '';
+          const scopeHint = (b.scope || b.titleEn).slice(0, 80).replace(/\s+/g, ' ');
+          return `- ${b.country.slice(0, 3).toUpperCase()} | ${eur}${dur} | ${scopeHint}`;
+        });
+        _BUDGET_BENCHMARKS.promptSnippet =
+          'REFERENCE BENCHMARKS (prior tenders with stated budgets — use as anchors when estimating):\n' +
+          lines.join('\n');
+        console.log(`✓ Loaded ${recent.length} budget benchmarks for AI estimation`);
+      } else {
+        console.log(`ℹ️  Only ${recent.length} usable budget rows in Sheet1 — skipping benchmark injection`);
+      }
+    } catch (e) {
+      console.log(`⚠️  Budget benchmark load failed: ${(e.message || '').slice(0, 100)}`);
+    }
+
     const SHEET_HEADERS = [
       'DATE OF WHEN ADDED TO THE LIST',  // A
       'BIDDING ANNOUCEMENT DATE',        // B
@@ -18123,19 +18202,35 @@ async function runScraper() {
           }
           const filled = [];
           if (!dd.maxBudget && ai.maxBudget) { dd.maxBudget = ai.maxBudget; filled.push('maxBudget'); }
-          // AI estimate fallback — no explicit budget anywhere, but AI thinks
-          // it can ballpark from scope/duration/country market rates. Marked
-          // with "EST " prefix so the cell visibly differentiates an estimate
-          // from a stated budget. Filter logic below still applies (estimates
-          // < 500K EUR are dropped exactly like stated budgets).
+          // 2026-06-04 (Task #170) — confidence-aware AI estimation.
+          // Use estimate ONLY when AI signals HIGH confidence + estimate
+          // is large enough to matter (>= 200K EUR). Otherwise:
+          //   • MEDIUM/LOW: I="Not defined in the tender. No exact estimation"
+          //   • HIGH but < 200K: drop tender (analogous to budget filter)
+          //   • Empty estimate: leave I blank
+          // J (budgetSource) reflects the actual basis used.
           if (!dd.maxBudget && ai.estimatedBudgetEur) {
             const num = parseFloat(String(ai.estimatedBudgetEur).replace(/[^0-9.]/g, ''));
-            if (Number.isFinite(num) && num > 0) {
+            const conf = (ai.estimationConfidence || '').toLowerCase();
+            if (Number.isFinite(num) && num > 0 && conf === 'high') {
               dd.maxBudget = `EST ${Math.round(num).toLocaleString('en-US')} EUR`;
               dd.budgetIsEstimated = true;
+              dd.budgetSource = ai.estimationReasoning
+                ? `AI estimate (high confidence): ${ai.estimationReasoning}`
+                : 'AI estimate (high confidence)';
               filled.push('maxBudget(EST)');
+            } else if (Number.isFinite(num) && num > 0 && (conf === 'medium' || conf === 'low')) {
+              // AI tried to estimate but confidence is too low — mark
+              // explicitly so a reviewer doesn't think we forgot.
+              dd.maxBudget = 'Not defined in the tender. No exact estimation';
+              dd.budgetIsEstimated = true;
+              dd.budgetSource = `AI estimate (${conf} confidence, ~${Math.round(num).toLocaleString('en-US')} EUR ballpark)`;
+              filled.push('maxBudget(not-estimable)');
             }
           }
+          // No estimate at all + no stated budget: leave I empty (J will
+          // fall back to "" — handled in buildRow). Don't write "Not
+          // defined" here, because user may want to manually inspect.
           // 2026-06-02 (Task #142) — budget source tracking (J column).
           // AI returns budgetSource as one of: "Document: <filename>",
           // "Source page", "Mercell tender notice", "AI estimate", or "".
