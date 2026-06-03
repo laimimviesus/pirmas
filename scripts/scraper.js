@@ -11580,23 +11580,12 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
                   console.log(`    ⚠️  mercell-tender: SSO redirect-follow failed: ${(e.message || '').slice(0, 80)}`);
                 }
               } else {
-                // No redirect URL — SSO simply failed. Fall through to
-                // classic email/password login attempt below (Path B'),
-                // re-enter the logon block by clearing ssoClicked.
-                console.log(`    🟦 mercell-tender: SSO landing has no redirect — falling back to classic email/password login`);
-                // Re-navigate to the original logon page to access the
-                // email/password form (if any).
-                try {
-                  // Use the ReturnUrl from current URL if present.
-                  const retMatch = postSsoUrl.match(/[?&]ReturnUrl=([^&]+)/i);
-                  const ret = retMatch ? decodeURIComponent(retMatch[1]) : `/m/mts/Tender.aspx?id=${tenderId}`;
-                  const logonRetryUrl = `https://my.mercell.com/m/logon/?ReturnUrl=${encodeURIComponent(ret)}`;
-                  await page.goto(logonRetryUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                  await new Promise((r) => setTimeout(r, 1500));
-                } catch (e) {
-                  console.log(`    ⚠️  mercell-tender: logon retry nav failed: ${(e.message || '').slice(0, 80)}`);
-                }
-                // Trigger Path B by signalling no SSO click happened.
+                // No embedded redirect URL — but run 79 diag confirmed
+                // SsoLogOn.aspx ITSELF contains an email/password form
+                // ("E-mail / Remember me / Login"). Stay on this page
+                // (don't navigate away) and trigger Path B which will
+                // fill those fields directly.
+                console.log(`    🟦 mercell-tender: SSO landing has no redirect — falling back to classic email/password login on current page`);
                 ssoClicked = null;
               }
             }
