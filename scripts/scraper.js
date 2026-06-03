@@ -3386,7 +3386,69 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
 const _driveFileCollector = [];
 const _collectDriveFile = (filename, buf) => {
   if (!filename || !buf || !buf.length) return;
-  _driveFileCollector.push({ filename: String(filename).slice(0, 240), buf });
+  // 2026-06-04 (Task #165) — auto-unwrap ZIP/nested ZIP containers.
+  // User wants Q column to link to the SPECIFIC file holding the
+  // qualification text, not a generic ZIP bundle. If buf is a ZIP, we
+  // extract individual entries (PDFs, DOCX, XLSX, etc.) and collect
+  // each one separately. Recurses 1 level deep into inner ZIPs.
+  // Single-file containers (PDF, DOCX) collected as-is.
+  const isZip = buf.length >= 4
+    && buf[0] === 0x50 && buf[1] === 0x4B
+    && (buf[2] === 0x03 || buf[2] === 0x05 || buf[2] === 0x07);
+  // .docx/.xlsx/.pptx are also ZIP containers — but they're single
+  // documents the user wants linked AS-IS. Skip unwrap if filename
+  // looks like an Office doc or has explicit non-zip extension.
+  const filenameLower = String(filename).toLowerCase();
+  const isOfficeDoc = /\.(docx?|xlsx?|pptx?|odt|ods|odp)$/i.test(filenameLower);
+  const isSingleNamedDoc = /\.(pdf|rtf|txt|csv|xml|json)$/i.test(filenameLower);
+  if (!isZip || isOfficeDoc || isSingleNamedDoc) {
+    _driveFileCollector.push({ filename: String(filename).slice(0, 240), buf });
+    return;
+  }
+  // True ZIP — extract entries one level (with 1-level nested ZIP).
+  let AdmZipLib = null;
+  try { AdmZipLib = require('adm-zip'); } catch (_) {}
+  if (!AdmZipLib) {
+    _driveFileCollector.push({ filename: String(filename).slice(0, 240), buf });
+    return;
+  }
+  try {
+    const queue = [{ buf, depth: 0, pathPrefix: '' }];
+    let pushed = 0;
+    while (queue.length && pushed < 50) {
+      const { buf: zbuf, depth, pathPrefix } = queue.shift();
+      let zip;
+      try { zip = new AdmZipLib(zbuf); } catch (_) { continue; }
+      const entries = zip.getEntries().filter((e) => !e.isDirectory);
+      for (const z of entries) {
+        if (pushed >= 50) break;
+        const entryName = z.entryName;
+        const lower = entryName.toLowerCase();
+        const isInnerZip = /\.zip$/i.test(lower);
+        if (isInnerZip && depth < 1) {
+          try {
+            queue.push({ buf: z.getData(), depth: depth + 1, pathPrefix: pathPrefix + entryName + '/' });
+          } catch (_) {}
+          continue;
+        }
+        // Skip junk (signatures, hidden, generic-help)
+        if (/^__macosx\/|\.ds_store$|^\..*\/|\.sig$/i.test(lower)) continue;
+        try {
+          const innerBuf = z.getData();
+          if (!innerBuf || innerBuf.length < 100) continue;
+          const fullName = (pathPrefix + entryName).slice(-240);
+          _driveFileCollector.push({ filename: fullName, buf: innerBuf });
+          pushed++;
+        } catch (_) {}
+      }
+    }
+    if (pushed === 0) {
+      // Fall back to uploading the outer ZIP if extraction yielded nothing
+      _driveFileCollector.push({ filename: String(filename).slice(0, 240), buf });
+    }
+  } catch (_) {
+    _driveFileCollector.push({ filename: String(filename).slice(0, 240), buf });
+  }
 };
 
 // 2026-06-02 (Task #148 fix) — Drive context mailbox.
@@ -6473,6 +6535,123 @@ async function fetchArtifikDocuments(browser, sourceUrl) {
     }
     if (finalBody && finalBody.length > 500) {
       out.push(`--- (artifik rendered body, PID=${pid}) ---\n${finalBody.slice(0, 40000)}`);
+    }
+
+    // 2026-06-04 (Task #164) — Download all docs as ZIP. Confirmed
+    // 2026-06-04 user inspection: /procurements/<id> has a "Download as
+    // zip" button in the Procurement documents tab that bundles all
+    // attachments (Competition basis, SSA-R appendices, etc). Anonymous
+    // — no login required. Click + CDP capture, then parse with adm-zip.
+    let pdfParseLib = null, mammothLib = null, XLSXLib = null, admZipLib = null;
+    try { pdfParseLib = require('pdf-parse'); } catch (_) {}
+    try { mammothLib  = require('mammoth');   } catch (_) {}
+    try { XLSXLib     = require('xlsx');      } catch (_) {}
+    try { admZipLib   = require('adm-zip');   } catch (_) {}
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const os = require('os');
+      const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'artifik-dl-'));
+      let cdpSession = null;
+      try {
+        cdpSession = await page.target().createCDPSession();
+        await cdpSession.send('Browser.setDownloadBehavior', {
+          behavior: 'allow', downloadPath: downloadDir,
+        }).catch(() => null);
+        await cdpSession.send('Page.setDownloadBehavior', {
+          behavior: 'allow', downloadPath: downloadDir,
+        }).catch(() => null);
+      } catch (_) {}
+      const before = new Set();
+      try { for (const n of fs.readdirSync(downloadDir)) before.add(n); } catch (_) {}
+      const zipClicked = await page.evaluate(() => {
+        const RX = /^\s*(?:download\s*as\s*zip|last\s*ned\s*som\s*zip|download\s*zip)\s*$/i;
+        const cands = Array.from(document.querySelectorAll('a, button, [role="button"]'));
+        for (const el of cands) {
+          if (el.offsetParent === null) continue;
+          const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (t && RX.test(t)) {
+            try { el.scrollIntoView({ block: 'center' }); el.click(); return t; }
+            catch (_) {}
+          }
+        }
+        return null;
+      }).catch(() => null);
+      if (zipClicked) {
+        console.log(`    🇳🇴 artifik: clicked "${zipClicked}" — waiting for ZIP`);
+        const deadline = Date.now() + 25000;
+        let zipPath = null;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 600));
+          let names = [];
+          try { names = fs.readdirSync(downloadDir); } catch (_) {}
+          const fresh = names.filter((n) => !before.has(n) && !/\.crdownload$/i.test(n));
+          if (fresh.length) {
+            let biggest = null;
+            for (const n of fresh) {
+              try {
+                const st = fs.statSync(path.join(downloadDir, n));
+                if (st.isFile() && st.size > 1000 && (!biggest || st.size > biggest.size)) {
+                  biggest = { path: path.join(downloadDir, n), size: st.size };
+                }
+              } catch (_) {}
+            }
+            if (biggest) { zipPath = biggest.path; break; }
+          }
+        }
+        if (zipPath && admZipLib) {
+          try {
+            const buf = fs.readFileSync(zipPath);
+            console.log(`    🇳🇴 artifik: ZIP captured (${buf.length}B) — parsing`);
+            // 2026-06-04 — collect outer ZIP for Drive (Task #143).
+            _collectDriveFile(path.basename(zipPath), buf);
+            const zip = new admZipLib(buf);
+            const RX_TEXT = /\.(pdf|docx?|xlsx?|rtf|txt)$/i;
+            const entries = zip.getEntries()
+              .filter((e) => !e.isDirectory && RX_TEXT.test(e.entryName))
+              .slice(0, 20);
+            const zipParts = [];
+            for (const z of entries) {
+              const innerBuf = z.getData();
+              const inLow = z.entryName.toLowerCase();
+              let innerTxt = '';
+              try {
+                if (inLow.endsWith('.pdf') && pdfParseLib) {
+                  const p = await pdfParseLib(innerBuf);
+                  innerTxt = (p?.text || '').trim();
+                } else if (inLow.endsWith('.docx') && mammothLib) {
+                  const m = await mammothLib.extractRawText({ buffer: innerBuf });
+                  innerTxt = (m?.value || '').trim();
+                } else if ((inLow.endsWith('.xlsx') || inLow.endsWith('.xls')) && XLSXLib) {
+                  const wb = XLSXLib.read(innerBuf, { type: 'buffer' });
+                  const sh = [];
+                  for (const sn of wb.SheetNames) sh.push(`### ${sn}\n${XLSXLib.utils.sheet_to_csv(wb.Sheets[sn])}`);
+                  innerTxt = sh.join('\n\n').trim();
+                } else if (inLow.endsWith('.txt') || inLow.endsWith('.rtf')) {
+                  innerTxt = Buffer.from(innerBuf).toString('utf8').trim();
+                }
+              } catch (_) {}
+              if (innerTxt && innerTxt.length > 100) {
+                const clipped = innerTxt.slice(0, 60000);
+                zipParts.push(`--- ${z.entryName.slice(-100)} ---\n${clipped}`);
+                console.log(`    📦 artifik zip entry "${z.entryName.slice(-80)}" (${innerBuf.length}B → ${clipped.length}ch)`);
+                _collectDriveFile(z.entryName, innerBuf);
+              }
+            }
+            if (zipParts.length) {
+              out.push(`--- (artifik ZIP bundle, PID=${pid}) ---\n${zipParts.join('\n\n').slice(0, 200000)}`);
+            }
+          } catch (zerr) {
+            console.log(`    ⚠️  artifik: ZIP parse failed: ${(zerr.message || '').slice(0, 100)}`);
+          }
+        } else if (!zipPath) {
+          console.log(`    ⚠️  artifik: ZIP download polling timed out`);
+        }
+      }
+      try { if (cdpSession) await cdpSession.detach(); } catch (_) {}
+      try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch (_) {}
+    } catch (e) {
+      console.log(`    ⚠️  artifik: ZIP step failed: ${(e.message || '').slice(0, 100)}`);
     }
 
     if (!out.length) {
