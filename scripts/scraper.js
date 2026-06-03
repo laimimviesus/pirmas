@@ -238,6 +238,12 @@ const ALWAYS_LOGIN_HOSTS = [
   // (post-redirect) depending on timing.
   'auftraege.bayern.de',
   'evergabe.bayern.de',
+  // fbhh-evergabe.web.hamburg.de — Hamburg DEVA (Freie und Hansestadt
+  // Hamburg). Same Healy Hudson platform as Bavaria; same supplier
+  // deeplink pattern (/evergabe.bieter/api/supplier/external/deeplink/sub/<id>)
+  // → login-gated documents. Requires separate Hamburg account
+  // (not the same as Bavaria — DEVA instances per region).
+  'fbhh-evergabe.web.hamburg.de',
   // viesiejipirkimai.lt — RE-ADDED 2026-05-28 (Task #119), reversing the
   // 2026-05-26 removal. Background:
   //
@@ -15820,49 +15826,17 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       const elapsed = Date.now() - t0;
       console.log(`    source done in ${elapsed}ms (host: ${src?.sourceHost || 'n/a'}, err: ${src?.error || 'none'}${src?.skipped ? ', skipped: ' + src.skipped : ''}${src?.placspDocsFound ? `, placsp=${src.placspDocsFound}` : ''})`);
 
-      // 2026-06-02 (Task #143 + #148 scope fix) — drain collected files
-      // to Drive via the module-level _DRIVE_CTX mailbox written by
-      // main() after Drive setup. Helpers (getOrCreateTenderFolder,
-      // uploadToDrive) live inside runScraper's IIFE and are NOT visible
-      // here without the mailbox. driveFiles map: filename → link.
-      // Saved on details so buildRow() can synthesize Q/J column links
-      // from the AI's returned qualificationsSourceFile / budgetSource.
+      // 2026-06-04 (Task #163) — DEFER Drive upload until AFTER routing
+      // decision. Previously we uploaded immediately here, but that
+      // populated Drive with orphan files for tenders that got skipped
+      // (budget filter, content filter, AI rejection). Files without a
+      // Sheet row are noise — user can't navigate from Drive back to a
+      // tender. Now we just stash the binary buffers on `details` and
+      // the main loop (post-AI, post-filter) drains them when the
+      // tender actually goes to Sheet1 or "For training".
       details.driveFiles = {};
       details.driveFolderLink = '';
-      if (_DRIVE_CTX && _DRIVE_CTX.rootFolderId && src?.collectedFiles?.length) {
-        try {
-          const refForFolder = srcCtx.referenceNumber || details.tenderId || '';
-          const folderId = await _DRIVE_CTX.getOrCreateTenderFolder(refForFolder);
-          if (folderId) {
-            details.driveFolderLink = `https://drive.google.com/drive/folders/${folderId}`;
-            let created = 0;
-            let reused = 0;
-            let failed = 0;
-            for (const { filename, buf } of src.collectedFiles) {
-              const res = await _DRIVE_CTX.uploadToDrive(folderId, filename, buf);
-              if (res && res.webViewLink) {
-                details.driveFiles[filename] = res.webViewLink;
-                if (res.reused) reused++; else created++;
-              } else {
-                failed++;
-              }
-            }
-            // 2026-06-03 (Task #152) — split tally so re-runs visibly
-            // reuse existing files instead of being indistinguishable
-            // from a fresh upload batch.
-            const parts = [];
-            if (created) parts.push(`${created} created`);
-            if (reused) parts.push(`${reused} reused`);
-            if (failed) parts.push(`${failed} failed`);
-            console.log(
-              `    📁 Drive: ${parts.join(' + ') || '0 processed'} ` +
-              `of ${src.collectedFiles.length} file(s) in "${refForFolder}" folder`
-            );
-          }
-        } catch (e) {
-          console.log(`    ⚠️ Drive upload step failed: ${(e.message || '').slice(0, 100)}`);
-        }
-      }
+      details._pendingDriveFiles = src?.collectedFiles?.length ? src.collectedFiles.slice() : [];
 
       // DEAD-SITE FALLBACK — Spanish regional portals.
       //
@@ -18051,6 +18025,48 @@ async function runScraper() {
         continue;
       }
 
+      // 2026-06-04 (Task #163) — Drive upload deferred to HERE, post-AI
+      // and post-content-filter. Only tenders that will actually land in
+      // Sheet1 or "For training" get their files uploaded. Skipped
+      // tenders (budget filter, content filter, AI defer) leave Drive
+      // clean — no orphan files without a sheet row.
+      try {
+        const dd = toFetch[i].details || {};
+        const pending = dd._pendingDriveFiles || [];
+        if (_DRIVE_CTX && _DRIVE_CTX.rootFolderId && pending.length) {
+          const refForFolder = (dd.fileReferenceNumber && dd.fileReferenceNumber.trim())
+            || dd.referenceNumber || dd.tenderId || '';
+          const folderId = await _DRIVE_CTX.getOrCreateTenderFolder(refForFolder);
+          if (folderId) {
+            dd.driveFolderLink = `https://drive.google.com/drive/folders/${folderId}`;
+            dd.driveFiles = dd.driveFiles || {};
+            let created = 0, reused = 0, failed = 0;
+            for (const { filename, buf } of pending) {
+              const res = await _DRIVE_CTX.uploadToDrive(folderId, filename, buf);
+              if (res && res.webViewLink) {
+                dd.driveFiles[filename] = res.webViewLink;
+                if (res.reused) reused++; else created++;
+              } else {
+                failed++;
+              }
+            }
+            const parts = [];
+            if (created) parts.push(`${created} created`);
+            if (reused) parts.push(`${reused} reused`);
+            if (failed) parts.push(`${failed} failed`);
+            console.log(
+              `    📁 Drive: ${parts.join(' + ') || '0 processed'} ` +
+              `of ${pending.length} file(s) in "${refForFolder}" folder`
+            );
+          }
+        }
+        // Release buffers — large blobs no longer needed
+        dd._pendingDriveFiles = null;
+        toFetch[i].details = dd;
+      } catch (e) {
+        console.log(`    ⚠️ Drive upload step failed: ${(e.message || '').slice(0, 100)}`);
+      }
+
       // Build & buffer
       const row = buildRow(toFetch[i]);
       // 2026-06-02 (Task #138 + #142) — dual-sheet routing:
@@ -18071,7 +18087,7 @@ async function runScraper() {
       }
 
       if (!sampleLogged) {
-        console.log('Sample row:', JSON.stringify(row).slice(0, 500));
+        console.log('Sample row:', JSON.stringify(row).slice(0, 2500));
         sampleLogged = true;
       }
 
