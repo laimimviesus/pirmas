@@ -17432,12 +17432,41 @@ async function runScraper() {
       const driveFolderLink = d.driveFolderLink || '';
       // Resolve a filename like "Document: 4_priedas.docx" → "4_priedas.docx"
       const stripDocPrefix = (s) => String(s || '').replace(/^\s*Document:\s*/i, '').trim();
-      // J — replace placeholder "Document: X" with "X — <link>" if upload exists
+      // J — Source of the budget. ALWAYS prefer a clickable link:
+      //   (a) "Document: <filename>" → if uploaded to Drive: "<filename> — <drive-link>"
+      //                                else: keep filename as text fallback
+      //   (b) "Source page"          → "Source page — <Mercell tender URL>"
+      //   (c) "Mercell tender notice"→ "Mercell tender notice — <Mercell URL>"
+      //   (d) "AI estimate"          → "AI estimate (from description)"
+      //   (e) empty / other          → "" (leave blank, no link to synthesize)
+      // 2026-06-03 (Task #156) — user feedback: empty/text-only J columns
+      // were confusing (looked like raw currency strings). Now every
+      // populated J cell either resolves to a URL or to an explicit
+      // labelled marker.
       let budgetSourceOut = d.budgetSource || '';
       const budgetFilename = stripDocPrefix(budgetSourceOut);
-      if (budgetFilename && driveFiles[budgetFilename]) {
+      const isDocumentSrc = /^\s*Document:\s*/i.test(d.budgetSource || '');
+      const isPageSrc = /^\s*source\s*page\s*$/i.test(budgetSourceOut);
+      const isMercellSrc = /^\s*mercell\s+tender\s+notice\s*$/i.test(budgetSourceOut);
+      const isAiEstimate = /^\s*ai\s*estimate\s*$/i.test(budgetSourceOut);
+      const mercellTenderUrl = publishedUrl || d.sourceUrl || '';
+      if (isDocumentSrc && budgetFilename && driveFiles[budgetFilename]) {
         budgetSourceOut = `${budgetFilename} — ${driveFiles[budgetFilename]}`;
+      } else if (isDocumentSrc && budgetFilename) {
+        // Drive upload didn't happen — keep filename as plain text
+        budgetSourceOut = budgetFilename;
+      } else if (isPageSrc) {
+        budgetSourceOut = mercellTenderUrl
+          ? `Source page — ${mercellTenderUrl}`
+          : 'Source page';
+      } else if (isMercellSrc) {
+        budgetSourceOut = mercellTenderUrl
+          ? `Mercell tender notice — ${mercellTenderUrl}`
+          : 'Mercell tender notice';
+      } else if (isAiEstimate) {
+        budgetSourceOut = 'AI estimate (from description)';
       }
+      // else: leave as-is (empty or non-standard AI output)
       // Q — Source URL link logic: AI-named qualifications file > tender folder > Mercell sourceUrl
       const qualSourceFile = (d.qualificationsSourceFile || '').trim();
       let sourceUrlOut = d.sourceUrl || '';
