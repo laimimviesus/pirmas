@@ -366,6 +366,13 @@ const LOGIN_URLS = {
   // portal. The "TAM_OP=login&AUTHNLEVEL=3" params trigger the username
   // /password form (rather than smart-card / certificate auth).
   'pmp.b2g.etat.lu':          'https://login.b2g.etat.lu/login/TAMLoginServlet?TAM_OP=login&AUTHNLEVEL=3&HOSTNAME=pmp.b2g.etat.lu&METHOD=GET&PROTOCOL=https&REFERER=https%3A%2F%2Fpmp.b2g.etat.lu%2Fentreprise&URL=%2Fentreprise%2Flogin&redirectUrl=https%3A%2F%2Fpmp.b2g.etat.lu%2Fentreprise%2Flogin&authMode=UP',
+  // subreport-elvis.de — German Subreport ELViS Vergabeportal. Source
+  // URLs like /download/bund/E.../<id>/bekanntmachung redirect to the
+  // root page (no login form there). Dedicated login page is at
+  // /elvis.public/portal.do?method=portalLogin — Wicket-based form
+  // with username + password fields. Confirmed via login page HTML
+  // template (sales@cornercasetech.com / CornerCase2025@ in PORTAL_CREDS).
+  'subreport-elvis.de':       'https://www.subreport-elvis.de/elvis.public/portal.do?method=portalLogin',
 };
 // ---------------------------------------------------------------------
 // normalizeSourceUrl
@@ -2553,8 +2560,15 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
   // returns "Number of results: 1" with the right row, including the
   // RC download button (a[href*="EntrepriseDownloadReglement"]) and a
   // detail link.
+  // 2026-06-03 — host-agnostic: use the caller's hostLabel so the same
+  // resolver works for any Atexo-based portal (marches-publics.gouv.fr,
+  // marches.megalis.bretagne.bzh, e-marchespublics.com, marches-securises.fr,
+  // etc.). All share the same Atexo Entreprise.EntrepriseAdvancedSearch
+  // URL pattern. Falls back to marches-publics.gouv.fr if no hostLabel.
+  const host = (hostLabel && /^[a-z0-9.\-]+$/i.test(hostLabel))
+    ? hostLabel : 'www.marches-publics.gouv.fr';
   const searchUrl =
-    `https://www.marches-publics.gouv.fr/?page=Entreprise.EntrepriseAdvancedSearch` +
+    `https://${host}/?page=Entreprise.EntrepriseAdvancedSearch` +
     `&searchAnnCons&keyWord=${encodeURIComponent(ref)}&categorie=0&localisations=`;
   let page = null;
   try {
@@ -2740,6 +2754,7 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
           const parsed = await pdfParseLib(buf);
           extractedText = (parsed && parsed.text ? parsed.text : '').trim();
           console.log(`    📄 marches-publics: parsed RC PDF → ${extractedText.length}ch`);
+          _collectDriveFile('RC.pdf', buf);
         } else if (isZip && AdmZipLib) {
           // DCE ZIP — recurse into PDFs/DOCXs inside.
           const z = new AdmZipLib(buf);
@@ -2775,6 +2790,7 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
           }
           extractedText = parts.join('\n\n');
           console.log(`    📦 marches-publics: parsed DCE ZIP (${z.getEntries().length} entries) → ${extractedText.length}ch`);
+          _collectDriveFile('DCE.zip', buf);
         } else {
           console.log(`    ⚠️  marches-publics: download is neither PDF nor ZIP (first 4 bytes: ${Array.from(buf.slice(0, 4)).map(b => b.toString(16)).join(' ')})`);
           return null;
@@ -3239,6 +3255,7 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
         const lotTag = doc._lotLabel ? ` [lot ${doc._lotLid}]` : '';
         texts.push(`--- (eu-supply ${format}${lotTag}) ${labelName} ---\n${clipped}`);
         console.log(`    🇳🇴 eu-supply: parsed ${format} "${labelName}" (${bytes.length}B → ${clipped.length}ch from ${(capturedUrl || '').slice(0, 80)})`);
+        _collectDriveFile(labelName, Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes));
       } else if (format === 'unknown') {
         const magic = Array.from(bytes.slice(0, 4)).map(x => x.toString(16).padStart(2, '0')).join(' ');
         console.log(`    ⚠️  eu-supply: unknown format for "${labelName}" (magic=${magic}, ${bytes.length}B) — skipping`);
@@ -5169,6 +5186,7 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
         const clipped = text.slice(0, 60000);
         texts.push(`--- (publicprocurement) ${labelName} ---\n${clipped}`);
         console.log(`    🇧🇪 publicprocurement: parsed ${fmt.toUpperCase()} "${labelName}" (${buf.length}B → ${clipped.length}ch)`);
+        _collectDriveFile(labelName, buf);
       }
     }
 
@@ -6783,6 +6801,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
                     const clipped = text.slice(0, 80000);
                     texts.push(`--- (tenderned) ${name} ---\n${clipped}`);
                     console.log(`    🇳🇱 tenderned: parsed "${name}" (${data.length}B → ${clipped.length}ch, score=${item.score})`);
+                    _collectDriveFile(name, Buffer.isBuffer(data) ? data : Buffer.from(data));
                   }
                 } catch (e) {
                   console.log(`    ⚠️  tenderned: parse failed "${name}": ${(e.message || '').slice(0, 80)}`);
@@ -7090,6 +7109,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
                   const clipped = text.slice(0, 80000);
                   texts.push(`--- (tenderned) ${name} ---\n${clipped}`);
                   console.log(`    🇳🇱 tenderned: parsed "${name}" (${data.length}B → ${clipped.length}ch, score=${item.score})`);
+                  _collectDriveFile(name, Buffer.isBuffer(data) ? data : Buffer.from(data));
                 } else {
                   console.log(`    ⚠️  tenderned: "${name}" extracted text too short (${text.length}ch)`);
                 }
@@ -7385,6 +7405,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
           const clipped = text.slice(0, 80000);
           texts.push(`--- (tenderned) ${labelName} ---\n${clipped}`);
           console.log(`    🇳🇱 tenderned: parsed "${labelName}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+          _collectDriveFile(labelName, buf);
         } else {
           console.log(`    ⚠️  tenderned: "${labelName}" extracted text too short (${text.length}ch)`);
         }
@@ -7883,6 +7904,7 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
             const clipped = text.slice(0, 80000);
             texts.push(`--- (tarjouspalvelu) ${name} ---\n${clipped}`);
             console.log(`    🇫🇮 tarjouspalvelu: parsed "${name}" (${data.length}B → ${clipped.length}ch, score=${item.score})`);
+            _collectDriveFile(name, Buffer.isBuffer(data) ? data : Buffer.from(data));
           } else {
             console.log(`    ⚠️  tarjouspalvelu: "${name}" extracted text too short (${text.length}ch)`);
           }
@@ -8636,6 +8658,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
           const clipped = text.slice(0, 80000);
           texts.push(`--- (tendsign) ${labelName} ---\n${clipped}`);
           console.log(`    🇸🇪 tendsign: parsed "${labelName}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+          _collectDriveFile(labelName, buf);
         } else {
           // 2026-06-01 (Task #136) — augmented diag: show isXlsx + first
           // 4 bytes as hex + isHtmlBlob flag, so we can distinguish "binary
@@ -9045,6 +9068,7 @@ async function fetchEavropDocuments(browser, sourceUrl) {
           const clipped = text.slice(0, 80000);
           texts.push(`--- (e-avrop) ${x.name.split('/').pop()} ---\n${clipped}`);
           console.log(`    🇸🇪 e-avrop: parsed "${x.name.split('/').pop().slice(0, 40)}" (${data.length}B → ${clipped.length}ch, score=${x.score})`);
+          _collectDriveFile(x.name.split('/').pop(), Buffer.isBuffer(data) ? data : Buffer.from(data));
         } else {
           console.log(`    ⚠️  e-avrop: "${x.name.split('/').pop().slice(0, 40)}" extracted text too short (${text.length}ch)`);
         }
@@ -9691,6 +9715,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           const clipped = text.slice(0, 80000);
           texts.push(`--- (kommersannons) ${labelName} ---\n${clipped}`);
           console.log(`    🇸🇪 kommersannons: parsed "${labelName.slice(0, 40)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+          _collectDriveFile(labelName, buf);
         } else {
           console.log(`    ⚠️  kommersannons: "${labelName.slice(0, 40)}" extracted text too short (${text.length}ch)`);
         }
@@ -10101,6 +10126,7 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
           const clipped = text.slice(0, 150000);
           texts.push(`--- (placsp ${doc.type}) ${labelName} ---\n${clipped}`);
           console.log(`    🇪🇸 PLACSP: parsed "${labelName.slice(0, 40)}" (${clipped.length}ch, rank=${doc.rank})`);
+          _collectDriveFile(labelName, buf);
         } else if (fmt === 'pdf' || fmt === 'zip') {
           console.log(`    ⚠️  PLACSP: "${labelName.slice(0, 40)}" extracted text too short (${text.length}ch)`);
         }
@@ -10818,6 +10844,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
         const clipped = text.slice(0, 50000);
         texts.push(`--- (source) ${labelName} ---\n${clipped}`);
         console.log(`    🇫🇷 marches-publics.info: parsed "${labelName.slice(0, 40)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+        _collectDriveFile(labelName, buf);
       } else {
         console.log(`    ⚠️  marches-publics.info: "${labelName.slice(0, 40)}" extracted no usable text`);
       }
@@ -11314,6 +11341,7 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
         const clipped = text.slice(0, 50000);
         texts.push(`--- (source) ${labelName} ---\n${clipped}`);
         console.log(`    🇪🇪 riigihanked: parsed "${labelName.slice(0, 40)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+        _collectDriveFile(labelName, buf);
       } else {
         console.log(`    ⚠️  riigihanked: "${labelName.slice(0, 40)}" extracted no usable text`);
       }
@@ -13255,6 +13283,13 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
             okCount += 1;
             const tag = sf.priority ? '⭐ PRIORITY' : '📄';
             console.log(`    ${tag} parsed source ${String(sf.ext).toUpperCase()} "${sf.name}" (${buf.length}B → ${clipped.length}ch${sf.priority ? `, cap=${perFileCap}` : ''})`);
+            // 2026-06-03 (Task #159) — collect for Drive upload. The
+            // generic source-file pipeline (dtvp, evergabe.nrw,
+            // vergabemarktplatz.brandenburg, blb.nrw, etc.) was missing
+            // this hook, so even successful parses never uploaded to
+            // Drive. Run 83 Germany: 6 tenders with 50-100K ch each
+            // parsed → 0 Drive uploads. Now they will be collected.
+            _collectDriveFile(sf.name, buf);
           } else {
             console.log(`    ⚠️ src ${String(sf.ext).toUpperCase()} "${sf.name}" had no extractable text`);
           }
@@ -15866,8 +15901,17 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       // landings, so it should work from this entry point too.
       //
       // Same pattern as PLACSP federal fallback above.
-      const hostIsMarchesPublics = src?.sourceHost &&
-        /(^|\.)marches-publics\.gouv\.fr$/i.test(src.sourceHost);
+      // 2026-06-03 (Task #157) — generalised to any Atexo-based French
+      // procurement portal. They all share the same UI/URL pattern
+      // (Entreprise.EntrepriseAdvancedSearch + keyWord search). Adds
+      // megalis.bretagne (4/run), e-marchespublics.com, marches-securises.fr.
+      const hostIsMarchesPublics = src?.sourceHost && (
+        /(^|\.)marches-publics\.gouv\.fr$/i.test(src.sourceHost) ||
+        /(^|\.)megalis\.bretagne\.bzh$/i.test(src.sourceHost) ||
+        /(^|\.)e-marchespublics\.com$/i.test(src.sourceHost) ||
+        /(^|\.)marches-securises\.fr$/i.test(src.sourceHost) ||
+        /(^|\.)xmarches\.fr$/i.test(src.sourceHost)
+      );
       const sourceLooksEmpty = src && !src.error && !src.skipped && !src.loginGated &&
         !src.sourceFilesText &&
         !src.maxBudget && !src.requirementsForSupplier &&
