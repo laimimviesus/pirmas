@@ -11509,7 +11509,96 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
           // Tender.aspx — wait for that too.
           await new Promise((r) => setTimeout(r, 2000));
           console.log(`    🟦 mercell-tender: post-SSO URL: ${page.url().slice(0, 110)}`);
-        } else {
+
+          // 2026-06-03 (Task #154) — SSO landing diagnostic + fallback.
+          // Run 67: SSO click landed on /m/logon/SsoLogOn.aspx?ReturnUrl=...
+          // with bodyLen=38, anchors=0 — auth round-trip didn't fire. Need
+          // to see WHAT's on the page (meta refresh, JS redirect URL,
+          // error message, or empty body waiting for client-side JS that
+          // Puppeteer can't execute).
+          const postSsoUrl = page.url();
+          const stillOnLogonAfterSso = /\/m\/logon\/?|logon\.aspx|SsoLogOn/i.test(postSsoUrl);
+          if (stillOnLogonAfterSso) {
+            const ssoDiag = await page.evaluate(() => {
+              const htmlSnippet = (document.documentElement?.outerHTML || '').slice(0, 2000);
+              const bodyText = (document.body?.innerText || '').trim();
+              // Meta refresh redirect (common ASP.NET pattern)
+              const metaRefresh = document.querySelector('meta[http-equiv="refresh" i]');
+              const metaContent = metaRefresh?.getAttribute('content') || '';
+              const metaUrl = (metaContent.match(/url\s*=\s*([^;\s"']+)/i) || [, ''])[1];
+              // JS-based redirect — scan all <script> for window.location patterns
+              const scripts = Array.from(document.querySelectorAll('script'));
+              const jsRedirects = [];
+              for (const s of scripts) {
+                const src = s.textContent || '';
+                const m = src.match(/(?:window\.location(?:\.href)?|location\.replace|location\.assign)\s*=\s*['"]([^'"]+)['"]/);
+                if (m) jsRedirects.push(m[1]);
+                const m2 = src.match(/location\.replace\s*\(\s*['"]([^'"]+)['"]/);
+                if (m2) jsRedirects.push(m2[1]);
+              }
+              // Error messages / placeholder content
+              const errSelectors = '[class*="error" i], [class*="alert" i], [role="alert"], .text-danger, .has-error';
+              const errors = Array.from(document.querySelectorAll(errSelectors))
+                .slice(0, 4)
+                .map((el) => (el.innerText || '').trim().slice(0, 140))
+                .filter(Boolean);
+              return {
+                bodyText: bodyText.slice(0, 200),
+                bodyLen: bodyText.length,
+                metaRefreshUrl: metaUrl,
+                jsRedirects: jsRedirects.slice(0, 3),
+                errors,
+                htmlHead: htmlSnippet.slice(0, 500).replace(/\s+/g, ' '),
+              };
+            }).catch(() => null);
+            if (ssoDiag) {
+              console.log(`    🔍 mercell-tender SSO diag: bodyLen=${ssoDiag.bodyLen}, meta="${ssoDiag.metaRefreshUrl || '∅'}", js=${JSON.stringify(ssoDiag.jsRedirects)}, errors=${JSON.stringify(ssoDiag.errors)}`);
+              if (ssoDiag.bodyText) console.log(`    🔍 mercell-tender SSO body preview: "${ssoDiag.bodyText.slice(0, 180)}"`);
+              if (ssoDiag.htmlHead && ssoDiag.bodyLen < 100) {
+                console.log(`    🔍 mercell-tender SSO head: "${ssoDiag.htmlHead.slice(0, 400)}"`);
+              }
+              // If we found a redirect URL embedded in the SSO landing
+              // page (meta refresh OR JS window.location), navigate to
+              // it directly — bypasses whatever client-side handshake
+              // is stuck.
+              const redirectUrl = ssoDiag.metaRefreshUrl
+                || (ssoDiag.jsRedirects.length > 0 ? ssoDiag.jsRedirects[0] : '');
+              if (redirectUrl) {
+                let absoluteUrl;
+                try { absoluteUrl = new URL(redirectUrl, page.url()).toString(); }
+                catch (_) { absoluteUrl = redirectUrl; }
+                console.log(`    🟦 mercell-tender: SSO landing has embedded redirect → ${absoluteUrl.slice(0, 110)}, following`);
+                try {
+                  await page.goto(absoluteUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+                  await new Promise((r) => setTimeout(r, 2000));
+                  console.log(`    🟦 mercell-tender: post-redirect URL: ${page.url().slice(0, 110)}`);
+                } catch (e) {
+                  console.log(`    ⚠️  mercell-tender: SSO redirect-follow failed: ${(e.message || '').slice(0, 80)}`);
+                }
+              } else {
+                // No redirect URL — SSO simply failed. Fall through to
+                // classic email/password login attempt below (Path B'),
+                // re-enter the logon block by clearing ssoClicked.
+                console.log(`    🟦 mercell-tender: SSO landing has no redirect — falling back to classic email/password login`);
+                // Re-navigate to the original logon page to access the
+                // email/password form (if any).
+                try {
+                  // Use the ReturnUrl from current URL if present.
+                  const retMatch = postSsoUrl.match(/[?&]ReturnUrl=([^&]+)/i);
+                  const ret = retMatch ? decodeURIComponent(retMatch[1]) : `/m/mts/Tender.aspx?id=${tenderId}`;
+                  const logonRetryUrl = `https://my.mercell.com/m/logon/?ReturnUrl=${encodeURIComponent(ret)}`;
+                  await page.goto(logonRetryUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                  await new Promise((r) => setTimeout(r, 1500));
+                } catch (e) {
+                  console.log(`    ⚠️  mercell-tender: logon retry nav failed: ${(e.message || '').slice(0, 80)}`);
+                }
+                // Trigger Path B by signalling no SSO click happened.
+                ssoClicked = null;
+              }
+            }
+          }
+        }
+        if (!ssoClicked || (ssoClicked && typeof ssoClicked !== 'string')) {
           // ─── Path B: classic email/password form (legacy fallback) ─
           console.log(`    🟦 mercell-tender: no SSO anchor — trying classic email/password form`);
           const username = process.env.MERCELL_USERNAME || '';
