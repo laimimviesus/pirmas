@@ -941,7 +941,7 @@ async function extractFieldsWithAI(text, meta = {}) {
     'You extract structured procurement tender fields from free-form notice text plus attached document text. ' +
     'The user message has sections labeled TITLE / DESCRIPTION / MERCELL_PAGE / DOCUMENTS. Scan ALL sections thoroughly. ' +
     'Return ONLY a JSON object (no prose, no markdown fences) with these keys: ' +
-    'maxBudget, estimatedBudgetEur, budgetSource, duration, requirementsForSupplier, qualificationRequirements, qualificationsSourceFile, offerWeighingCriteria, scopeOfAgreement, lotStructure, itLotsScope, rejectReason, rejectCategory.\n' +
+    'maxBudget, estimatedBudgetEur, budgetSource, duration, requirementsForSupplier, requirementsSourceFile, qualificationRequirements, qualificationsSourceFile, offerWeighingCriteria, scopeOfAgreement, lotStructure, itLotsScope, rejectReason, rejectCategory.\n' +
     'Rules:\n' +
     '- maxBudget: total ceiling / max contract value AS STATED in the tender. Empty string if not explicitly stated.\n' +
     '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND description gives enough basis.\n' +
@@ -6670,6 +6670,9 @@ async function fetchArtifikDocuments(browser, sourceUrl) {
             const buf = fs.readFileSync(zipPath);
             console.log(`    🇳🇴 artifik: ZIP captured (${buf.length}B) — parsing`);
             // 2026-06-04 — collect outer ZIP for Drive (Task #143).
+            // Task #165 auto-unwrap will explode this into individual
+            // entries automatically, so we only need to register the
+            // ZIP once here (no manual per-entry collect below).
             _collectDriveFile(path.basename(zipPath), buf);
             const zip = new admZipLib(buf);
             const RX_TEXT = /\.(pdf|docx?|xlsx?|rtf|txt)$/i;
@@ -6701,7 +6704,8 @@ async function fetchArtifikDocuments(browser, sourceUrl) {
                 const clipped = innerTxt.slice(0, 60000);
                 zipParts.push(`--- ${z.entryName.slice(-100)} ---\n${clipped}`);
                 console.log(`    📦 artifik zip entry "${z.entryName.slice(-80)}" (${innerBuf.length}B → ${clipped.length}ch)`);
-                _collectDriveFile(z.entryName, innerBuf);
+                // No _collectDriveFile call here — Task #165 auto-unwrap
+                // already extracts and registers every ZIP entry once.
               }
             }
             if (zipParts.length) {
@@ -16594,7 +16598,7 @@ async function runRetranslateStale(sheets, SHEET_ID, TAB_NAME) {
     try {
       await sheets.spreadsheets.values.batchUpdate({
         spreadsheetId: SHEET_ID,
-        requestBody: { valueInputOption: 'RAW', data: updates.splice(0) },
+        requestBody: { valueInputOption: 'USER_ENTERED', data: updates.splice(0) },
       });
       console.log(`  💾 flushed ${label} (${translated} cells so far)`);
     } catch (e) {
@@ -17453,7 +17457,7 @@ async function runScraper() {
         await sheets.spreadsheets.values.update({
           spreadsheetId: SHEET_ID,
           range: `${TAB_NAME}!A1`,
-          valueInputOption: 'RAW',
+          valueInputOption: 'USER_ENTERED',
           requestBody: { values: [SHEET_HEADERS] },
         });
         console.log('Header row inserted (empty sheet)');
@@ -17814,10 +17818,41 @@ async function runScraper() {
       // Q — Source URL link logic: AI-named qualifications file > tender folder > Mercell sourceUrl
       const qualSourceFile = (d.qualificationsSourceFile || '').trim();
       let sourceUrlOut = d.sourceUrl || '';
+      // 2026-06-04 — BE deep-link rewrite: when Mercell handed us
+      // .../publication-workspace-detail/<uuid>/general, point Q
+      // straight at the /documents tab so the user lands on the file
+      // list immediately. /general only shows tender metadata.
+      if (/(^|\.)publicprocurement\.be\/.*\/publication-workspace-detail\/[a-f0-9-]+\/general(\?|$)/i.test(sourceUrlOut)) {
+        sourceUrlOut = sourceUrlOut.replace(/\/general(\?|$)/i, '/documents$1');
+      }
+      // Source URL Q: prefer specific file > tender folder > Mercell URL
       if (qualSourceFile && driveFiles[qualSourceFile]) {
         sourceUrlOut = driveFiles[qualSourceFile];
       } else if (driveFolderLink) {
         sourceUrlOut = driveFolderLink;
+      }
+
+      // 2026-06-04 (Task #168) — turn L (Requirements) and M (Qualifications)
+      // cell content into HYPERLINK() formulas pointing at the source file.
+      // Sheets renders the formula result as clickable text (display = full
+      // qualification text, target = Drive file URL). Requires
+      // valueInputOption=USER_ENTERED so the formula is parsed (not stored
+      // as literal "=HYPERLINK..."). Fallback: if no per-file link, keep
+      // plain text (no link). Helper quotes only ", everything else is
+      // safe inside =HYPERLINK("url","text").
+      const escForFormula = (s) => String(s || '').replace(/"/g, '""');
+      // Heuristic source-file pickers (AI fills these in extractFieldsWithAI):
+      //   - requirementsSourceFile (fallback to qualificationsSourceFile)
+      //   - qualificationsSourceFile
+      // If filename matches a Drive upload, wrap cell in =HYPERLINK.
+      const reqSourceFile = (d.requirementsSourceFile || qualSourceFile || '').trim();
+      let reqCell = reqOut;
+      if (reqOut && reqSourceFile && driveFiles[reqSourceFile]) {
+        reqCell = `=HYPERLINK("${escForFormula(driveFiles[reqSourceFile])}","${escForFormula(reqOut)}")`;
+      }
+      let qualCell = qualOut;
+      if (qualOut && qualSourceFile && driveFiles[qualSourceFile]) {
+        qualCell = `=HYPERLINK("${escForFormula(driveFiles[qualSourceFile])}","${escForFormula(qualOut)}")`;
       }
       return [
         nowIso,                                                  // A — DATE ADDED
@@ -17831,8 +17866,8 @@ async function runScraper() {
         formatEurBudget(d.maxBudget),                            // I — MAX BUDGET EUR
         budgetSourceOut,                                         // J — SOURCE OF THE BUDGET ★ + Drive link if available
         d.duration || '',                                        // K — DURATION
-        reqOut,                                                  // L — REQUIREMENTS FOR SUPPLIER
-        qualOut,                                                 // M — QUALIFICATION REQUIREMENTS
+        reqCell,                                                 // L — REQUIREMENTS FOR SUPPLIER ★ HYPERLINK if source file uploaded
+        qualCell,                                                // M — QUALIFICATION REQUIREMENTS ★ HYPERLINK if source file uploaded
         critOut,                                                 // N — OFFER WEIGHING CRITERIA
         scopeOrigOut,                                            // O — SCOPE OF AGREEMENT
         d.technicalStack || '',                                  // P — TECHNICAL STACK
@@ -17868,7 +17903,7 @@ async function runScraper() {
       return await sheets.spreadsheets.values.append({
         spreadsheetId: SHEET_ID,
         range: `${tabName}!A:A`,
-        valueInputOption: 'RAW',
+        valueInputOption: 'USER_ENTERED',
         insertDataOption: 'INSERT_ROWS',
         requestBody: { values: batch },
       });
@@ -17922,7 +17957,7 @@ async function runScraper() {
           // appends always begin at column A regardless of what's in
           // columns B-AH.
           range: `${TAB_NAME}!A:A`,
-          valueInputOption: 'RAW',
+          valueInputOption: 'USER_ENTERED',
           insertDataOption: 'INSERT_ROWS',
           requestBody: { values: batch },
         });
@@ -18109,6 +18144,15 @@ async function runScraper() {
           if (!dd.budgetSource && ai.budgetSource) {
             dd.budgetSource = String(ai.budgetSource).slice(0, 200);
           }
+          // 2026-06-04 (Task #169) — fallback: if Mercell JSON already
+          // pre-filled dd.maxBudget BEFORE the AI call (from moneyRange)
+          // and the AI didn't return any budgetSource, attribute it to
+          // Mercell. Run 89 case: artifik 2616 had EUR 56,550,000 in I
+          // but J was empty because AI saw budget already populated and
+          // didn't bother to fill source.
+          if (dd.maxBudget && !dd.budgetSource && !dd.budgetIsEstimated) {
+            dd.budgetSource = 'Mercell tender notice';
+          }
           if (!dd.duration && ai.duration) { dd.duration = ai.duration; filled.push('duration'); }
           if (!dd.requirementsForSupplier && ai.requirementsForSupplier) { dd.requirementsForSupplier = ai.requirementsForSupplier; filled.push('requirements'); }
           if (!dd.qualificationRequirements && ai.qualificationRequirements) { dd.qualificationRequirements = ai.qualificationRequirements; filled.push('qualifications'); }
@@ -18119,6 +18163,10 @@ async function runScraper() {
           // that document inside the per-tender Drive folder.
           if (!dd.qualificationsSourceFile && ai.qualificationsSourceFile) {
             dd.qualificationsSourceFile = String(ai.qualificationsSourceFile).slice(0, 240);
+          }
+          // 2026-06-04 (Task #168) — same idea for requirements source file.
+          if (!dd.requirementsSourceFile && ai.requirementsSourceFile) {
+            dd.requirementsSourceFile = String(ai.requirementsSourceFile).slice(0, 240);
           }
           if (!dd.offerWeighingCriteria && ai.offerWeighingCriteria) { dd.offerWeighingCriteria = ai.offerWeighingCriteria; filled.push('criteria'); }
           // scopeOfAgreement: AI's English summary overrides native-language description
