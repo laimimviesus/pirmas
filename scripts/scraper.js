@@ -4816,7 +4816,15 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
   try {
     const u = new URL(sourceUrl);
     if (!/(^|\.)publicprocurement\.be$/i.test(u.hostname)) return [];
-    // Only handle tender-workspace URLs — not the bare login page
+    // Only handle tender-workspace URLs — not the bare login page.
+    // 2026-06-03 — log bare-URL cases so we can see how often Mercell
+    // hands us no tender ID + decide whether to add a search-by-ref
+    // flow (Task #117-style). Currently 3/run in big scans.
+    const isBareUrl = !u.pathname || u.pathname === '/' || u.pathname === '/supplier' || u.pathname === '/supplier/';
+    if (isBareUrl) {
+      console.log(`    🇧🇪 publicprocurement.be: bare URL "${sourceUrl}" — Mercell handed us no tender ID, skipping for now (search-by-reference flow not yet implemented)`);
+      return [];
+    }
     if (!/\/tendering-workspaces?\//i.test(u.pathname) &&
         !/\/(notice|opportunity|tender)\//i.test(u.pathname)) {
       return [];
@@ -12098,7 +12106,19 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
         sourceHost: u.host,
       };
     }
-    if (/(^|\.)mercell\.com$/i.test(u.hostname)) {
+    // 2026-06-03 — s2c.mercell.com unblocked. Run 67 audit showed 8
+    // tenders/run routed to s2c.mercell.com/today/<id>. Previously
+    // skipped as "internal dashboard" but never verified. Allow the
+    // standard source-page fetch flow to try — if the page renders
+    // tender documents, we extract them; if not, we get the same
+    // empty result as before. No regression risk.
+    //
+    // my.mercell.com is still skipped here because permalink.mercell
+    // and app.mercell.com routes redirect TO my.mercell, and we
+    // already handle that flow through fetchMercellTenderDocuments
+    // above. Direct my.mercell.com URLs from Mercell's source field
+    // are rare and almost always internal dashboards.
+    if (/(^|\.)my\.mercell\.com$/i.test(u.hostname)) {
       console.log(`    skipping Mercell-internal source: ${u.host}`);
       return {
         skipped: 'mercell-internal',
