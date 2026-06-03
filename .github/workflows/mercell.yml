@@ -70,6 +70,7 @@ jobs:
           MERCELL_PASSWORD: ${{ secrets.MERCELL_PASSWORD }}
           GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_DRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_FOLDER_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PORTAL_CREDS_JSON: ${{ secrets.PORTAL_CREDS_JSON }}
           # Optional inputs forwarded from workflow_dispatch
