@@ -11640,6 +11640,34 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
               try { submitBtn.click(); return { ok: true, button: submitBtn.value || submitBtn.innerText }; }
               catch (e) { return { ok: false, reason: 'click-error', err: String(e).slice(0, 80) }; }
             }, username, password).catch((e) => ({ ok: false, reason: 'evaluate-error', err: String(e).slice(0, 80) }));
+            if (loggedIn && loggedIn.reason === 'no-fields') {
+              // 2026-06-03 (Task #155 diag) — Path B selector found no
+              // visible inputs. Run 81 confirmed body has "E-mail /
+              // Remember me / Login" but selector returned no-fields.
+              // Dump ALL inputs (visible + hidden) so we can see why
+              // mercell's logon form is invisible to our heuristic.
+              const inputDump = await page.evaluate(() => {
+                const all = Array.from(document.querySelectorAll('input'));
+                return all.slice(0, 20).map((i) => ({
+                  type: i.type, name: i.name, id: i.id,
+                  placeholder: i.placeholder,
+                  visible: i.offsetParent !== null,
+                  width: i.offsetWidth, height: i.offsetHeight,
+                  disp: window.getComputedStyle(i).display,
+                  vis: window.getComputedStyle(i).visibility,
+                }));
+              }).catch(() => null);
+              const formDump = await page.evaluate(() => {
+                const forms = Array.from(document.querySelectorAll('form'));
+                return forms.map((f) => ({
+                  action: f.action, method: f.method,
+                  inputCount: f.querySelectorAll('input').length,
+                  visible: f.offsetParent !== null,
+                }));
+              }).catch(() => null);
+              console.log(`    🔍 mercell-tender no-fields diag — inputs: ${JSON.stringify(inputDump)}`);
+              console.log(`    🔍 mercell-tender no-fields diag — forms:  ${JSON.stringify(formDump)}`);
+            }
             if (loggedIn && loggedIn.ok) {
               console.log(`    🟦 mercell-tender: logon submitted ("${(loggedIn.button || '').slice(0, 30)}") — waiting for redirect`);
               await Promise.race([
