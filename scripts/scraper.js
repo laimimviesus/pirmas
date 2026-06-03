@@ -4653,39 +4653,86 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           // and extract text from each supported inner doc. CVPP bundles
           // routinely contain 3-15 files (Bestek/PCAP-equivalent, ESPD
           // request, technical annexes, price tables, contract templates).
+          //
+          // 2026-06-03 (Task #150) — NESTED ZIP recursion. CVPP often
+          // wraps the actual ToR docs in an inner "Pirkimo dokumentai.zip"
+          // file (run 73 examples: Teisės aktų 7942837, Duomenų valdymo
+          // 7824033). Without recursion we get 6-7K ch of placeholder
+          // text from the outer wrapper and miss the 100K+ ch ToR inside.
+          // Recurse 1 level deeper (max 2 levels total) into any .zip
+          // entry, parsing pdf/docx/xlsx/odt/rtf/txt at each level.
           if (!text && AdmZipLib) {
             try {
-              const zip = new AdmZipLib(buf);
-              const entries = zip.getEntries().filter((e) => !e.isDirectory);
-              // Filter to text-bearing types and cap at 15 inner files.
               const RX_TEXTUAL = /\.(pdf|docx?|xlsx?|odt|ods|rtf|txt)$/i;
-              const candidates = entries.filter((e) => RX_TEXTUAL.test(e.entryName)).slice(0, 15);
+              const RX_INNER_ZIP = /\.zip$/i;
               const parts = [];
-              for (const z of candidates) {
-                const innerBytes = z.getData();
-                const inLow = z.entryName.toLowerCase();
-                let innerTxt = '';
-                try {
-                  if (inLow.endsWith('.pdf') && pdfParseLib) {
-                    const p = await pdfParseLib(innerBytes);
-                    innerTxt = (p?.text || '').trim();
-                  } else if (inLow.endsWith('.docx') && mammothLib) {
-                    const m = await mammothLib.extractRawText({ buffer: innerBytes });
-                    innerTxt = (m?.value || '').trim();
-                  } else if ((inLow.endsWith('.xlsx') || inLow.endsWith('.xls')) && XLSXLib) {
-                    const wb = XLSXLib.read(innerBytes, { type: 'buffer' });
-                    const sheetParts = [];
-                    for (const sn of wb.SheetNames) sheetParts.push(`### ${sn}\n${XLSXLib.utils.sheet_to_csv(wb.Sheets[sn])}`);
-                    innerTxt = sheetParts.join('\n\n').trim();
-                  } else if (inLow.endsWith('.txt') || inLow.endsWith('.rtf')) {
-                    innerTxt = Buffer.from(innerBytes).toString('utf8').trim();
+              // BFS-style queue: [{ buf, depth, pathPrefix }]. Process
+              // outer first, then nested .zip entries. Cap: 2 levels
+              // (depth ≤ 1), 15 text entries per level, 3 nested zips per
+              // level (defends against zip-bomb-style amplification).
+              const queue = [{ buf, depth: 0, pathPrefix: '' }];
+              let processedEntries = 0;
+              const MAX_TEXTUAL = 30;
+              while (queue.length && processedEntries < MAX_TEXTUAL) {
+                const { buf: zbuf, depth, pathPrefix } = queue.shift();
+                let zip;
+                try { zip = new AdmZipLib(zbuf); } catch (e) {
+                  console.log(`    ⚠️  viesiejipirkimai: zip open failed at depth=${depth}: ${(e.message || '').slice(0, 80)}`);
+                  continue;
+                }
+                const entries = zip.getEntries().filter((e) => !e.isDirectory);
+                // 1) Parse text entries at this level
+                const textEntries = entries
+                  .filter((e) => RX_TEXTUAL.test(e.entryName))
+                  .slice(0, 15);
+                for (const z of textEntries) {
+                  if (processedEntries >= MAX_TEXTUAL) break;
+                  const innerBytes = z.getData();
+                  const inLow = z.entryName.toLowerCase();
+                  let innerTxt = '';
+                  try {
+                    if (inLow.endsWith('.pdf') && pdfParseLib) {
+                      const p = await pdfParseLib(innerBytes);
+                      innerTxt = (p?.text || '').trim();
+                    } else if (inLow.endsWith('.docx') && mammothLib) {
+                      const m = await mammothLib.extractRawText({ buffer: innerBytes });
+                      innerTxt = (m?.value || '').trim();
+                    } else if ((inLow.endsWith('.xlsx') || inLow.endsWith('.xls')) && XLSXLib) {
+                      const wb = XLSXLib.read(innerBytes, { type: 'buffer' });
+                      const sheetParts = [];
+                      for (const sn of wb.SheetNames) sheetParts.push(`### ${sn}\n${XLSXLib.utils.sheet_to_csv(wb.Sheets[sn])}`);
+                      innerTxt = sheetParts.join('\n\n').trim();
+                    } else if (inLow.endsWith('.txt') || inLow.endsWith('.rtf')) {
+                      innerTxt = Buffer.from(innerBytes).toString('utf8').trim();
+                    }
+                  } catch (_) {}
+                  if (innerTxt && innerTxt.length > 100) {
+                    const innerClipped = innerTxt.slice(0, 60000);
+                    const labelPath = pathPrefix + z.entryName.slice(-100);
+                    parts.push(`--- ${labelPath} ---\n${innerClipped}`);
+                    console.log(`    📦 zip entry "${labelPath.slice(-80)}" (${innerBytes.length}B → ${innerClipped.length}ch, depth=${depth})`);
+                    processedEntries++;
                   }
-                } catch (_) {}
-                if (innerTxt && innerTxt.length > 100) {
-                  // Per-entry cap 60K — CVPP bundles can carry 5+ rich PDFs.
-                  const innerClipped = innerTxt.slice(0, 60000);
-                  parts.push(`--- ${z.entryName.slice(-100)} ---\n${innerClipped}`);
-                  console.log(`    📦 zip entry "${z.entryName.slice(-80)}" (${innerBytes.length}B → ${innerClipped.length}ch)`);
+                }
+                // 2) Queue nested .zip entries for next level (only at
+                //    depth < 1 → max 2 levels total)
+                if (depth < 1) {
+                  const nestedZips = entries
+                    .filter((e) => RX_INNER_ZIP.test(e.entryName))
+                    .slice(0, 3);
+                  for (const z of nestedZips) {
+                    try {
+                      const nestedBytes = z.getData();
+                      console.log(`    📦 nested ZIP "${z.entryName.slice(-80)}" (${nestedBytes.length}B) — recursing to depth ${depth + 1}`);
+                      queue.push({
+                        buf: nestedBytes,
+                        depth: depth + 1,
+                        pathPrefix: pathPrefix + z.entryName + '/',
+                      });
+                    } catch (e) {
+                      console.log(`    ⚠️  nested zip read failed for "${z.entryName.slice(-60)}": ${(e.message || '').slice(0, 60)}`);
+                    }
+                  }
                 }
               }
               text = parts.join('\n\n').trim();
