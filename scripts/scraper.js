@@ -4930,24 +4930,90 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
 // Strategy mirrors fetchArtifikDocuments: capture /api/* JSON during
 // SPA navigation + click Documents tab + harvest anchors with diagnostic.
 // =====================================================================
-async function fetchPublicProcurementBeDocuments(browser, sourceUrl) {
+async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
+  let isBareUrl = false;
   try {
     const u = new URL(sourceUrl);
     if (!/(^|\.)publicprocurement\.be$/i.test(u.hostname)) return [];
-    // Only handle tender-workspace URLs — not the bare login page.
-    // 2026-06-03 — log bare-URL cases so we can see how often Mercell
-    // hands us no tender ID + decide whether to add a search-by-ref
-    // flow (Task #117-style). Currently 3/run in big scans.
-    const isBareUrl = !u.pathname || u.pathname === '/' || u.pathname === '/supplier' || u.pathname === '/supplier/';
-    if (isBareUrl) {
-      console.log(`    🇧🇪 publicprocurement.be: bare URL "${sourceUrl}" — Mercell handed us no tender ID, skipping for now (search-by-reference flow not yet implemented)`);
-      return [];
-    }
-    if (!/\/tendering-workspaces?\//i.test(u.pathname) &&
+    isBareUrl = !u.pathname || u.pathname === '/' || u.pathname === '/supplier' || u.pathname === '/supplier/';
+    if (!isBareUrl &&
+        !/\/tendering-workspaces?\//i.test(u.pathname) &&
         !/\/(notice|opportunity|tender)\//i.test(u.pathname)) {
       return [];
     }
   } catch (_) { return []; }
+
+  // 2026-06-04 (Task #166) — bare-URL fallback. Mercell hands us
+  // https://www.publicprocurement.be without tender ID for 3/run.
+  // Try to resolve via search using ctx.referenceNumber (e.g. "2026/2237").
+  // BE portal is Angular SPA; standard search URL pattern is the
+  // tendering-workspaces list with searchTerm query parameter.
+  if (isBareUrl) {
+    const ref = (ctx.referenceNumber || '').trim();
+    if (!ref) {
+      console.log(`    🇧🇪 publicprocurement.be: bare URL + no referenceNumber → skipping`);
+      return [];
+    }
+    // Standard SPA search URLs to try (in order). First match with a
+    // visible result anchor → navigate to it (which becomes the new
+    // sourceUrl for the rest of this handler).
+    console.log(`    🇧🇪 publicprocurement.be: bare URL — trying search with ref="${ref}"`);
+    let probe = null;
+    try {
+      probe = await browser.newPage();
+      probe.setDefaultNavigationTimeout(20000);
+      // Pre-login is required to even see search results (Keycloak gate).
+      // We'll try anonymously first; if Keycloak shows up, log + bail
+      // (the caller will run attemptPortalLogin and re-call us).
+      const searchUrls = [
+        `https://www.publicprocurement.be/supplier/enterprises/872560/tendering-workspaces?searchTerm=${encodeURIComponent(ref)}`,
+        `https://www.publicprocurement.be/supplier/tendering-workspaces?searchTerm=${encodeURIComponent(ref)}`,
+        `https://www.publicprocurement.be/supplier/search?q=${encodeURIComponent(ref)}`,
+      ];
+      let resolvedUrl = null;
+      for (const su of searchUrls) {
+        try {
+          await probe.goto(su, { waitUntil: 'domcontentloaded', timeout: 18000 });
+          await new Promise((r) => setTimeout(r, 3000));
+          const curUrl = probe.url();
+          if (/keycloak|openid-connect\/auth|\/auth\/realms/i.test(curUrl)) {
+            console.log(`    🇧🇪 publicprocurement.be: search hit Keycloak — needs login first (will retry post-auth)`);
+            break;
+          }
+          // Look for a link to a specific tender workspace.
+          resolvedUrl = await probe.evaluate(() => {
+            const anchors = Array.from(document.querySelectorAll('a[href*="tendering-workspaces/"], a[href*="publication-workspace-detail/"]'));
+            for (const a of anchors) {
+              const href = a.getAttribute('href') || '';
+              if (/tendering-workspaces\/[a-f0-9-]{6,}/i.test(href) ||
+                  /publication-workspace-detail\/[a-f0-9-]{6,}/i.test(href)) {
+                try { return new URL(href, location.href).toString(); } catch (_) {}
+              }
+            }
+            return null;
+          }).catch(() => null);
+          if (resolvedUrl) {
+            console.log(`    🇧🇪 publicprocurement.be: search resolved → ${resolvedUrl.slice(-100)}`);
+            break;
+          }
+        } catch (e) {
+          console.log(`    🇧🇪 publicprocurement.be: search probe failed (${su.slice(-60)}): ${(e.message || '').slice(0, 60)}`);
+        }
+      }
+      try { await probe.close(); } catch (_) {}
+      if (!resolvedUrl) {
+        console.log(`    🇧🇪 publicprocurement.be: search returned 0 matches for "${ref}"`);
+        return [];
+      }
+      // Replace sourceUrl with resolved deep-link — rest of handler
+      // proceeds normally.
+      sourceUrl = resolvedUrl;
+    } catch (e) {
+      try { if (probe) await probe.close(); } catch (_) {}
+      console.log(`    🇧🇪 publicprocurement.be: search flow threw: ${(e.message || '').slice(0, 80)}`);
+      return [];
+    }
+  }
 
   let pdfParseLib = null, mammothLib = null, XLSXLib = null, admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
@@ -13672,7 +13738,7 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
     // click the tab, harvest visible download anchors, and fall back to
     // API-derived URLs if no DOM links surfaced. No-op for non-BE sources.
     try {
-      const beTexts = await fetchPublicProcurementBeDocuments(browser, sourceUrl);
+      const beTexts = await fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx);
       if (beTexts && beTexts.length) {
         const SRC_TOTAL_CAP = 200000;
         const existing = result.sourceFilesText || '';
