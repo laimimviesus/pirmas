@@ -2935,6 +2935,23 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
       console.log(`    🇳🇴 eu-supply: PID=${pid}, LID=${allLots[0].lid} — navigating to docs page`);
     }
 
+    // Step 1.5 — Accept the RFT invitation. eu-supply gates RFT documents
+    // behind an explicit "Accept" click (/app/rfq/invitation.asp?AC=AT&PID=X).
+    // Required even for logged-in users with a registered company. Without
+    // this, lot docs pages return "0 doc(s)" because the user hasn't yet
+    // joined the procurement (confirmed via UI 2026-06-04: "Click 'Accept'
+    // to get access to the RFT information"). One-time per PID per session.
+    // 2026-06-04: idempotent — re-accepting an already-accepted invitation
+    // just lands on the docs page, no error.
+    try {
+      const acceptUrl = `https://${entranceHost}/app/rfq/invitation.asp?AC=AT&PID=${pid}&B=`;
+      await page.goto(acceptUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await new Promise((r) => setTimeout(r, 1500));
+      console.log(`    🇳🇴 eu-supply: accepted RFT invitation for PID=${pid} (URL: ${acceptUrl.slice(-80)})`);
+    } catch (e) {
+      console.log(`    🇳🇴 eu-supply: accept-invitation nav warn: ${(e.message || '').slice(0, 80)} — proceeding anyway`);
+    }
+
     // Step 2 — for each lot LID, navigate to its docs page and collect docs.
     // Dedupe by both docId AND normalized filename — eu-supply assigns each
     // lot its own docId for content-identical files (observed 2026-05-19:
@@ -3003,6 +3020,22 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
         lotNew++;
       }
       console.log(`    🇳🇴 eu-supply: lot LID=${lot.lid} → ${lotDocs.length} doc(s) (${lotNew} new after dedup)`);
+      // 2026-06-04 — empty-lot diag. Some buyers publish the RFQ shell
+      // first and attach files only after Q&A or pre-bid clarification.
+      // Detect "No documents attached" / empty list explicitly so the
+      // log makes it clear this is buyer-side gap, not handler failure.
+      if (lotDocs.length === 0) {
+        const emptyHint = await page.evaluate(() => {
+          const body = (document.body?.innerText || '').toLowerCase();
+          if (/no documents (?:attached|available)|ingen dokumenter|inga dokument/i.test(body)) {
+            return 'buyer has not attached docs to this RFQ (yet)';
+          }
+          return null;
+        }).catch(() => null);
+        if (emptyHint) {
+          console.log(`    ℹ️  eu-supply: ${emptyHint}`);
+        }
+      }
     }
 
     if (!found.length) {
