@@ -69,8 +69,8 @@ const MAX_PAGES = COUNTRY_FILTER_ACTIVE
 // 6h, o pilnas detail-fetch ciklas per tender'į truko ~5–10s. 4000 tenderių
 // prasilenkdavo su timeout'u ir niekas nebuvo įrašoma. Paliekam override'ą
 // per aplinkos kintamąjį jeigu kada reikės platesnio pirmojo backfill'o.
-const MAX_TENDERS = TEST_MODE ? 30 : Number(process.env.MAX_TENDERS || 500);
-const DETAILS_LIMIT = TEST_MODE ? 30 : Number(process.env.DETAILS_LIMIT || 500);
+const MAX_TENDERS = TEST_MODE ? 9 : Number(process.env.MAX_TENDERS || 500);
+const DETAILS_LIMIT = TEST_MODE ? 9 : Number(process.env.DETAILS_LIMIT || 500);
 const FLUSH_BATCH = TEST_MODE ? 1 : Number(process.env.FLUSH_BATCH || 5);
 const SOURCE_NAV_TIMEOUT = 25000;
 
@@ -954,6 +954,7 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- budgetSource: WHERE the budget value was found. The DOCUMENTS section of the user message has headers like "--- (handler-name) filename.ext ---" before each parsed file. Identify which one carries the budget number you used. Values: (a) "Document: <filename>" — when budget number appears inside any parsed document (use the exact filename from the nearest "--- (...) filename ---" header BEFORE the matched text); (b) "Source page" — when budget number is in the MERCELL_PAGE section but not in any document; (c) "Mercell tender notice" — when budget number is only in the TITLE/DESCRIPTION sections (Mercell API JSON); (d) "AI estimate" — when maxBudget is empty and you populated estimatedBudgetEur from description context only. Empty string if neither maxBudget nor estimatedBudgetEur was set.\n' +
     '- duration: contract length in months or years. Empty string if not stated.\n' +
     '- requirementsForSupplier: MANDATORY technical/legal requirements the supplier (company) MUST meet to participate. Examples: "ISO 27001 certified", "Security clearance Level 2", "GDPR DPA in place", "Hosted in EU only", "Native LT-speaking staff". This is NOT a summary of the work to be done — that goes in scopeOfAgreement. DO NOT invent or generalize. If documents do not explicitly list mandatory supplier requirements, write "(no explicit mandatory supplier requirements stated in tender documents)" rather than inferring from scope.\n' +
+    '- requirementsSourceFile: **MANDATORY when requirementsForSupplier is non-placeholder**. The exact filename (from the nearest "--- (handler) <filename> ---" header preceding the text you extracted) where the requirements were found. Examples: "Aanbestedingsleidraad.pdf", "0_Pirkimo sąlygos A Specialioji dalis.docx", "Bijlage 12 Gemeentelijke_ict_kwaliteitsnormen_2024.pdf". This filename is used to construct a clickable hyperlink in the spreadsheet. Empty string ONLY if requirements came from MERCELL_PAGE / TITLE / DESCRIPTION sections (no document) OR no requirements were stated.\n' +
     '- qualificationRequirements: FORMAL SUPPLIER COMPANY ELIGIBILITY. This is the supplier-side ENTRY criteria — the bar a bidder must clear to be ALLOWED to submit. It is NOT a description of work, NOT a list of capabilities to deliver, NOT the system features being built.\n' +
     '\n' +
     '   2026-06-02 GUIDANCE — EXTRACT FROM INLINE TEXT, NOT JUST SECTION HEADERS:\n' +
@@ -985,7 +986,9 @@ async function extractFieldsWithAI(text, meta = {}) {
     '   PER-SPECIALIST DETAIL: when documents list named specialist roles (Projekto vadovas, Architektas, Informacinių sistemų programuotojas Nr. 1/Nr. 2, Testuotojas, Analytikas, Saugos specialistas), include EACH role separately with its minimum-experience requirement verbatim from source. Concatenate with semicolons. Source language preserved if outputLanguage==lt.\n' +
     '\n' +
     '   FALLBACK RULE: Only write "(no explicit supplier qualification requirements stated in tender documents)" if you have CAREFULLY scanned the DOCUMENTS section AND found NO supplier-eligibility pattern matching ANY language variant above (turnover number, year count, specialist role with experience years, ISO certification, reference project count). Do NOT use this placeholder when the documents contain clear quantitative supplier criteria — extract those even if they appear in numbered lists without a section header. Leaving this field empty is better than filling with scope-like content, BUT extracting verbatim numbered/named supplier criteria is ALWAYS better than the placeholder.\n' +
-    '- qualificationsSourceFile: WHICH parsed document the qualifications were extracted from. The DOCUMENTS section has headers like "--- (handler-name) filename.ext ---" before each parsed file body. Identify the NEAREST header BEFORE the qualification text you extracted, and return ONLY the filename (no handler prefix, no path). Examples: "4_priedas_Reikalavimai tiekėjų kvalifikacijai.docx", "PCAP_LICITACION.pdf", "Annex IV - PQQ.pdf". If qualifications come from multiple files, return the PRIMARY one (richest source). Empty string if qualifications were not extracted from documents (placeholder used) or only from the source page / Mercell notice.\n' +
+    '- qualificationsSourceFile: **MANDATORY when qualificationRequirements is non-placeholder**. The exact filename (from the nearest "--- (handler) <filename> ---" header preceding the extracted text) where the qualifications were found. Return ONLY the filename (no handler prefix, no path). Examples: "4_priedas_Reikalavimai tiekėjų kvalifikacijai.docx", "PCAP_LICITACION.pdf", "Annex IV - PQQ.pdf". If qualifications come from multiple files, return the PRIMARY one (richest source). Empty string ONLY when qualifications came from MERCELL_PAGE / TITLE / DESCRIPTION sections or no qualifications were stated.\n' +
+    '\n' +
+    '   ⚠️ CRITICAL: Both requirementsSourceFile and qualificationsSourceFile MUST be populated whenever you extracted real text into those fields. Empty source-file values cause broken hyperlinks in the output spreadsheet. The DOCUMENTS section headers look like "--- (viesiejipirkimai ZIP-bundle(N)) 0_Pirkimo sąlygos A.docx ---" or "--- (tendsign) Aanbestedingsleidraad.pdf ---" — extract the filename portion (after "(handler) " up to " ---"). Do NOT return the handler name. Do NOT return the section heading. Do NOT return a path. Just the filename like the AI prompt examples above.\n' +
     '- offerWeighingCriteria: award criteria with EXACT WEIGHTS. ALWAYS list every criterion with its percentage/weight verbatim from the tender (e.g., "Price 40%, Quality 60% (subdivided: solution specification 30%, establishment plan 30%)"). For Lithuanian tenders look for "Kainos lyginamasis svoris X%", "Ekonominio naudingumo X%", "Specialistų kvalifikacija ir patirtis X%". If quality sub-criteria are scored individually (Y1, Y2, Y3 etc.), list each with what is measured and the point range (e.g., "Y1 Project manager additional experience: 1 pt per 1 IS project, 2 pts for 2+ projects"). DO NOT lose subdivision detail — these scoring rules drive the award.\n' +
     '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English. SPECIAL CASE: if lotStructure=="partial" AND there are IT/software-development lots, the scope should describe ONLY the IT lots (not the umbrella framework). If lotStructure=="all-required", describe the whole umbrella.\n' +
     '- lotStructure: one of "single" | "partial" | "all-required". Mark "single" if the tender procures one consolidated scope. Mark "partial" for multi-lot tenders where bidders MAY submit for individual lots/categories independently (look for phrases like "Tilbud på deler av oppdraget er tillatt", "Adgang til å gi tilbud på deler", "Det er adgang til å gi tilbud på enkeltkategorier", "Lots: division into lots = yes", "partial bids allowed", "tilbud på enkelte delkontrakter", "anbud på delar"). Mark "all-required" for multi-lot tenders where bidders MUST cover EVERY lot to win (look for phrases like "Det er ikke adgang til å gi tilbud på deler av oppdraget", "no partial bids", "tilbud må omfatte hele leveransen", "bidders must submit for all lots"). When unclear in a multi-lot tender, default to "all-required".\n' +
@@ -13215,9 +13218,38 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
             /alle\s+dokumente|vergabeunterlagen|dokumente\s+als\s+zip|zip-datei|gesamtdokumente|gesamtpaket/i.test(linkText) ||
             /alledokumente|vergabeunterlagen|bulk|zipdownload|gesamtdownload/i.test(abs)
           );
+          // 2026-06-04 (Task #172) — name resolution priority:
+          //   1. URL last segment IF it looks like a real filename
+          //      (has the extension we matched). e.g. "Vergabeunterlagen.pdf".
+          //   2. linkText IF it's longer than just the bare extension
+          //      (avoid useless "PDF" / "ZIP" labels from generic icon-link
+          //      anchors on evergabe-online, dtvp etc. — those gave us
+          //      filename "PDF" with no actual identity, breaking later
+          //      Drive lookups and AI source-file references).
+          //   3. linkText fallback (any non-empty).
+          //   4. Synthetic "source-file.<ext>".
+          const urlTail = (() => {
+            try {
+              const p = new URL(abs).pathname.split('/').pop() || '';
+              return decodeURIComponent(p);
+            } catch (_) { return abs.split('/').pop() || ''; }
+          })();
+          const urlTailHasExt = urlTail && new RegExp('\\.' + ext + '$', 'i').test(urlTail);
+          const linkTextIsJustExt = linkText &&
+            new RegExp('^\\s*(?:\\.?' + ext + '|download(?:\\s+pdf|\\s+zip)?)\\s*$', 'i').test(linkText);
+          let resolvedName;
+          if (urlTailHasExt && urlTail.length >= 5) {
+            resolvedName = urlTail;
+          } else if (linkText && !linkTextIsJustExt) {
+            resolvedName = linkText;
+          } else if (urlTail && urlTail.length >= 3) {
+            resolvedName = urlTail;
+          } else {
+            resolvedName = linkText || `source-file.${ext}`;
+          }
           out.push({
             url: abs,
-            name: linkText || abs.split('/').pop() || `source-file.${ext}`,
+            name: resolvedName,
             ext,
             priority: isBulkZip || undefined,
           });
