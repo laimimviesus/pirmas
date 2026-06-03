@@ -882,13 +882,22 @@ async function translateToEnglish(text, { hint = '', skipHeuristic = false } = {
     );
     let result = out || trimmed;
     // Defensive retry: if Claude echoed the input unchanged AND the input
-    // clearly contains non-ASCII characters (i.e. it isn't English), force
-    // a second pass with an even more direct instruction. Avoids the
+    // is clearly NOT English (non-ASCII diacritics OR non-English stopwords),
+    // force a second pass with an even more direct instruction. Avoids the
     // common Haiku failure mode where it hands back the source string
     // because the system prompt felt ambiguous.
+    //
+    // 2026-06-03 (Task #151) — Bug fix: Dutch tender text like "Het doel
+    // van deze aanbesteding is het afsluiten..." has NO diacritics → was
+    // all-ASCII → hasNonAscii=false → retry skipped → echoed Dutch landed
+    // in the sheet's O column. Real-world: tenderned 427479 (DSU Managed
+    // Hosting), 427496 (TA-WAN). Fix: trust the stopword heuristic which
+    // already correctly flags such cases (the same regex used above to
+    // decide whether to skip translation entirely).
     const echoed = out && out.trim() === trimmed.trim();
     const hasNonAscii = /[^\x00-\x7F]/.test(trimmed);
-    if (echoed && hasNonAscii) {
+    const hasNonEnglishStopwordForRetry = /\b(?:och|und|der|die|den|das|dem|für|mit|auf|bei|nach|ist|sind|wir|sie|ihr|het|van|een|voor|naar|niet|wel|als|aan|maar|ook|waar|dan|alleen|geen|meer|kan|el|la|los|las|para|del|por|que|con|una|uno|les|pour|sur|avec|sans|dans|sous|dei|delle|della|degli|alla|allo|zur|zum|med|till|fra|men|att|som|inte|och|eller|ir|su|dėl|kad|yra|kaip|bei|arba|taip|šis|tas|tos|kas|kuris|todėl|prie|po|nuo|iki|i|w|na|dla|z|ze|nie|jest|się|że|do|oraz|który|przez|przy|jako|lub|jeśli|a|je|ve|do|by|se|jako|nebo|pokud|który|však|neboť|vo|zo|sa|alebo|však|preto|ja|on|ei|et|ka|oma|või|kui|aga|és|az|egy|hogy|vagy|van|nem|csak|már|i|u|sa|je|li|nije|ali|ima|kao|samo)\b/i.test(trimmed);
+    if (echoed && (hasNonAscii || hasNonEnglishStopwordForRetry)) {
       try {
         const forced = await callClaude(
           'Translate the following non-English text into English. Output ONLY the English translation. No source language label, no quotes, no explanation.',
