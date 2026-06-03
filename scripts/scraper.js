@@ -3346,6 +3346,20 @@ const _collectDriveFile = (filename, buf) => {
 // setup; fetchTenderDetails reads it (null when Drive is disabled).
 let _DRIVE_CTX = null;
 
+// 2026-06-03 (Task #147) — auth-needed signal from source-page handlers.
+// Some handlers (notably tendsign) extract real anonymous content (PDFs,
+// DOCX) successfully but find that SPECIFIC priority docs (XLSB Vedlegg
+// with personnel/CV requirements) are gated behind login and come back
+// as HTML responses (ct=text/html). Without this signal, the FORCE-LOGIN
+// guard (Task #42) saw the 26K+ ch of anonymous content and skipped
+// login, leaving the qualification-bearing XLSB files unparsed.
+//
+// Set by handler before returning when ≥1 priority doc came back as an
+// HTML blob (login redirect). Read by the FORCE-LOGIN guard to bypass
+// the substantial-content skip and trigger attemptPortalLogin + re-fetch
+// with authenticated session. Reset per tender by fetchTenderDetails.
+let _SOURCE_HANDLER_NEEDS_AUTH = false;
+
 async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
   let resourceId = null;
   try {
@@ -8433,6 +8447,14 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
     } catch (_) {}
 
     const texts = [];
+    // 2026-06-03 (Task #147) — track priority docs that came back as HTML
+    // blobs (login redirect pages). UiT Norges 93074 case: anonymous flow
+    // pulls PDF/DOCX (Konkurransebestemmelser, Tilbudsbrev) successfully
+    // but the 3 XLSB Vedlegg files containing personnel/CV requirements
+    // return ct=text/html. We track htmlBlobCount and signal the FORCE-
+    // LOGIN guard via _SOURCE_HANDLER_NEEDS_AUTH after the loop, so the
+    // caller forces login + re-fetch.
+    let htmlBlobCount = 0;
     for (const doc of topDocs) {
       const labelName = (doc.filename || doc.name).slice(0, 100);
       // STEP 1 — try fetch first (faster, no disk I/O). If it returns
@@ -8621,10 +8643,30 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
             `(${text.length}ch, isPdf=${isPdf}, isDocx=${isDocx}, isXlsx=${isXlsx}, ` +
             `isZip=${isZip}, isHtml=${isHtmlBlob}, magic=${magic}, ct=${ctL.slice(0, 40)})${htmlSnip}`
           );
+          // 2026-06-03 (Task #147) — count HTML-blob responses among
+          // priority docs. These signal that the doc URL is gated
+          // behind auth even though the public page itself rendered.
+          // After the loop we set _SOURCE_HANDLER_NEEDS_AUTH so the
+          // caller-side FORCE-LOGIN guard bypasses its content-len
+          // skip and triggers attemptPortalLogin + re-fetch.
+          if (isHtmlBlob) htmlBlobCount++;
         }
       } catch (e) {
         console.log(`    ⚠️  tendsign: parse failed for "${labelName}": ${(e.message || '').slice(0, 80)}`);
       }
+    }
+    // 2026-06-03 (Task #147) — signal caller to force login + re-fetch
+    // if any priority doc came back as an HTML blob. UiT Norges 93074
+    // case: 3 XLSB Vedlegg files (where personnel CV requirements live)
+    // return ct=text/html under anonymous session. Without this signal,
+    // the FORCE-LOGIN guard (Task #42) sees the 26K+ ch of successfully
+    // parsed PDFs and skips login, leaving qualifications unextracted.
+    if (htmlBlobCount > 0) {
+      _SOURCE_HANDLER_NEEDS_AUTH = true;
+      console.log(
+        `    🔐 tendsign: ${htmlBlobCount} priority doc(s) came back as HTML — ` +
+        `signaling FORCE-LOGIN bypass to caller for re-fetch with auth`
+      );
     }
     // v3 cleanup — detach CDP + rm tmp download dir.
     try { if (cdpSession) await cdpSession.detach(); } catch (_) {}
@@ -15571,6 +15613,11 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           || details.referenceNumber || '',
         title: details.title || '',
       };
+      // 2026-06-03 (Task #147) — reset per-tender auth-needed signal
+      // before invoking source-page handlers. Handlers (e.g. tendsign)
+      // set this when ≥1 priority doc returns as HTML blob, so the
+      // FORCE-LOGIN guard below can bypass its content-len skip.
+      _SOURCE_HANDLER_NEEDS_AUTH = false;
       let src = await fetchSourcePageDetails(browser, details.sourceUrl, srcCtx);
       const elapsed = Date.now() - t0;
       console.log(`    source done in ${elapsed}ms (host: ${src?.sourceHost || 'n/a'}, err: ${src?.error || 'none'}${src?.skipped ? ', skipped: ' + src.skipped : ''}${src?.placspDocsFound ? `, placsp=${src.placspDocsFound}` : ''})`);
@@ -15590,15 +15637,29 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
           const folderId = await _DRIVE_CTX.getOrCreateTenderFolder(refForFolder);
           if (folderId) {
             details.driveFolderLink = `https://drive.google.com/drive/folders/${folderId}`;
-            let uploaded = 0;
+            let created = 0;
+            let reused = 0;
+            let failed = 0;
             for (const { filename, buf } of src.collectedFiles) {
               const res = await _DRIVE_CTX.uploadToDrive(folderId, filename, buf);
               if (res && res.webViewLink) {
                 details.driveFiles[filename] = res.webViewLink;
-                uploaded++;
+                if (res.reused) reused++; else created++;
+              } else {
+                failed++;
               }
             }
-            console.log(`    📁 Drive: uploaded ${uploaded}/${src.collectedFiles.length} file(s) to ${refForFolder} folder`);
+            // 2026-06-03 (Task #152) — split tally so re-runs visibly
+            // reuse existing files instead of being indistinguishable
+            // from a fresh upload batch.
+            const parts = [];
+            if (created) parts.push(`${created} created`);
+            if (reused) parts.push(`${reused} reused`);
+            if (failed) parts.push(`${failed} failed`);
+            console.log(
+              `    📁 Drive: ${parts.join(' + ') || '0 processed'} ` +
+              `of ${src.collectedFiles.length} file(s) in "${refForFolder}" folder`
+            );
           }
         } catch (e) {
           console.log(`    ⚠️ Drive upload step failed: ${(e.message || '').slice(0, 100)}`);
@@ -15780,12 +15841,29 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         // Mirror of the dtvp.de fix in Task #8 (same overwrite pattern).
         const hasSubstantialSourceContent =
           src.sourceFilesText && src.sourceFilesText.length > 1000;
-        if (hostRequiresLogin(src.sourceHost) && hasSubstantialSourceContent) {
+        // 2026-06-03 (Task #147) — bypass the substantial-content skip
+        // when a handler signalled it needs authenticated re-fetch
+        // (≥1 priority doc returned as HTML blob). tendsign UiT Norges
+        // 93074: anonymous extracted 26K ch from PDFs but 3 XLSB Vedlegg
+        // (with personnel/CV requirements) gated behind auth. Forcing
+        // login + re-fetch gives the handler an authenticated cookie jar
+        // for the XLSB downloads.
+        if (hostRequiresLogin(src.sourceHost) && hasSubstantialSourceContent && !_SOURCE_HANDLER_NEEDS_AUTH) {
           console.log(
             `    ✓ host ${src.sourceHost} normally forces login, but source handler ` +
             `already extracted ${src.sourceFilesText.length}ch — skipping forced login ` +
             `to preserve the content`
           );
+        } else if (hostRequiresLogin(src.sourceHost) && _SOURCE_HANDLER_NEEDS_AUTH) {
+          console.log(
+            `    🔐 host ${src.sourceHost} — handler signalled auth-needed (HTML blobs ` +
+            `among priority docs); forcing login + re-fetch despite ${src.sourceFilesText?.length || 0}ch ` +
+            `of partial content already extracted`
+          );
+          src.loginGated = true;
+          src.matchedMarkers = src.matchedMarkers || 0;
+          src.hasPasswordField = false;
+          src.bodyLength = src.bodyLength || bodyLen;
         } else if (hostRequiresLogin(src.sourceHost) && (looksThinShell || !hasLoggedInMarker)) {
           const trigger = looksThinShell ? 'thin-shell' : 'no-logged-in-marker';
           console.log(`    🔐 host ${src.sourceHost} in ALWAYS_LOGIN_HOSTS (trigger=${trigger}, bodyLen=${bodyLen}) — forcing login`);
@@ -16747,37 +16825,63 @@ async function runScraper() {
      * Find or create a per-tender folder inside the root Drive folder.
      * Folder name = reference number (e.g. "7918455" or "00373935-2026").
      * Returns the folder ID, or null if Drive is disabled or call fails.
+     *
+     * 2026-06-03 (Task #152) — dedup hardening:
+     *   1. Normalise reference (trim + collapse whitespace) so cross-run
+     *      lookups match even if the upstream ref carries extra spaces.
+     *   2. Split log message into "created" vs "reused" cases so the user
+     *      can see at a glance whether a re-run reused an existing folder.
+     *   3. Race-condition tolerance: if Drive returns 409 (name conflict)
+     *      on create, retry the search once — likely a concurrent run beat
+     *      us to it. Cheaper than full transactional locking.
      */
     const getOrCreateTenderFolder = async (referenceNumber) => {
       if (!DRIVE_ROOT_FOLDER_ID || !referenceNumber) return null;
-      const refStr = String(referenceNumber).trim();
+      // Canonicalise: trim + collapse internal whitespace so e.g.
+      // "PRJ 2026 / 001" and "PRJ  2026  /  001" map to the same folder.
+      const refStr = String(referenceNumber).trim().replace(/\s+/g, ' ');
       if (!refStr) return null;
       if (_driveFolderCache.has(refStr)) return _driveFolderCache.get(refStr);
-      try {
-        // Search for existing subfolder with this name in the root folder
+      const searchFolder = async () => {
         const q = `name = '${refStr.replace(/'/g, "\\'")}' and '${DRIVE_ROOT_FOLDER_ID}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
         const list = await drive.files.list({
           q, fields: 'files(id, name)', pageSize: 1, supportsAllDrives: true, includeItemsFromAllDrives: true,
         });
-        let folderId = list.data.files?.[0]?.id;
-        if (!folderId) {
+        return list.data.files?.[0]?.id || null;
+      };
+      try {
+        let folderId = await searchFolder();
+        if (folderId) {
+          console.log(`    ♻️  Drive: tender folder "${refStr}" already exists — reusing (id=${folderId.slice(-12)})`);
+        } else {
           // Create new
-          const created = await drive.files.create({
-            requestBody: {
-              name: refStr,
-              mimeType: 'application/vnd.google-apps.folder',
-              parents: [DRIVE_ROOT_FOLDER_ID],
-            },
-            fields: 'id',
-            supportsAllDrives: true,
-          });
-          folderId = created.data.id;
-          console.log(`    📁 Drive: created tender folder ${refStr} → ${folderId}`);
+          try {
+            const created = await drive.files.create({
+              requestBody: {
+                name: refStr,
+                mimeType: 'application/vnd.google-apps.folder',
+                parents: [DRIVE_ROOT_FOLDER_ID],
+              },
+              fields: 'id',
+              supportsAllDrives: true,
+            });
+            folderId = created.data.id;
+            console.log(`    📁 Drive: created tender folder "${refStr}" → ${folderId.slice(-12)}`);
+          } catch (createErr) {
+            // Race-condition recovery: if another run beat us, the create
+            // may fail (Drive doesn't enforce uniqueness, but transient
+            // 5xx is possible). Retry search to recover. If still no
+            // folder, propagate the original error.
+            console.log(`    ⚠️  Drive: folder create failed for "${refStr}" — retrying search: ${(createErr.message || '').slice(0, 80)}`);
+            folderId = await searchFolder();
+            if (!folderId) throw createErr;
+            console.log(`    ♻️  Drive: race-recovery — found folder "${refStr}" created by concurrent process (id=${folderId.slice(-12)})`);
+          }
         }
         _driveFolderCache.set(refStr, folderId);
         return folderId;
       } catch (e) {
-        console.log(`    ⚠️  Drive: folder create/find failed for ${refStr}: ${(e.message || '').slice(0, 100)}`);
+        console.log(`    ⚠️  Drive: folder create/find failed for "${refStr}": ${(e.message || '').slice(0, 100)}`);
         return null;
       }
     };
@@ -16817,13 +16921,24 @@ async function runScraper() {
       try {
         // Skip duplicate uploads — check if a file with this name already
         // exists in the parent folder (idempotent re-runs).
+        //
+        // 2026-06-03 (Task #152) — dedup hardening:
+        //   • Returns a `reused` flag so the caller can distinguish
+        //     a freshly-uploaded blob from a re-run match.
+        //   • The webViewLink is the SAME for both paths so consumers
+        //     (Q/J column synthesis) don't need to special-case anything.
+        //   • Logged at debug level — bulk counter prints final tally.
         const dupQ = `name = '${safeName.replace(/'/g, "\\'")}' and '${parentFolderId}' in parents and trashed = false`;
         const dup = await drive.files.list({
           q: dupQ, fields: 'files(id, webViewLink)', pageSize: 1,
           supportsAllDrives: true, includeItemsFromAllDrives: true,
         }).catch(() => ({ data: { files: [] } }));
         if (dup.data.files?.[0]?.id) {
-          return { id: dup.data.files[0].id, webViewLink: dup.data.files[0].webViewLink || `https://drive.google.com/file/d/${dup.data.files[0].id}/view` };
+          return {
+            id: dup.data.files[0].id,
+            webViewLink: dup.data.files[0].webViewLink || `https://drive.google.com/file/d/${dup.data.files[0].id}/view`,
+            reused: true,
+          };
         }
         const stream = require('stream');
         const bufStream = new stream.PassThrough();
@@ -16834,7 +16949,11 @@ async function runScraper() {
           fields: 'id, webViewLink',
           supportsAllDrives: true,
         });
-        return { id: res.data.id, webViewLink: res.data.webViewLink || `https://drive.google.com/file/d/${res.data.id}/view` };
+        return {
+          id: res.data.id,
+          webViewLink: res.data.webViewLink || `https://drive.google.com/file/d/${res.data.id}/view`,
+          reused: false,
+        };
       } catch (e) {
         console.log(`    ⚠️  Drive: upload "${safeName.slice(0, 40)}" failed: ${(e.message || '').slice(0, 120)}`);
         return null;
