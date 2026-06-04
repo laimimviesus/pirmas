@@ -983,7 +983,8 @@ async function extractFieldsWithAI(text, meta = {}) {
     '     ✓ "ISO 27001 ir ISO 9001 sertifikatai"\n' +
     '     ✓ "Ekonominis pajėgumas 30% sutarties vertės"\n' +
     '\n' +
-    '   PER-SPECIALIST DETAIL: when documents list named specialist roles (Projekto vadovas, Architektas, Informacinių sistemų programuotojas Nr. 1/Nr. 2, Testuotojas, Analytikas, Saugos specialistas), include EACH role separately with its minimum-experience requirement verbatim from source. Concatenate with semicolons. Source language preserved if outputLanguage==lt.\n' +
+    '   PER-SPECIALIST DETAIL: when documents list named specialist roles (Projekto vadovas, Architektas, Informacinių sistemų programuotojas Nr. 1/Nr. 2, Testuotojas, Analytikas, Saugos specialistas, Jefe de proyecto, Auditor, Project manager, Lead developer), include EACH role separately with its minimum-experience requirement. Concatenate with semicolons.\n' +
+    '   LANGUAGE RULE: When outputLanguage==en (non-Lithuanian tenders), TRANSLATE ALL extracted text to English — including specialist role titles, sentences, and numbered list items. Keep numeric values (EUR amounts, years, percentages) exact, but every Spanish/French/German/Dutch/Italian/Polish/Estonian/Norwegian/Swedish/Finnish/Danish noun, verb, and adjective MUST be translated. NEVER leave Spanish phrases like "Volumen anual de negocios" or "Jefe/a de proyecto: experiencia superior a 5 años" — translate to "Annual turnover" or "Project manager: experience over 5 years". The qualificationRequirements field must read fluently in English. Same rule applies to requirementsForSupplier and offerWeighingCriteria. Only outputLanguage==lt keeps original Lithuanian.\n' +
     '\n' +
     '   FALLBACK RULE: Only write "(no explicit supplier qualification requirements stated in tender documents)" if you have CAREFULLY scanned the DOCUMENTS section AND found NO supplier-eligibility pattern matching ANY language variant above (turnover number, year count, specialist role with experience years, ISO certification, reference project count). Do NOT use this placeholder when the documents contain clear quantitative supplier criteria — extract those even if they appear in numbered lists without a section header. Leaving this field empty is better than filling with scope-like content, BUT extracting verbatim numbered/named supplier criteria is ALWAYS better than the placeholder.\n' +
     '- qualificationsSourceFile: **MANDATORY when qualificationRequirements is non-placeholder**. The exact filename (from the nearest "--- (handler) <filename> ---" header preceding the extracted text) where the qualifications were found. Return ONLY the filename (no handler prefix, no path). Examples: "4_priedas_Reikalavimai tiekėjų kvalifikacijai.docx", "PCAP_LICITACION.pdf", "Annex IV - PQQ.pdf". If qualifications come from multiple files, return the PRIMARY one (richest source). Empty string ONLY when qualifications came from MERCELL_PAGE / TITLE / DESCRIPTION sections or no qualifications were stated.\n' +
@@ -18058,6 +18059,62 @@ async function runScraper() {
       const driveFolderLink = d.driveFolderLink || '';
       // Resolve a filename like "Document: 4_priedas.docx" → "4_priedas.docx"
       const stripDocPrefix = (s) => String(s || '').replace(/^\s*Document:\s*/i, '').trim();
+      // 2026-06-04 (Task #176) — fuzzy filename resolver. Handlers sometimes
+      // emit headers like "Pliego: 02/06/2026 09:33:27 Pliego" (PLACSP) or
+      // "Document attached" (eu-supply) that the AI faithfully returns as
+      // requirementsSourceFile / qualificationsSourceFile. Those header
+      // strings don't match the actual Drive filename (e.g. "Pliego.pdf").
+      // Strategy:
+      //   (a) exact match (current behaviour)
+      //   (b) startsWith / contains case-insensitive
+      //   (c) normalized token match — strip non-alphanumerics, lowercase,
+      //       check if AI value's leading word OR file extension hint
+      //       appears in driveFiles key
+      //   (d) if only ONE file uploaded → use that single file as the link
+      //       (high-confidence single-doc fallback)
+      const resolveDriveFile = (rawAiFilename) => {
+        if (!rawAiFilename) return null;
+        const name = String(rawAiFilename).trim();
+        if (!name) return null;
+        // (a) exact
+        if (driveFiles[name]) return driveFiles[name];
+        const keys = Object.keys(driveFiles);
+        if (keys.length === 0) return null;
+        // (d) single-file shortcut — only if AI returned non-empty placeholder
+        if (keys.length === 1) return driveFiles[keys[0]];
+        const lc = name.toLowerCase();
+        // (b) case-insensitive startsWith / contains
+        const ciExact = keys.find(k => k.toLowerCase() === lc);
+        if (ciExact) return driveFiles[ciExact];
+        const ciStart = keys.find(k => k.toLowerCase().startsWith(lc) || lc.startsWith(k.toLowerCase()));
+        if (ciStart) return driveFiles[ciStart];
+        // (c) token overlap — extract first meaningful word from name (skip
+        // common prefix like "Document:", colons, dates) and match against
+        // file basenames (before extension). Score by Jaccard-like overlap.
+        const tokenize = (s) => String(s || '')
+          .replace(/^Document:\s*/i, '')
+          .replace(/\d{1,2}\/\d{1,2}\/\d{2,4}/g, '')
+          .replace(/\d{1,2}:\d{2}(:\d{2})?/g, '')
+          .replace(/[^\p{L}\p{N}]+/gu, ' ')
+          .toLowerCase()
+          .split(/\s+/)
+          .filter(t => t.length >= 3);
+        const nameTokens = new Set(tokenize(name));
+        if (nameTokens.size === 0) return null;
+        let best = null;
+        let bestScore = 0;
+        for (const k of keys) {
+          const kt = new Set(tokenize(k.replace(/\.[a-z0-9]+$/i, '')));
+          if (kt.size === 0) continue;
+          let inter = 0;
+          for (const t of nameTokens) if (kt.has(t)) inter++;
+          const score = inter / Math.max(1, Math.min(nameTokens.size, kt.size));
+          if (score > bestScore) { bestScore = score; best = k; }
+        }
+        // require >= 50% token overlap to avoid wrong matches
+        if (best && bestScore >= 0.5) return driveFiles[best];
+        return null;
+      };
       // J — Source of the budget. ALWAYS prefer a clickable link:
       //   (a) "Document: <filename>" → if uploaded to Drive: "<filename> — <drive-link>"
       //                                else: keep filename as text fallback
@@ -18076,8 +18133,9 @@ async function runScraper() {
       const isMercellSrc = /^\s*mercell\s+tender\s+notice\s*$/i.test(budgetSourceOut);
       const isAiEstimate = /^\s*ai\s*estimate\s*$/i.test(budgetSourceOut);
       const mercellTenderUrl = publishedUrl || d.sourceUrl || '';
-      if (isDocumentSrc && budgetFilename && driveFiles[budgetFilename]) {
-        budgetSourceOut = `${budgetFilename} — ${driveFiles[budgetFilename]}`;
+      const budgetDriveLink = isDocumentSrc && budgetFilename ? resolveDriveFile(budgetFilename) : null;
+      if (isDocumentSrc && budgetFilename && budgetDriveLink) {
+        budgetSourceOut = `${budgetFilename} — ${budgetDriveLink}`;
       } else if (isDocumentSrc && budgetFilename) {
         // Drive upload didn't happen — keep filename as plain text
         budgetSourceOut = budgetFilename;
@@ -18104,8 +18162,9 @@ async function runScraper() {
         sourceUrlOut = sourceUrlOut.replace(/\/general(\?|$)/i, '/documents$1');
       }
       // Source URL Q: prefer specific file > tender folder > Mercell URL
-      if (qualSourceFile && driveFiles[qualSourceFile]) {
-        sourceUrlOut = driveFiles[qualSourceFile];
+      const qualDriveLink = qualSourceFile ? resolveDriveFile(qualSourceFile) : null;
+      if (qualDriveLink) {
+        sourceUrlOut = qualDriveLink;
       } else if (driveFolderLink) {
         sourceUrlOut = driveFolderLink;
       }
@@ -18125,12 +18184,13 @@ async function runScraper() {
       // If filename matches a Drive upload, wrap cell in =HYPERLINK.
       const reqSourceFile = (d.requirementsSourceFile || qualSourceFile || '').trim();
       let reqCell = reqOut;
-      if (reqOut && reqSourceFile && driveFiles[reqSourceFile]) {
-        reqCell = `=HYPERLINK("${escForFormula(driveFiles[reqSourceFile])}","${escForFormula(reqOut)}")`;
+      const reqDriveLink = reqSourceFile ? resolveDriveFile(reqSourceFile) : null;
+      if (reqOut && reqDriveLink) {
+        reqCell = `=HYPERLINK("${escForFormula(reqDriveLink)}","${escForFormula(reqOut)}")`;
       }
       let qualCell = qualOut;
-      if (qualOut && qualSourceFile && driveFiles[qualSourceFile]) {
-        qualCell = `=HYPERLINK("${escForFormula(driveFiles[qualSourceFile])}","${escForFormula(qualOut)}")`;
+      if (qualOut && qualDriveLink) {
+        qualCell = `=HYPERLINK("${escForFormula(qualDriveLink)}","${escForFormula(qualOut)}")`;
       }
       return [
         nowIso,                                                  // A — DATE ADDED
