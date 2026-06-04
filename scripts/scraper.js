@@ -18404,7 +18404,7 @@ async function runScraper() {
           // 2026-06-04 (Task #170) — confidence-aware AI estimation.
           // Use estimate ONLY when AI signals HIGH confidence + estimate
           // is large enough to matter (>= 200K EUR). Otherwise:
-          //   • MEDIUM/LOW: I="Not defined in the tender. No exact estimation"
+          //   • MEDIUM/LOW: I="Not defined in the tender."
           //   • HIGH but < 200K: drop tender (analogous to budget filter)
           //   • Empty estimate: leave I blank
           // J (budgetSource) reflects the actual basis used.
@@ -18421,7 +18421,8 @@ async function runScraper() {
             } else if (Number.isFinite(num) && num > 0 && (conf === 'medium' || conf === 'low')) {
               // AI tried to estimate but confidence is too low — mark
               // explicitly so a reviewer doesn't think we forgot.
-              dd.maxBudget = 'Not defined in the tender. No exact estimation';
+              // 2026-06-04 — user prašymas: be "No exact estimation" sufikso.
+              dd.maxBudget = 'Not defined in the tender.';
               dd.budgetIsEstimated = true;
               dd.budgetSource = `AI estimate (${conf} confidence, ~${Math.round(num).toLocaleString('en-US')} EUR ballpark)`;
               filled.push('maxBudget(not-estimable)');
@@ -18448,8 +18449,18 @@ async function runScraper() {
             dd.budgetSource = 'Mercell tender notice';
           }
           if (!dd.duration && ai.duration) { dd.duration = ai.duration; filled.push('duration'); }
-          if (!dd.requirementsForSupplier && ai.requirementsForSupplier) { dd.requirementsForSupplier = ai.requirementsForSupplier; filled.push('requirements'); }
-          if (!dd.qualificationRequirements && ai.qualificationRequirements) { dd.qualificationRequirements = ai.qualificationRequirements; filled.push('qualifications'); }
+          // 2026-06-04 (Task #175) — non-LT tenderiams AI English versija turi
+          // OVERRIDE handler'io original-language tekstą. Anksčiau guard'as
+          // `if (!dd.X && ai.X)` blokavo override'inimą, todėl PLACSP/Spanish
+          // handler'iai išsaugodavo ispanišką section-text'ą M/N stulpeliuose,
+          // o anglas AI atsakymas nepasiekdavo sheet'o. LT tenderiams (isLT)
+          // — paliekam handler'io LT-original (jis ir taip LT-language).
+          // scopeOfAgreement jau elgiasi šitaip (line 18467).
+          const aiOverrideMode = !isLithuanianSource;
+          const takeReq = aiOverrideMode ? !!ai.requirementsForSupplier : (!dd.requirementsForSupplier && !!ai.requirementsForSupplier);
+          const takeQual = aiOverrideMode ? !!ai.qualificationRequirements : (!dd.qualificationRequirements && !!ai.qualificationRequirements);
+          if (takeReq) { dd.requirementsForSupplier = ai.requirementsForSupplier; filled.push('requirements'); }
+          if (takeQual) { dd.qualificationRequirements = ai.qualificationRequirements; filled.push('qualifications'); }
           // 2026-06-02 (Task #143) — qualifications source file tracking.
           // AI returns the filename where qualifications were found (e.g.
           // "4_priedas_Reikalavimai tiekėjų kvalifikacijai.docx"). Used
@@ -18462,7 +18473,10 @@ async function runScraper() {
           if (!dd.requirementsSourceFile && ai.requirementsSourceFile) {
             dd.requirementsSourceFile = String(ai.requirementsSourceFile).slice(0, 240);
           }
-          if (!dd.offerWeighingCriteria && ai.offerWeighingCriteria) { dd.offerWeighingCriteria = ai.offerWeighingCriteria; filled.push('criteria'); }
+          // 2026-06-04 (Task #175) — non-LT atveju override'inam handler'io
+          // original-language criteria.
+          const takeCrit = aiOverrideMode ? !!ai.offerWeighingCriteria : (!dd.offerWeighingCriteria && !!ai.offerWeighingCriteria);
+          if (takeCrit) { dd.offerWeighingCriteria = ai.offerWeighingCriteria; filled.push('criteria'); }
           // scopeOfAgreement: AI's English summary overrides native-language description
           if (ai.scopeOfAgreement) { dd.scopeOfAgreement = ai.scopeOfAgreement; filled.push('scope'); }
           // Carry multi-lot framework analysis through
