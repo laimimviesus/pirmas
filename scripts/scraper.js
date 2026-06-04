@@ -18016,13 +18016,22 @@ async function runScraper() {
       const titleEn = d.titleEn ? cleanDescription(d.titleEn) : '';
       const scopeEn = d.scopeOfAgreementEn ? cleanDescription(d.scopeOfAgreementEn) : '';
 
+      // 2026-06-04 (Task #177) — O column should be ENGLISH for non-LT.
+      // When AI returns scope, dd.scopeOfAgreement is already English. When
+      // AI returns empty (e.g. 200K input hit max_tokens before scope was
+      // generated), dd.scopeOfAgreement stays in source language (Spanish
+      // description from Mercell JSON). The downstream translation pass
+      // writes English to dd.scopeOfAgreementEn but the O column was
+      // reading dd.scopeOfAgreement and missed it. Prefer scopeEn when
+      // present, fall back to scopeOrig.
+      const isLtTender = !!d._keepOriginalLanguage;
       // Surface ambiguous-procurement reviews in the sheet so the
       // sales reviewer can spot them at a glance. We prefix BOTH the
       // original and EN titles with "[REVIEW]" so it's visible whichever
       // column the reviewer looks at; the human-review note is injected
       // into both scope cells.
       let titleOrigOut = titleOrig;
-      let scopeOrigOut = scopeOrig;
+      let scopeOrigOut = isLtTender ? scopeOrig : (scopeEn || scopeOrig);
       let titleEnOut = titleEn;
       let scopeEnOut = scopeEn;
       if (d.rejectCategory === 'ambiguous_procurement_check_manually' && d.rejectReason) {
