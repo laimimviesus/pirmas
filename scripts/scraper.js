@@ -1383,19 +1383,66 @@ async function checkTreeNodeByName(page, name) {
 // PrimeReact'ui su šiais checkbox'ais (patikrinta diagnostika — click'as kviečiasi,
 // bet .p-highlight nepersijungia).
 async function checkCheckboxInAccordion(page, accordionRegex, labelText) {
-  // 1. Išplėsti accordion'ą
-  await page.evaluate((pat) => {
-    const regex = new RegExp(pat, 'i');
-    const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
-    const target = tabs.find(t => regex.test(t.id || ''));
-    if (!target) return;
-    const link = target.querySelector('.p-accordion-header-link');
-    if (link && link.getAttribute('aria-expanded') !== 'true') {
-      link.scrollIntoView({ block: 'center' });
-      link.click();
-    }
-  }, accordionRegex);
+  // 1. Išplėsti accordion'ą + LAUKTI kol all labels suhidruoja
+  // 2026-06-04 (Task #174) — naujoje Mercell Explore UI accordion'as
+  // kartais re-renderina'i po čekboksų click'o ir tik vieną label'į rodo
+  // pirmus 0.7-1.5s. Padidinau wait'ą + retry'us:
+  //   • Re-open jei collapsed
+  //   • Poll iki 4s laukiant ar label'is, kurio ieškome, jau renderintas
+  //   • Click "Show more" jei toks egzistuoja accordion'e
+  const openAccordion = async () => {
+    return await page.evaluate((pat) => {
+      const regex = new RegExp(pat, 'i');
+      const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+      const target = tabs.find(t => regex.test(t.id || ''));
+      if (!target) return { ok: false, reason: 'no tab' };
+      const link = target.querySelector('.p-accordion-header-link');
+      if (!link) return { ok: false, reason: 'no header link' };
+      if (link.getAttribute('aria-expanded') !== 'true') {
+        link.scrollIntoView({ block: 'center' });
+        link.click();
+      }
+      return { ok: true, expanded: link.getAttribute('aria-expanded') === 'true' };
+    }, accordionRegex);
+  };
+  await openAccordion();
   await new Promise(r => setTimeout(r, 700));
+
+  // Poll iki ~4s kol mūsų label'is appears arba label count stabilizuojasi >1.
+  // Jei collapsed (po re-render), bandom dar kartą open'inti.
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 4000) {
+    const status = await page.evaluate((pat, text) => {
+      const regex = new RegExp(pat, 'i');
+      const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+      const target = tabs.find(t => regex.test(t.id || ''));
+      if (!target) return { ok: false, expanded: false, labelCount: 0, hasTarget: false };
+      const link = target.querySelector('.p-accordion-header-link');
+      const expanded = link?.getAttribute('aria-expanded') === 'true';
+      const labels = Array.from(target.querySelectorAll('.p-checkbox-label'));
+      const hasTarget = labels.some(l => {
+        const t = (l.textContent || '').trim();
+        return t === text || t.startsWith(text + ' ') || t.startsWith(text + '(');
+      });
+      return { ok: true, expanded, labelCount: labels.length, hasTarget };
+    }, accordionRegex, labelText);
+    if (status.hasTarget) break;
+    if (!status.expanded) {
+      // Accordion collapsed — re-open.
+      await openAccordion();
+    }
+    // Try clicking "Show more" / "View all" buttons inside this accordion.
+    await page.evaluate((pat) => {
+      const regex = new RegExp(pat, 'i');
+      const tabs = Array.from(document.querySelectorAll('.p-accordion-tab'));
+      const target = tabs.find(t => regex.test(t.id || ''));
+      if (!target) return;
+      const buttons = Array.from(target.querySelectorAll('button, a'));
+      const more = buttons.find(b => /show\s*more|view\s*all|more\s*options|see\s*more/i.test((b.textContent || '').trim()));
+      if (more) { try { more.scrollIntoView({ block: 'center' }); more.click(); } catch (_) {} }
+    }, accordionRegex);
+    await new Promise(r => setTimeout(r, 350));
+  }
 
   const tryClick = async (mode) => {
     // mode: 'label' | 'box' | 'input'
@@ -17096,21 +17143,66 @@ async function runScraper() {
     }, { timeout: 60000 }).catch(() => {
       console.log('WARN: no result cards after 60s');
     });
-    await new Promise(r => setTimeout(r, 2000));
+    // 2026-06-04 (Task #174) — bumped 2s → 6s, plus poll'inam kol card
+    // count stabilizuojasi. Run 99 POST-APPLY rodė 20 cards su senu
+    // [data-testid^="search-result-card:"] selector'iu, bet po 2s collection
+    // loop'as gavo 0 — Mercell vis dar hydrateino. Šis poll'as palaiko card
+    // count stabilumą per ~2s prieš pereinant į collection.
+    {
+      const startedAt = Date.now();
+      let prevCount = -1;
+      let stableTicks = 0;
+      while (Date.now() - startedAt < 12000) {
+        const c = await page.evaluate(() =>
+          document.querySelectorAll('[data-testid="tender-name"]').length
+        );
+        if (c > 0 && c === prevCount) {
+          stableTicks++;
+          if (stableTicks >= 3) break; // ~1.5s stable
+        } else {
+          stableTicks = 0;
+        }
+        prevCount = c;
+        await new Promise(r => setTimeout(r, 500));
+      }
+      console.log(`Post-apply: settled at ${prevCount} tender-name cards`);
+    }
 
     // ---- POST-APPLY: DIAGNOSTINIS DUMP ----
     const postApplyState = await page.evaluate(() => {
-      const firstCards = Array.from(document.querySelectorAll('[data-testid^="search-result-card:"]')).slice(0, 3);
+      const oldWrappers = Array.from(document.querySelectorAll('[data-testid^="search-result-card:"]'));
+      const tenderNames = Array.from(document.querySelectorAll('[data-testid="tender-name"]'));
+      const firstCards = oldWrappers.slice(0, 3);
+      // 2026-06-04 (Task #174) — papildomas walk-up dump'as: pakeliam
+      // ancestor'us nuo pirmų 3 tender-name elementų ir žiūrim ar randam
+      // <a href> ar [data-testid^="search-result-card"].
+      const walkSamples = tenderNames.slice(0, 3).map(t => {
+        let node = t;
+        const tags = [];
+        for (let i = 0; i < 8 && node; i++) {
+          const dt = node.getAttribute && node.getAttribute('data-testid');
+          tags.push({
+            tag: node.tagName,
+            href: node.getAttribute?.('href') || null,
+            dt: dt || null,
+            cls: (node.className || '').toString().slice(0, 80),
+          });
+          node = node.parentElement;
+        }
+        return tags;
+      });
       return {
         url: location.href.slice(0, 500),
         urlHasStatusFilter: /filter=tender_status/i.test(location.href),
         urlHasDocTypeFilter: /filter=doc_type_code/i.test(location.href),
-        totalCards: document.querySelectorAll('[data-testid^="search-result-card:"]').length,
+        totalOldWrappers: oldWrappers.length,
+        totalTenderNames: tenderNames.length,
         firstCards: firstCards.map(c => ({
           title: (c.querySelector('[data-testid="tender-name"]')?.innerText || '').trim().slice(0, 60),
           status: (c.querySelector('[data-testid="tender-header__tender-status"]')?.innerText || '').trim(),
           docType: (c.querySelector('[data-testid="tender-header__doc-type-code"]')?.innerText || '').trim(),
         })),
+        walkSamples,
       };
     });
     console.log('POST-APPLY URL/results:', JSON.stringify(postApplyState, null, 2));
@@ -17137,11 +17229,52 @@ async function runScraper() {
       }
 
       const pageTenders = await page.evaluate(() => {
-        const cards = Array.from(document.querySelectorAll('[data-testid^="search-result-card:"]'));
+        // 2026-06-04 (Task #174) — Mercell rewrote Explore UI. Old
+        // wrapper [data-testid="search-result-card:<id>"] is gone. New
+        // structure: tender-name + tender-authority + search-result-card__
+        // locations are the only stable testid hooks. The clickable card
+        // wrapper is an ancestor <a href="/tender/<id>"> (or similar).
+        // Approach: find every tender-name node, walk up to nearest
+        // anchor with a tender URL, treat that as the card root.
+        let cards = Array.from(document.querySelectorAll('[data-testid^="search-result-card:"]'));
+        if (cards.length === 0) {
+          const titles = Array.from(document.querySelectorAll('[data-testid="tender-name"]'));
+          const seenRoots = new Set();
+          cards = [];
+          for (const t of titles) {
+            // Walk up to find the clickable wrapper.
+            let node = t;
+            let root = null;
+            for (let i = 0; i < 10 && node; i++) {
+              if (node.tagName === 'A' && node.getAttribute('href')) { root = node; break; }
+              if (node.getAttribute && (node.getAttribute('data-testid') || '').startsWith('search-result-card')) {
+                root = node; break;
+              }
+              node = node.parentElement;
+            }
+            // Fall back to nearest article/section/li/the title's grandparent.
+            if (!root) root = t.closest('article, section, li') || (t.parentElement && t.parentElement.parentElement) || t.parentElement;
+            if (root && !seenRoots.has(root)) {
+              seenRoots.add(root);
+              cards.push(root);
+            }
+          }
+        }
         return cards.map(card => {
           const nameEl = card.querySelector('[data-testid="tender-name"]');
-          const linkEl = nameEl?.querySelector('a[href*="/tender/"]') || nameEl?.querySelector('a');
-          const href = linkEl?.getAttribute('href') || null;
+          // New UI: the card root itself is often the <a href>. Old UI:
+          // anchor was inside the name. Check both.
+          let href = null;
+          if (card.tagName === 'A' && card.getAttribute('href')) {
+            href = card.getAttribute('href');
+          } else {
+            const linkEl =
+              card.querySelector('a[href*="/tender/"]') ||
+              nameEl?.querySelector('a[href*="/tender/"]') ||
+              nameEl?.querySelector('a') ||
+              card.querySelector('a[href]');
+            href = linkEl?.getAttribute('href') || null;
+          }
           const title = (nameEl?.innerText || '').trim();
 
           const pubDateRaw = card.querySelector('[data-testid="tender-header__publication-date"]')?.innerText?.trim() || '';
@@ -17164,7 +17297,18 @@ async function runScraper() {
 
           let organisation = null;
           let country = null;
-          if (orgCountryLine) {
+          // 2026-06-04 — new Explore UI: tender-authority element contains
+          // "Buyer name, Country" (e.g. "Brønnøy kommune, Norway").
+          const authEl = card.querySelector('[data-testid="tender-authority"]');
+          const authText = (authEl?.innerText || '').trim();
+          if (authText) {
+            const m = authText.match(/^(.+?),\s*([A-Za-z\s]+?)\s*$/);
+            if (m) {
+              organisation = m[1].trim();
+              country = m[2].trim();
+            }
+          }
+          if (!organisation && orgCountryLine) {
             const m = orgCountryLine.match(/^(.+),\s*([A-Za-z\s]+)$/);
             if (m) {
               organisation = m[1].trim();
@@ -17189,6 +17333,29 @@ async function runScraper() {
 
       const foundHrefs = pageTenders.slice(0, 3).map(t => (t.href || '').slice(0, 60));
       console.log(`Page ${pageNum}: found ${pageTenders.length} cards, first hrefs: ${JSON.stringify(foundHrefs)}`);
+
+      // 2026-06-04 (Task #174) — kai page 1 grįžta 0 cards, padaryti
+      // forenzinį DOM dump'ą kad žinotume KAS surinkimo metu yra puslapy.
+      if (pageNum <= 2 && pageTenders.length === 0) {
+        const diag = await page.evaluate(() => {
+          const tenderNames = Array.from(document.querySelectorAll('[data-testid="tender-name"]'));
+          const oldWrap = document.querySelectorAll('[data-testid^="search-result-card:"]').length;
+          const aLinks = Array.from(document.querySelectorAll('a[href*="/tender/"]')).slice(0, 5).map(a => a.getAttribute('href'));
+          const dataTestids = new Set();
+          document.querySelectorAll('[data-testid]').forEach(el => {
+            const t = el.getAttribute('data-testid') || '';
+            const norm = t.split(':')[0].split('-').slice(0, 3).join('-');
+            dataTestids.add(norm);
+          });
+          return {
+            tenderNameCount: tenderNames.length,
+            oldWrapperCount: oldWrap,
+            tenderLinkSamples: aLinks,
+            uniqueTestidPrefixes: Array.from(dataTestids).filter(t => /tender|search|card|result/i.test(t)).slice(0, 20),
+          };
+        });
+        console.log(`  DIAG (page ${pageNum} empty):`, JSON.stringify(diag, null, 2));
+      }
 
       let newOnThisPage = 0;
       let dupesOnThisPage = 0;
