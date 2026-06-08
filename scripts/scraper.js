@@ -11793,9 +11793,20 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
 async function fetchDoffinDocuments(browser, ctx = {}) {
   const ref = (ctx.referenceNumber || '').trim();
   const title = (ctx.title || '').trim();
-  const searchTerm = ref && ref.length >= 4 ? ref : title;
-  if (!searchTerm || searchTerm.length < 4) {
-    console.log(`    🇳🇴 doffin: no usable reference/title to search — skipping`);
+  // 2026-06-08 run 112 lesson: Doffin's `searchString` does FULL-TEXT search
+  // and does NOT index the buyer's internal reference ("2025/6484" → 0 hits,
+  // "Konkurranse (0)"). The tender TITLE is what matches. So try, in order:
+  //   1. full title (best for full-text), 2. first ~7 words of title (drops
+  //   trailing codes/lot suffixes), 3. the buyer ref (last resort).
+  const titleWords = title.split(/\s+/).filter(Boolean);
+  const titleShort = titleWords.slice(0, 7).join(' ');
+  const searchCandidates = [];
+  const pushCand = (s) => { const v = (s || '').trim(); if (v.length >= 4 && !searchCandidates.includes(v)) searchCandidates.push(v); };
+  pushCand(title);
+  pushCand(titleShort);
+  pushCand(ref);
+  if (!searchCandidates.length) {
+    console.log(`    🇳🇴 doffin: no usable title/reference to search — skipping`);
     return [];
   }
   let page = null;
@@ -11812,36 +11823,50 @@ async function fetchDoffinDocuments(browser, ctx = {}) {
         Object.defineProperty(navigator, 'languages', { get: () => ['nb-NO', 'no', 'en-US', 'en'] });
       });
     } catch (_) {}
-    const searchUrl = `https://www.doffin.no/search?searchString=${encodeURIComponent(searchTerm)}`;
-    console.log(`    🇳🇴 doffin: searching "${searchTerm.slice(0, 60)}" → ${searchUrl.slice(0, 90)}`);
-    try {
-      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-    } catch (e) {
-      console.log(`    🇳🇴 doffin: search nav warn: ${(e.message || '').slice(0, 80)}`);
-    }
-    try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
-    await new Promise((r) => setTimeout(r, 2000));
-    // Find the first notice link. Doffin notice URLs look like
-    // /notices/<guid>/... or /nb/notices/... — match broadly.
-    const noticeUrl = await page.evaluate(() => {
-      const anchors = Array.from(document.querySelectorAll('a[href]'));
-      for (const a of anchors) {
-        const href = a.getAttribute('href') || '';
-        if (/\/notices?\/[0-9a-f-]{6,}/i.test(href) || /\/notice\/\d+/i.test(href)) {
-          try { return new URL(href, location.href).toString(); } catch (_) { return href; }
-        }
+    // Try each candidate term until one returns a notice link.
+    let noticeUrl = null;
+    for (const term of searchCandidates) {
+      const searchUrl = `https://www.doffin.no/search?searchString=${encodeURIComponent(term)}`;
+      console.log(`    🇳🇴 doffin: searching "${term.slice(0, 60)}" → ${searchUrl.slice(0, 90)}`);
+      try {
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+      } catch (e) {
+        console.log(`    🇳🇴 doffin: search nav warn: ${(e.message || '').slice(0, 80)}`);
       }
-      return null;
-    }).catch(() => null);
+      try { await page.waitForNetworkIdle({ idleTime: 1200, timeout: 12000 }); } catch (_) {}
+      await new Promise((r) => setTimeout(r, 2500));
+      // Find the first notice link. Doffin notice URLs vary across the
+      // current React SPA — match broadly: /notices/<id>, /notice/<id>,
+      // /nb|en/notices/..., or any anchor whose text/row is a result card.
+      const probe = await page.evaluate(() => {
+        const RX = /\/(?:notices?|kunngjoring|kunngjøring|anskaffelse)s?\/[0-9a-f-]{4,}/i;
+        const anchors = Array.from(document.querySelectorAll('a[href]'));
+        let hit = null;
+        for (const a of anchors) {
+          const href = a.getAttribute('href') || '';
+          if (RX.test(href)) { try { hit = new URL(href, location.href).toString(); } catch (_) { hit = href; } break; }
+        }
+        // result-count text ("Konkurranse (N)") to distinguish 0-hits from
+        // selector-miss.
+        const body = (document.body?.innerText || '').replace(/\s+/g, ' ');
+        const countM = body.match(/Konkurranse\s*\((\d+)\)/i);
+        return {
+          hit,
+          resultCount: countM ? parseInt(countM[1], 10) : null,
+          allHrefs: anchors.slice(0, 30).map((a) => (a.getAttribute('href') || '').slice(0, 80)).filter(h => h && h !== '/'),
+        };
+      }).catch(() => ({ hit: null, resultCount: null, allHrefs: [] }));
+      if (probe.hit) { noticeUrl = probe.hit; break; }
+      console.log(`    🇳🇴 doffin: "${term.slice(0, 40)}" → resultCount=${probe.resultCount}, 0 notice links. Hrefs: ${JSON.stringify((probe.allHrefs || []).slice(0, 14))}`);
+      // If the count is a positive number but our selector missed, no point
+      // trying more terms with the same selector — log and stop.
+      if (probe.resultCount && probe.resultCount > 0) {
+        console.log(`    🇳🇴 doffin: ⚠️ ${probe.resultCount} result(s) present but link selector missed — needs DOM tuning (see hrefs above)`);
+        break;
+      }
+    }
     if (!noticeUrl) {
-      // Diagnostic dump so we can tune the selector on a future run.
-      const diag = await page.evaluate(() => ({
-        url: location.href,
-        bodyPreview: (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 200),
-        anchorSample: Array.from(document.querySelectorAll('a[href]'))
-          .slice(0, 12).map((a) => (a.getAttribute('href') || '').slice(0, 70)),
-      })).catch(() => null);
-      console.log(`    🇳🇴 doffin: 0 notice links for "${searchTerm.slice(0, 40)}" — diag: ${JSON.stringify(diag).slice(0, 300)}`);
+      console.log(`    🇳🇴 doffin: no notice found across ${searchCandidates.length} search term(s)`);
       return [];
     }
     console.log(`    🇳🇴 doffin: opening notice ${noticeUrl.slice(0, 90)}`);
