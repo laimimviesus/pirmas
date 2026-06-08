@@ -11920,13 +11920,34 @@ async function fetchDoffinDocuments(browser, ctx = {}) {
         console.log(`    🇳🇴 doffin: portal delegation (${l.host}) failed: ${(e.message || '').slice(0, 80)}`);
       }
     }
-    // (b) always include the Doffin notice body — Norwegian notices often
-    // render Kvalifikasjonskrav / Tildelingskriterier inline.
-    if (harvest.body && harvest.body.length > 500) {
+    // (b) Include the Doffin notice body ONLY if it's plausibly the RIGHT
+    // tender. Run 113 lesson: full-text search by an ENGLISH title fuzzy-
+    // matched a WRONG 2022 notice (2022-924573) for a 2026 tender and we
+    // merged 1.6K of irrelevant text into pdfText. Guard: require either
+    // (1) we already delegated to a real portal handler (out has content),
+    // or (2) the notice body shares ≥2 significant tokens (len≥5) with the
+    // tender title. Otherwise DROP the body — injecting wrong-tender content
+    // is worse than leaving qualifications empty.
+    const delegated = out.length > 0;
+    if (!delegated && harvest.body && harvest.body.length > 500) {
+      const norm = (s) => String(s || '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+      const STOP = new Set(['procurement','framework','agreement','services','service','contract','tender','for','and','the','of','a','an','with','further','development','operation']);
+      const titleTokens = new Set(norm(title).filter((t) => t.length >= 5 && !STOP.has(t)));
+      const bodyLow = harvest.body.toLowerCase();
+      let overlap = 0;
+      for (const t of titleTokens) if (bodyLow.includes(t)) overlap++;
+      if (overlap >= 2) {
+        out.push(`--- (doffin notice) ${noticeUrl} ---\n${harvest.body}`);
+        console.log(`    🇳🇴 doffin: notice body accepted (${overlap} title-token match)`);
+      } else {
+        console.log(`    🇳🇴 doffin: notice body REJECTED — only ${overlap} title-token overlap (likely wrong/fuzzy match: ${noticeUrl.slice(-40)}), not merging to avoid wrong-tender data`);
+      }
+    } else if (delegated && harvest.body && harvest.body.length > 500) {
+      // Portal delegation already gave us the real docs — body is bonus.
       out.push(`--- (doffin notice) ${noticeUrl} ---\n${harvest.body}`);
     }
     if (!out.length) {
-      console.log(`    🇳🇴 doffin: notice reached but no portal docs or usable body text`);
+      console.log(`    🇳🇴 doffin: notice reached but no portal docs or relevant body text`);
       return [];
     }
     return out;
@@ -12176,77 +12197,101 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
           if (!username || !password) {
             console.log(`    ⚠️  mercell-tender: no MERCELL_USERNAME/PASSWORD env — cannot login`);
           } else {
-            const loggedIn = await page.evaluate((u, p) => {
-              const allInputs = Array.from(document.querySelectorAll('input'));
-              const visible = (el) => el && el.offsetParent !== null;
-              const userInput = allInputs.find((i) =>
-                visible(i) && /^(email|text)$/i.test(i.type) &&
-                /(email|user|login)/i.test((i.name || '') + ' ' + (i.id || '') + ' ' + (i.placeholder || ''))
-              ) || allInputs.find((i) => visible(i) && i.type === 'email');
-              const passInput = allInputs.find((i) => visible(i) && i.type === 'password');
-              if (!userInput || !passInput) return { ok: false, reason: 'no-fields' };
-              try {
-                userInput.focus();
-                userInput.value = u;
-                userInput.dispatchEvent(new Event('input', { bubbles: true }));
-                userInput.dispatchEvent(new Event('change', { bubbles: true }));
-                passInput.focus();
-                passInput.value = p;
-                passInput.dispatchEvent(new Event('input', { bubbles: true }));
-                passInput.dispatchEvent(new Event('change', { bubbles: true }));
-              } catch (e) {
-                return { ok: false, reason: 'fill-error', err: String(e).slice(0, 80) };
-              }
-              const submitBtn = Array.from(document.querySelectorAll(
-                'input[type="submit"], button[type="submit"], button'
-              )).find((b) => {
+            // 2026-06-08 — EMAIL-FIRST MULTI-STEP login. Run 113 confirmed
+            // my.mercell SsoLogOn.aspx shows ONLY an email field + "Login"
+            // button on step 1 (no password yet); the old single-page
+            // "need both fields visible" check returned no-fields and bailed.
+            // Now: fill email → click Login → wait → fill password → submit.
+            // Use Puppeteer page.type/click (real keystrokes/clicks) so the
+            // ASP.NET WebForms postback fires reliably.
+            const EMAIL_FINDER = (em) => {
+              const vis = (el) => el && el.offsetParent !== null && !el.disabled;
+              const ins = Array.from(document.querySelectorAll('input'));
+              const el = ins.find((i) => vis(i) && (i.type === 'email'
+                || (/^text$/i.test(i.type) && /(email|user|login|lvemail|commoncontent)/i.test((i.name || '') + (i.id || '') + (i.placeholder || '')))))
+                || ins.find((i) => vis(i) && i.type === 'email');
+              if (!el) return false;
+              document.querySelectorAll('[data-mx-mlogin]').forEach((e) => e.removeAttribute('data-mx-mlogin'));
+              el.setAttribute('data-mx-mlogin', 'email');
+              try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
+              return true;
+            };
+            // Click a login/next/submit control. Defined as a string-built
+            // function so it serialises cleanly into page.evaluate.
+            const CLICK_LOGIN = () => {
+              const cands = Array.from(document.querySelectorAll('input[type="submit"], button[type="submit"], button, a'));
+              const btn = cands.find((b) => {
                 if (b.disabled || b.offsetParent === null) return false;
-                const t = (b.value || b.innerText || '').trim().toLowerCase();
-                return /^(sign\s*in|log\s*in|logg?\s*på|login|inloggen|kirjaudu)/i.test(t)
-                    || /(ctl00.*btnLogin|ctl00.*btnSignIn|btnLogon)/i.test(b.name || b.id || '');
+                const t = (b.value || b.innerText || b.textContent || '').trim().toLowerCase();
+                return /^(sign\s*in|log\s*in|logg?\s*p[åa]|login|inloggen|kirjaudu|neste|next|continue|fortsett|videre)\b/i.test(t)
+                  || /(btnlogin|btnsignin|btnlogon|btnnext|btncontinue|loginbutton|nextbutton)/i.test((b.name || '') + (b.id || ''));
               });
-              if (!submitBtn) return { ok: false, reason: 'no-submit' };
-              try { submitBtn.click(); return { ok: true, button: submitBtn.value || submitBtn.innerText }; }
-              catch (e) { return { ok: false, reason: 'click-error', err: String(e).slice(0, 80) }; }
-            }, username, password).catch((e) => ({ ok: false, reason: 'evaluate-error', err: String(e).slice(0, 80) }));
-            if (loggedIn && loggedIn.reason === 'no-fields') {
-              // 2026-06-03 (Task #155 diag) — Path B selector found no
-              // visible inputs. Run 81 confirmed body has "E-mail /
-              // Remember me / Login" but selector returned no-fields.
-              // Dump ALL inputs (visible + hidden) so we can see why
-              // mercell's logon form is invisible to our heuristic.
+              if (!btn) return null;
+              try { btn.click(); return (btn.value || btn.innerText || '').trim().slice(0, 30) || 'login'; } catch (_) { return null; }
+            };
+            let mloginOk = false;
+            let mloginReason = '';
+            try {
+              const haveEmail = await page.evaluate(EMAIL_FINDER, username).catch(() => false);
+              if (!haveEmail) {
+                mloginReason = 'no-email-field';
+              } else {
+                try { await page.click('[data-mx-mlogin="email"]', { clickCount: 3 }); } catch (_) {}
+                await page.type('[data-mx-mlogin="email"]', username, { delay: 25 });
+                let hasPass = await page.$('input[type="password"]:not([disabled])');
+                if (!hasPass) {
+                  const advanced = await page.evaluate(CLICK_LOGIN).catch(() => null);
+                  console.log(`    🟦 mercell-tender: email submitted (advance="${advanced || 'none'}") — waiting for password step`);
+                  await Promise.race([
+                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null),
+                    new Promise((r) => setTimeout(r, 4000)),
+                  ]);
+                  await new Promise((r) => setTimeout(r, 1500));
+                  hasPass = await page.$('input[type="password"]:not([disabled])');
+                }
+                if (!hasPass) {
+                  mloginReason = 'no-password-after-advance';
+                } else {
+                  await page.evaluate(() => {
+                    const vis = (el) => el && el.offsetParent !== null && !el.disabled;
+                    const el = Array.from(document.querySelectorAll('input[type="password"]')).find(vis);
+                    if (el) {
+                      document.querySelectorAll('[data-mx-mlogin]').forEach((e) => e.removeAttribute('data-mx-mlogin'));
+                      el.setAttribute('data-mx-mlogin', 'pass');
+                      try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
+                    }
+                  }).catch(() => null);
+                  try { await page.click('[data-mx-mlogin="pass"]', { clickCount: 3 }); } catch (_) {}
+                  await page.type('[data-mx-mlogin="pass"]', password, { delay: 25 });
+                  const submitted = await page.evaluate(CLICK_LOGIN).catch(() => null);
+                  console.log(`    🟦 mercell-tender: password submitted (btn="${submitted || 'none'}") — waiting for auth round-trip`);
+                  await Promise.race([
+                    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => null),
+                    new Promise((r) => setTimeout(r, 5000)),
+                  ]);
+                  await new Promise((r) => setTimeout(r, 1500));
+                  const stillPass = await page.$('input[type="password"]:not([disabled]):not([aria-hidden="true"])');
+                  mloginOk = !stillPass;
+                  mloginReason = mloginOk ? 'ok' : 'password-field-still-present';
+                }
+              }
+            } catch (e) {
+              mloginReason = 'exception:' + (e.message || '').slice(0, 60);
+            }
+            if (mloginOk) {
+              console.log(`    ✅ mercell-tender: classic login OK — post-login URL: ${page.url().slice(0, 100)}`);
+            } else {
+              console.log(`    ⚠️  mercell-tender: classic login failed (${mloginReason})`);
+              // Diagnostic dump so we can tune the email/password selectors.
               const inputDump = await page.evaluate(() => {
                 const all = Array.from(document.querySelectorAll('input'));
                 return all.slice(0, 20).map((i) => ({
                   type: i.type, name: i.name, id: i.id,
                   placeholder: i.placeholder,
                   visible: i.offsetParent !== null,
-                  width: i.offsetWidth, height: i.offsetHeight,
-                  disp: window.getComputedStyle(i).display,
-                  vis: window.getComputedStyle(i).visibility,
                 }));
               }).catch(() => null);
-              const formDump = await page.evaluate(() => {
-                const forms = Array.from(document.querySelectorAll('form'));
-                return forms.map((f) => ({
-                  action: f.action, method: f.method,
-                  inputCount: f.querySelectorAll('input').length,
-                  visible: f.offsetParent !== null,
-                }));
-              }).catch(() => null);
-              console.log(`    🔍 mercell-tender no-fields diag — inputs: ${JSON.stringify(inputDump)}`);
-              console.log(`    🔍 mercell-tender no-fields diag — forms:  ${JSON.stringify(formDump)}`);
-            }
-            if (loggedIn && loggedIn.ok) {
-              console.log(`    🟦 mercell-tender: logon submitted ("${(loggedIn.button || '').slice(0, 30)}") — waiting for redirect`);
-              await Promise.race([
-                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null),
-                new Promise((r) => setTimeout(r, 5000)),
-              ]);
-              await new Promise((r) => setTimeout(r, 1500));
-              console.log(`    🟦 mercell-tender: post-login URL: ${page.url().slice(0, 100)}`);
-            } else {
-              console.log(`    ⚠️  mercell-tender: classic login failed (${loggedIn?.reason || '?'}${loggedIn?.err ? ', ' + loggedIn.err : ''})`);
+              console.log(`    🔍 mercell-tender login-fail diag — inputs: ${JSON.stringify(inputDump)}`);
             }
           }
         }
