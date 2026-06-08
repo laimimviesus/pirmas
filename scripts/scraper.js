@@ -12068,12 +12068,19 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     //   default.aspx STEP 2: Password field → submit → ReturnUrl back to tender.
     // (This is NOT SsoLogOn.aspx, which is SSO-only and has no password.)
     const mercellClassicLogin = async () => {
-      const username = process.env.MERCELL_USERNAME || '';
-      const password = process.env.MERCELL_PASSWORD || '';
+      // 2026-06-08 — creds come from PORTAL_CREDS_JSON["mercell.com"]
+      // FIRST (sales@cornercasetech.com), env MERCELL_USERNAME/PASSWORD
+      // only as fallback. Run 115 failed because the env username was a
+      // stale/wrong value; the authoritative login lives in the portal
+      // creds JSON.
+      const mCreds = getPortalCreds('mercell.com') || {};
+      const username = String(mCreds.username || process.env.MERCELL_USERNAME || '').trim();
+      const password = String(mCreds.password || process.env.MERCELL_PASSWORD || '');
       if (!username || !password) {
-        console.log(`    ⚠️  mercell-tender: no MERCELL_USERNAME/PASSWORD env — cannot login`);
+        console.log(`    ⚠️  mercell-tender: no mercell.com creds (PORTAL_CREDS_JSON or env) — cannot login`);
         return { ok: false, reason: 'no-creds' };
       }
+      console.log(`    🟦 mercell-tender: using creds for "${username}" (src=${mCreds.username ? 'PORTAL_CREDS_JSON' : 'env'})`);
       // Tag the username/email field. default.aspx uses lbUserInfo_text;
       // older flows use lvEmail_text — match both (+ generic hints).
       const USER_FINDER = () => {
@@ -12150,6 +12157,27 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         const inputDump = await page.evaluate(() => Array.from(document.querySelectorAll('input')).slice(0, 20)
           .map((i) => ({ type: i.type, name: i.name, id: i.id, visible: i.offsetParent !== null }))).catch(() => null);
         console.log(`    🔍 mercell-tender login-fail diag — inputs: ${JSON.stringify(inputDump)}`);
+        // Surface WHY: wrong-password popup, validation text, or other error.
+        const errDiag = await page.evaluate(() => {
+          const getVal = (id) => { const e = document.getElementById(id); return e ? (e.value || '') : null; };
+          const popupWrong = getVal('ctl00_commonContent_NewPopupWrongPassword__show');
+          const popupSend = getVal('ctl00_commonContent_NewPopupSendPassword__show');
+          // Any visible error/popup/validation text on the page.
+          const sel = '[class*="error" i], [class*="alert" i], [class*="popup" i], [role="alert"], .text-danger, .validation, [id*="Wrong" i], [id*="error" i]';
+          const msgs = Array.from(document.querySelectorAll(sel))
+            .map((el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim())
+            .filter((t) => t && t.length > 3 && t.length < 200);
+          return {
+            wrongPasswordPopup: popupWrong,
+            sendPasswordPopup: popupSend,
+            messages: Array.from(new Set(msgs)).slice(0, 5),
+            bodySnippet: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 220),
+          };
+        }).catch(() => null);
+        if (errDiag) {
+          console.log(`    🔍 mercell-tender login-fail why: wrongPwPopup=${JSON.stringify(errDiag.wrongPasswordPopup)} sendPwPopup=${JSON.stringify(errDiag.sendPasswordPopup)} msgs=${JSON.stringify(errDiag.messages)}`);
+          console.log(`    🔍 mercell-tender login-fail body: "${errDiag.bodySnippet}"`);
+        }
       }
       return { ok, reason };
     };
@@ -18695,7 +18723,12 @@ async function runScraper() {
         reqCell = `=HYPERLINK("${escForFormula(reqLink)}","${escForFormula(reqOut)}")`;
       }
       let qualCell = qualOut;
-      const qualLink = qualDriveLink || driveFolderLink || null;
+      // 2026-06-08 (user request) — M (Qualification requirements) must link
+      // ONLY to the SPECIFIC file where the qualification requirements are
+      // found, NEVER to the tender Drive folder. A folder link was
+      // misleading. If the specific source file can't be resolved, leave M
+      // as plain text (no link).
+      const qualLink = qualDriveLink || null;
       if (qualOut && qualLink) {
         qualCell = `=HYPERLINK("${escForFormula(qualLink)}","${escForFormula(qualOut)}")`;
       }
