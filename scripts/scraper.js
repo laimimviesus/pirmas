@@ -11993,10 +11993,24 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     && u.pathname.match(/^\/(\d+)\.aspx$/i);
   if (permalinkMatch) {
     const tenderId = permalinkMatch[1];
-    const rewritten = `https://my.mercell.com/m/mts/Tender.aspx?id=${tenderId}`;
-    console.log(`    🟦 mercell-tender: rewriting permalink (${u.host}) → ${rewritten}`);
-    sourceUrl = rewritten;
-    u = new URL(sourceUrl);
+    // 2026-06-08 — DO NOT rewrite to my.mercell.com/m/mts/Tender.aspx.
+    // Runs 110-114 proved that target is SSO-ONLY: SsoLogOn.aspx has NO
+    // password field (only email + "Remember me") and clicking "Login"
+    // raises "Single Sign On did not work properly with Mercell's SSO
+    // setup" — the SSO bridge from our app.mercell session is broken, so
+    // we could never reach the document list there.
+    //
+    // User inspection of tender 284856286 confirmed the permalink instead
+    // redirects to the PUBLIC tender page:
+    //   https://www.mercell.com/en/tender/<id>/<slug>-tender.aspx
+    // which carries the file list + "Show interest" (ctl00$main$btnDownloadInterest)
+    // + "Enable download" (ctl00$main$btnDownload) buttons and the
+    // rpFiles __doPostBack download links. So we navigate the permalink
+    // AS-IS and let Puppeteer follow the native 30x to www.mercell.com —
+    // the "Show interest"/"Enable download"/file-postback handlers below
+    // already know how to drive that page.
+    console.log(`    🟦 mercell-tender: permalink (${u.host}, id=${tenderId}) — following native redirect to www.mercell.com tender page (NOT my.mercell SSO)`);
+    // sourceUrl/u left unchanged.
   }
 
   const hostLabel = u.host;
@@ -12042,6 +12056,103 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         } catch (_) {}
       } catch (_) {}
     });
+
+    // 2026-06-08 — REUSABLE email-first classic login for Mercell's
+    // my.mercell.com/.../default.aspx logon page. User inspection (tender
+    // 285221645) confirmed the AUTHENTICATED document flow is:
+    //   www.mercell.com/.../tender.aspx  → click "Show interest"
+    //     → "Already registered" button  → my.mercell.com/en/m/logon/default.aspx
+    //   default.aspx STEP 1: Username field (ctl00$commonContent$lbUserInfo_text)
+    //                        + "Continue" link (ctl00$commonContent$newbutton1,
+    //                          fires WebForm_DoPostBackWithOptions(...,'Login',...))
+    //   default.aspx STEP 2: Password field → submit → ReturnUrl back to tender.
+    // (This is NOT SsoLogOn.aspx, which is SSO-only and has no password.)
+    const mercellClassicLogin = async () => {
+      const username = process.env.MERCELL_USERNAME || '';
+      const password = process.env.MERCELL_PASSWORD || '';
+      if (!username || !password) {
+        console.log(`    ⚠️  mercell-tender: no MERCELL_USERNAME/PASSWORD env — cannot login`);
+        return { ok: false, reason: 'no-creds' };
+      }
+      // Tag the username/email field. default.aspx uses lbUserInfo_text;
+      // older flows use lvEmail_text — match both (+ generic hints).
+      const USER_FINDER = () => {
+        const vis = (el) => el && el.offsetParent !== null && !el.disabled;
+        const ins = Array.from(document.querySelectorAll('input'));
+        const el = ins.find((i) => vis(i) && (i.type === 'email'
+          || (/^text$/i.test(i.type) && /(email|user|login|lvemail|lbuserinfo|userinfo|commoncontent)/i.test((i.name || '') + (i.id || '') + (i.placeholder || '')))))
+          || ins.find((i) => vis(i) && i.type === 'email');
+        if (!el) return false;
+        document.querySelectorAll('[data-mx-mlogin]').forEach((e) => e.removeAttribute('data-mx-mlogin'));
+        el.setAttribute('data-mx-mlogin', 'email');
+        try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
+        return true;
+      };
+      // Click Continue/Login/Next. Mercell's "Continue" is an <a id=newbutton1>
+      // whose onclick calls WebForm_DoPostBackWithOptions — a plain .click()
+      // fires it. Also matches input[type=submit]/buttons in other locales.
+      const CLICK_CONTINUE = () => {
+        const cands = Array.from(document.querySelectorAll('input[type="submit"], button[type="submit"], button, a'));
+        const btn = cands.find((b) => {
+          if (b.disabled || b.offsetParent === null) return false;
+          const t = (b.value || b.innerText || b.textContent || '').trim().toLowerCase();
+          return /^(sign\s*in|log\s*in|logg?\s*p[åa]|login|inloggen|kirjaudu|neste|next|continue|fortsett|videre|forts[æa]t)\b/i.test(t)
+            || /(newbutton1|btnlogin|btnsignin|btnlogon|btnnext|btncontinue|loginbutton|nextbutton)/i.test((b.name || '') + (b.id || ''));
+        });
+        if (!btn) return null;
+        try { btn.click(); return (btn.value || btn.innerText || '').trim().slice(0, 30) || 'continue'; } catch (_) { return null; }
+      };
+      let ok = false;
+      let reason = '';
+      try {
+        const haveUser = await page.evaluate(USER_FINDER).catch(() => false);
+        if (!haveUser) { return { ok: false, reason: 'no-username-field' }; }
+        try { await page.click('[data-mx-mlogin="email"]', { clickCount: 3 }); } catch (_) {}
+        await page.type('[data-mx-mlogin="email"]', username, { delay: 25 });
+        let hasPass = await page.$('input[type="password"]:not([disabled])').catch(() => null);
+        if (!hasPass) {
+          // STEP 1 → click Continue, wait for the postback to SETTLE before
+          // probing (probing mid-navigation hangs the protocol call, 180s).
+          const advanced = await page.evaluate(CLICK_CONTINUE).catch(() => null);
+          console.log(`    🟦 mercell-tender: username submitted (continue="${advanced || 'none'}") — waiting for password step`);
+          await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null);
+          await new Promise((r) => setTimeout(r, 1200));
+          await page.waitForSelector('input[type="password"]', { timeout: 10000 }).catch(() => null);
+          hasPass = await page.$('input[type="password"]:not([disabled])').catch(() => null);
+        }
+        if (!hasPass) { return { ok: false, reason: 'no-password-after-continue' }; }
+        // STEP 2 — password
+        await page.evaluate(() => {
+          const vis = (el) => el && el.offsetParent !== null && !el.disabled;
+          const el = Array.from(document.querySelectorAll('input[type="password"]')).find(vis);
+          if (el) {
+            document.querySelectorAll('[data-mx-mlogin]').forEach((e) => e.removeAttribute('data-mx-mlogin'));
+            el.setAttribute('data-mx-mlogin', 'pass');
+            try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
+          }
+        }).catch(() => null);
+        try { await page.click('[data-mx-mlogin="pass"]', { clickCount: 3 }); } catch (_) {}
+        await page.type('[data-mx-mlogin="pass"]', password, { delay: 25 });
+        const submitted = await page.evaluate(CLICK_CONTINUE).catch(() => null);
+        console.log(`    🟦 mercell-tender: password submitted (btn="${submitted || 'none'}") — waiting for auth round-trip`);
+        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null);
+        await new Promise((r) => setTimeout(r, 1800));
+        const stillPass = await page.$('input[type="password"]:not([disabled]):not([aria-hidden="true"])').catch(() => null);
+        ok = !stillPass;
+        reason = ok ? 'ok' : 'password-field-still-present';
+      } catch (e) {
+        reason = 'exception:' + (e.message || '').slice(0, 60);
+      }
+      if (ok) {
+        console.log(`    ✅ mercell-tender: classic login OK — post-login URL: ${page.url().slice(0, 100)}`);
+      } else {
+        console.log(`    ⚠️  mercell-tender: classic login failed (${reason})`);
+        const inputDump = await page.evaluate(() => Array.from(document.querySelectorAll('input')).slice(0, 20)
+          .map((i) => ({ type: i.type, name: i.name, id: i.id, visible: i.offsetParent !== null }))).catch(() => null);
+        console.log(`    🔍 mercell-tender login-fail diag — inputs: ${JSON.stringify(inputDump)}`);
+      }
+      return { ok, reason };
+    };
 
     console.log(`    🟦 mercell-tender: navigating to ${sourceUrl.slice(0, 100)}`);
     try {
@@ -12198,111 +12309,11 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
           }
         }
         if (!ssoClicked || (ssoClicked && typeof ssoClicked !== 'string')) {
-          // ─── Path B: classic email/password form (legacy fallback) ─
-          console.log(`    🟦 mercell-tender: no SSO anchor — trying classic email/password form`);
-          const username = process.env.MERCELL_USERNAME || '';
-          const password = process.env.MERCELL_PASSWORD || '';
-          if (!username || !password) {
-            console.log(`    ⚠️  mercell-tender: no MERCELL_USERNAME/PASSWORD env — cannot login`);
-          } else {
-            // 2026-06-08 — EMAIL-FIRST MULTI-STEP login. Run 113 confirmed
-            // my.mercell SsoLogOn.aspx shows ONLY an email field + "Login"
-            // button on step 1 (no password yet); the old single-page
-            // "need both fields visible" check returned no-fields and bailed.
-            // Now: fill email → click Login → wait → fill password → submit.
-            // Use Puppeteer page.type/click (real keystrokes/clicks) so the
-            // ASP.NET WebForms postback fires reliably.
-            const EMAIL_FINDER = (em) => {
-              const vis = (el) => el && el.offsetParent !== null && !el.disabled;
-              const ins = Array.from(document.querySelectorAll('input'));
-              const el = ins.find((i) => vis(i) && (i.type === 'email'
-                || (/^text$/i.test(i.type) && /(email|user|login|lvemail|commoncontent)/i.test((i.name || '') + (i.id || '') + (i.placeholder || '')))))
-                || ins.find((i) => vis(i) && i.type === 'email');
-              if (!el) return false;
-              document.querySelectorAll('[data-mx-mlogin]').forEach((e) => e.removeAttribute('data-mx-mlogin'));
-              el.setAttribute('data-mx-mlogin', 'email');
-              try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
-              return true;
-            };
-            // Click a login/next/submit control. Defined as a string-built
-            // function so it serialises cleanly into page.evaluate.
-            const CLICK_LOGIN = () => {
-              const cands = Array.from(document.querySelectorAll('input[type="submit"], button[type="submit"], button, a'));
-              const btn = cands.find((b) => {
-                if (b.disabled || b.offsetParent === null) return false;
-                const t = (b.value || b.innerText || b.textContent || '').trim().toLowerCase();
-                return /^(sign\s*in|log\s*in|logg?\s*p[åa]|login|inloggen|kirjaudu|neste|next|continue|fortsett|videre)\b/i.test(t)
-                  || /(btnlogin|btnsignin|btnlogon|btnnext|btncontinue|loginbutton|nextbutton)/i.test((b.name || '') + (b.id || ''));
-              });
-              if (!btn) return null;
-              try { btn.click(); return (btn.value || btn.innerText || '').trim().slice(0, 30) || 'login'; } catch (_) { return null; }
-            };
-            let mloginOk = false;
-            let mloginReason = '';
-            try {
-              const haveEmail = await page.evaluate(EMAIL_FINDER, username).catch(() => false);
-              if (!haveEmail) {
-                mloginReason = 'no-email-field';
-              } else {
-                try { await page.click('[data-mx-mlogin="email"]', { clickCount: 3 }); } catch (_) {}
-                await page.type('[data-mx-mlogin="email"]', username, { delay: 25 });
-                let hasPass = await page.$('input[type="password"]:not([disabled])').catch(() => null);
-                if (!hasPass) {
-                  // Email-first: click Login, then wait for the postback/IdP
-                  // redirect to SETTLE before probing. Run 114: probing with
-                  // page.$ while navigation was in-flight hung the protocol
-                  // call (Runtime.callFunctionOn timed out, 180s).
-                  const advanced = await page.evaluate(CLICK_LOGIN).catch(() => null);
-                  console.log(`    🟦 mercell-tender: email submitted (advance="${advanced || 'none'}") — waiting for password step`);
-                  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null);
-                  await new Promise((r) => setTimeout(r, 1200));
-                  await page.waitForSelector('input[type="password"]', { timeout: 10000 }).catch(() => null);
-                  hasPass = await page.$('input[type="password"]:not([disabled])').catch(() => null);
-                }
-                if (!hasPass) {
-                  mloginReason = 'no-password-after-advance';
-                } else {
-                  await page.evaluate(() => {
-                    const vis = (el) => el && el.offsetParent !== null && !el.disabled;
-                    const el = Array.from(document.querySelectorAll('input[type="password"]')).find(vis);
-                    if (el) {
-                      document.querySelectorAll('[data-mx-mlogin]').forEach((e) => e.removeAttribute('data-mx-mlogin'));
-                      el.setAttribute('data-mx-mlogin', 'pass');
-                      try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
-                    }
-                  }).catch(() => null);
-                  try { await page.click('[data-mx-mlogin="pass"]', { clickCount: 3 }); } catch (_) {}
-                  await page.type('[data-mx-mlogin="pass"]', password, { delay: 25 });
-                  const submitted = await page.evaluate(CLICK_LOGIN).catch(() => null);
-                  console.log(`    🟦 mercell-tender: password submitted (btn="${submitted || 'none'}") — waiting for auth round-trip`);
-                  // Wait for the auth navigation to SETTLE before probing
-                  // (same protocol-timeout hazard as the email step).
-                  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null);
-                  await new Promise((r) => setTimeout(r, 1800));
-                  const stillPass = await page.$('input[type="password"]:not([disabled]):not([aria-hidden="true"])').catch(() => null);
-                  mloginOk = !stillPass;
-                  mloginReason = mloginOk ? 'ok' : 'password-field-still-present';
-                }
-              }
-            } catch (e) {
-              mloginReason = 'exception:' + (e.message || '').slice(0, 60);
-            }
-            if (mloginOk) {
-              console.log(`    ✅ mercell-tender: classic login OK — post-login URL: ${page.url().slice(0, 100)}`);
-            } else {
-              console.log(`    ⚠️  mercell-tender: classic login failed (${mloginReason})`);
-              // Diagnostic dump so we can tune the email/password selectors.
-              const inputDump = await page.evaluate(() => {
-                const all = Array.from(document.querySelectorAll('input'));
-                return all.slice(0, 20).map((i) => ({
-                  type: i.type, name: i.name, id: i.id,
-                  placeholder: i.placeholder,
-                  visible: i.offsetParent !== null,
-                }));
-              }).catch(() => null);
-              console.log(`    🔍 mercell-tender login-fail diag — inputs: ${JSON.stringify(inputDump)}`);
-            }
-          }
+          // ─── Path B: classic email-first login (default.aspx) ────────
+          // We landed directly on a logon page (permalink redirected
+          // straight to login). Run the reusable email-first login.
+          console.log(`    🟦 mercell-tender: no SSO redirect — running classic email-first login`);
+          await mercellClassicLogin();
         }
       }
     }
@@ -12380,6 +12391,68 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         new Promise((r) => setTimeout(r, 4000)),
       ]);
       await new Promise((r) => setTimeout(r, 2000));
+    }
+
+    // 2026-06-08 — "Already registered" gate → authenticated login.
+    //
+    // User inspection (tender 285221645): after "Show interest", an
+    // "Already registered" button appears. Clicking it redirects to
+    //   my.mercell.com/en/m/logon/default.aspx?ReturnUrl=<tender>&auth0done=true
+    // which is the REAL classic login (Username → Continue → Password),
+    // NOT the SSO-only SsoLogOn.aspx. After login the ReturnUrl brings us
+    // back to the tender page with showinterest=true and live file links.
+    //
+    // EN "Already registered"  NO "Allerede registrert"  SE "Redan registrerad"
+    // DA "Allerede registreret" FI "Jo rekisteröitynyt"  DE "Bereits registriert"
+    const alreadyRegClicked = await page.evaluate(() => {
+      const RE = /\b(already\s+registered|allerede\s+registr(ert|eret)|redan\s+registrerad|jo\s+rekister[öo]itynyt|bereits\s+registriert|d[ée]j[àa]\s+inscrit|al\s+geregistreerd)\b/i;
+      const cands = Array.from(document.querySelectorAll('input[type="submit"], input[type="button"], button, a'));
+      for (const el of cands) {
+        if (el.disabled || el.offsetParent === null) continue;
+        const t = (el.value || el.innerText || el.textContent || '').trim();
+        if (t && RE.test(t)) {
+          try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
+          el.click();
+          return t.slice(0, 40);
+        }
+      }
+      return null;
+    }).catch(() => null);
+    if (alreadyRegClicked) {
+      console.log(`    🟦 mercell-tender: clicked "Already registered" ("${alreadyRegClicked}") — expecting login redirect`);
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null);
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    // If we are now (or were already) on a Mercell logon page, authenticate.
+    if (/\/m\/logon\/|logon\.aspx|default\.aspx/i.test(page.url())) {
+      console.log(`    🟦 mercell-tender: on logon page (${page.url().slice(0, 90)}) — authenticating`);
+      const loginRes = await mercellClassicLogin();
+      if (loginRes.ok) {
+        // After login the ReturnUrl should land us back on the tender page.
+        // Give the redirect a moment; if still on a logon URL, navigate to
+        // the original tender source explicitly.
+        await new Promise((r) => setTimeout(r, 1500));
+        if (/\/m\/logon\/|logon\.aspx/i.test(page.url())) {
+          try {
+            await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+            await new Promise((r) => setTimeout(r, 1500));
+          } catch (_) {}
+        }
+        console.log(`    🟦 mercell-tender: post-login back on ${page.url().slice(0, 90)}`);
+        // Re-click "Show interest" if the returned page shows it again
+        // (some tenders require it post-auth before files unlock).
+        const reInterest = await page.evaluate(() => {
+          const b = document.querySelector('input[name="ctl00$main$btnDownloadInterest"]')
+            || document.querySelector('input[id="ctl00_main_btnDownloadInterest"]');
+          if (b && !b.disabled && b.offsetParent !== null) { try { b.scrollIntoView({ block: 'center' }); } catch (_) {} b.click(); return true; }
+          return false;
+        }).catch(() => false);
+        if (reInterest) {
+          console.log(`    🟦 mercell-tender: re-clicked "Show interest" after login — waiting`);
+          await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => null);
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
     }
 
     // 2026-05-19 — "Enable download" click (Mercell classic ASP.NET).
@@ -12619,9 +12692,76 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
       }
     }
 
+    // 2026-06-08 — POSTBACK FILE DOWNLOADS (rpFiles ZIP/PDF).
+    // After auth, Mercell renders the document list as ASP.NET __doPostBack
+    // anchors (e.g. ctl00$main$rpFiles$ctl01$ctl00 → "Konk.gr.l ....zip").
+    // These are NOT plain hrefs — the in-page fetch loop above skips
+    // javascript: links — clicking them triggers a server postback that
+    // STREAMS the file as an attachment (no navigation). Capture via CDP
+    // download interception. The first .zip is usually the full bundle.
+    try {
+      const fs = require('fs');
+      const os = require('os');
+      const path = require('path');
+      const postbackFiles = await page.evaluate(() => {
+        const EXT = /\.(zip|pdf|docx?|xlsx?|rtf|odt|ods|7z|rar)(\b|$)/i;
+        const out = [];
+        for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+          const href = a.getAttribute('href') || '';
+          const onclick = a.getAttribute('onclick') || '';
+          const txt = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
+          const m = (href + ' ' + onclick).match(/__doPostBack\(\s*['"]([^'"]+)['"]/);
+          if (!m) continue;
+          if (!EXT.test(txt)) continue; // only file-looking links
+          out.push({ target: m[1], text: txt.slice(0, 80) });
+        }
+        return out.slice(0, 4);
+      }).catch(() => []);
+      if (postbackFiles.length) {
+        console.log(`    🟦 mercell-tender: ${postbackFiles.length} postback file link(s) — downloading via CDP`);
+        const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mercell-dl-'));
+        let cdp = null;
+        try {
+          cdp = await page.target().createCDPSession();
+          await cdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: downloadDir });
+        } catch (e) {
+          console.log(`    ⚠️  mercell-tender: CDP download setup failed: ${(e.message || '').slice(0, 80)}`);
+        }
+        for (const pf of postbackFiles) {
+          try {
+            const before = new Set(fs.readdirSync(downloadDir));
+            await page.evaluate((t) => { try { __doPostBack(t, ''); } catch (_) {} }, pf.target);
+            let newFile = null;
+            for (let i = 0; i < 30; i++) { // up to ~15s, ignore partial .crdownload
+              await new Promise((r) => setTimeout(r, 500));
+              const now = fs.readdirSync(downloadDir).filter((f) => !before.has(f) && !/\.crdownload$/i.test(f));
+              if (now.length) { newFile = now[0]; break; }
+            }
+            if (!newFile) { console.log(`    ⚠️  mercell-tender: postback "${pf.text.slice(0, 40)}" produced no download`); continue; }
+            const buf = fs.readFileSync(path.join(downloadDir, newFile));
+            const text = await parseBuffer(pf.text || newFile, buf);
+            if (text && text.length > 100) {
+              const clip = text.slice(0, 30000);
+              texts.push(`--- (mercell-doc) ${(pf.text || newFile).slice(0, 80)} ---\n${clip}`);
+              console.log(`    ✓ mercell-tender: parsed postback "${pf.text.slice(0, 50)}" (${buf.length}B → ${clip.length}ch)`);
+            } else {
+              console.log(`    ⚠️  mercell-tender: postback "${pf.text.slice(0, 40)}" → ${buf.length}B but no usable text`);
+            }
+            try { fs.unlinkSync(path.join(downloadDir, newFile)); } catch (_) {}
+          } catch (e) {
+            console.log(`    ⚠️  mercell-tender: postback download error for "${pf.text.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+          }
+        }
+        try { if (cdp) await cdp.detach(); } catch (_) {}
+        try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch (_) {}
+      }
+    } catch (e) {
+      console.log(`    ⚠️  mercell-tender: postback download block error: ${(e.message || '').slice(0, 100)}`);
+    }
+
     const sourceFilesText = texts.join('\n\n');
     const elapsed = Date.now() - t0;
-    console.log(`    🟦 mercell-tender: done in ${elapsed}ms — extracted ${texts.length}/${targets.length} docs, ${sourceFilesText.length}ch total`);
+    console.log(`    🟦 mercell-tender: done in ${elapsed}ms — extracted ${texts.length} docs (fetch+postback), ${sourceFilesText.length}ch total`);
 
     return {
       sourceHost: hostLabel,
