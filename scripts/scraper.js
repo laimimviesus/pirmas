@@ -12016,6 +12016,14 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
   try {
     page = await browser.newPage();
     page.setDefaultNavigationTimeout(15000);
+    // 2026-06-08 — auto-dismiss any native JS dialog (alert/confirm/prompt).
+    // The my.mercell SsoLogOn.aspx form fires a client-side validation
+    // alert if "Login" is clicked with an empty password; a blocking
+    // dialog freezes the renderer and makes every page.evaluate hang until
+    // protocolTimeout (180s) → "Runtime.callFunctionOn timed out" (run 114).
+    page.on('dialog', async (d) => {
+      try { console.log(`    🟦 mercell-tender: auto-dismissing dialog "${(d.message() || '').slice(0, 60)}"`); await d.dismiss(); } catch (_) {}
+    });
 
     // Capture all JSON responses for diagnostic — helps identify the
     // documents endpoint if/when Mercell exposes one we don't know.
@@ -12238,16 +12246,18 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
               } else {
                 try { await page.click('[data-mx-mlogin="email"]', { clickCount: 3 }); } catch (_) {}
                 await page.type('[data-mx-mlogin="email"]', username, { delay: 25 });
-                let hasPass = await page.$('input[type="password"]:not([disabled])');
+                let hasPass = await page.$('input[type="password"]:not([disabled])').catch(() => null);
                 if (!hasPass) {
+                  // Email-first: click Login, then wait for the postback/IdP
+                  // redirect to SETTLE before probing. Run 114: probing with
+                  // page.$ while navigation was in-flight hung the protocol
+                  // call (Runtime.callFunctionOn timed out, 180s).
                   const advanced = await page.evaluate(CLICK_LOGIN).catch(() => null);
                   console.log(`    🟦 mercell-tender: email submitted (advance="${advanced || 'none'}") — waiting for password step`);
-                  await Promise.race([
-                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null),
-                    new Promise((r) => setTimeout(r, 4000)),
-                  ]);
-                  await new Promise((r) => setTimeout(r, 1500));
-                  hasPass = await page.$('input[type="password"]:not([disabled])');
+                  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null);
+                  await new Promise((r) => setTimeout(r, 1200));
+                  await page.waitForSelector('input[type="password"]', { timeout: 10000 }).catch(() => null);
+                  hasPass = await page.$('input[type="password"]:not([disabled])').catch(() => null);
                 }
                 if (!hasPass) {
                   mloginReason = 'no-password-after-advance';
@@ -12265,12 +12275,11 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
                   await page.type('[data-mx-mlogin="pass"]', password, { delay: 25 });
                   const submitted = await page.evaluate(CLICK_LOGIN).catch(() => null);
                   console.log(`    🟦 mercell-tender: password submitted (btn="${submitted || 'none'}") — waiting for auth round-trip`);
-                  await Promise.race([
-                    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => null),
-                    new Promise((r) => setTimeout(r, 5000)),
-                  ]);
-                  await new Promise((r) => setTimeout(r, 1500));
-                  const stillPass = await page.$('input[type="password"]:not([disabled]):not([aria-hidden="true"])');
+                  // Wait for the auth navigation to SETTLE before probing
+                  // (same protocol-timeout hazard as the email step).
+                  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null);
+                  await new Promise((r) => setTimeout(r, 1800));
+                  const stillPass = await page.$('input[type="password"]:not([disabled]):not([aria-hidden="true"])').catch(() => null);
                   mloginOk = !stillPass;
                   mloginReason = mloginOk ? 'ok' : 'password-field-still-present';
                 }
