@@ -14972,6 +14972,15 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         } catch (_) { /* ignore */ }
       };
       if (json && typeof json === 'object') {
+        // 2026-06-08 TEMP DEBUG — unconditional raw dump of originalNotices &
+        // related fields (dumpField hides known "TODO" stubs, so we never see
+        // them). Confirms whether Mercell exposes any usable Doffin/artifik
+        // URL or just a stub. REMOVE after diagnosis.
+        try {
+          console.log(`    🐞 DEBUG originalNotices raw: ${JSON.stringify(json.originalNotices)}`);
+          console.log(`    🐞 DEBUG externalReferences raw: ${JSON.stringify(json.externalReferences)}`);
+          console.log(`    🐞 DEBUG fileReferenceNumber raw: ${JSON.stringify(json.fileReferenceNumber)}`);
+        } catch (_) {}
         dumpField('fileReferenceNumber', json.fileReferenceNumber);
         dumpField('originalNotices', json.originalNotices);
         dumpField('publicationNumber', json.publicationNumber);
@@ -16070,6 +16079,24 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
               console.log(`      · ${t}`);
             }
             continue;
+          }
+
+          // 2026-06-08 TEMP DEBUG (Norway/artifik routing) — for OriginalNotice
+          // files (Contract Doffin / Contract TED) dump the FULL raw bytes and
+          // any embedded URLs. The XML text-extractor strips tags (→ ~28ch in
+          // logs), so a doffin.no / app.artifik.no link living in an attribute
+          // or element would be invisible. This shows whether Mercell embeds a
+          // usable public-portal URL we could follow. REMOVE after diagnosis.
+          if (/doffin|\bted\b|original\s*notice|kunngj|notice/i.test(f.name)) {
+            try {
+              const rawTxt = bytes.toString('utf8');
+              const urlHits = (rawTxt.match(/https?:\/\/[^\s"'<>]+/gi) || []).slice(0, 40);
+              console.log(`    🐞 DEBUG OriginalNotice "${f.name}" (${f.ext}, ${bytes.length}B) from ${String(okUrl).slice(0, 90)}`);
+              console.log(`    🐞 DEBUG raw bytes (full, ${bytes.length}B): ${rawTxt.replace(/\s+/g, ' ').slice(0, 3000)}`);
+              console.log(`    🐞 DEBUG URLs found (${urlHits.length}): ${urlHits.join(' | ') || '(none)'}`);
+            } catch (dbgErr) {
+              console.log(`    🐞 DEBUG dump failed for "${f.name}": ${(dbgErr.message || dbgErr)}`);
+            }
           }
 
           try {
