@@ -6776,7 +6776,15 @@ async function fetchArtifikDocuments(browser, sourceUrl) {
               } catch (_) {}
               if (innerTxt && innerTxt.length > 100) {
                 const clipped = innerTxt.slice(0, 60000);
-                zipParts.push(`--- ${z.entryName.slice(-100)} ---\n${clipped}`);
+                // 2026-06-08 — prefix with "(artifik ZIP)" so the AI prompt's
+                // "--- (handler) <filename> ---" pattern matches and
+                // qualificationsSourceFile / requirementsSourceFile get a real
+                // filename → M/L columns become clickable HYPERLINKs (Task #168).
+                // Previously the header was "--- <filename> ---" (no handler
+                // prefix), so the AI often returned an empty source-file and
+                // the qualification link silently dropped to plain text.
+                const innerName = z.entryName.split('/').pop().slice(-100);
+                zipParts.push(`--- (artifik ZIP) ${innerName} ---\n${clipped}`);
                 console.log(`    📦 artifik zip entry "${z.entryName.slice(-80)}" (${innerBuf.length}B → ${clipped.length}ch)`);
                 // No _collectDriveFile call here — Task #165 auto-unwrap
                 // already extracts and registers every ZIP entry once.
@@ -18192,14 +18200,22 @@ async function runScraper() {
       //   - qualificationsSourceFile
       // If filename matches a Drive upload, wrap cell in =HYPERLINK.
       const reqSourceFile = (d.requirementsSourceFile || qualSourceFile || '').trim();
+      // 2026-06-08 — fallback chain: specific Drive file → tender Drive folder.
+      // Previously, if the exact source file couldn't be resolved the cell
+      // stayed plain text (no link). Now, whenever ANY file was uploaded for
+      // this tender we still link the cell to the tender's Drive folder, so the
+      // user can always reach the documents the info was taken from ("kur ją
+      // galima rasti"). Only stays plain text when nothing was uploaded.
       let reqCell = reqOut;
       const reqDriveLink = reqSourceFile ? resolveDriveFile(reqSourceFile) : null;
-      if (reqOut && reqDriveLink) {
-        reqCell = `=HYPERLINK("${escForFormula(reqDriveLink)}","${escForFormula(reqOut)}")`;
+      const reqLink = reqDriveLink || driveFolderLink || null;
+      if (reqOut && reqLink) {
+        reqCell = `=HYPERLINK("${escForFormula(reqLink)}","${escForFormula(reqOut)}")`;
       }
       let qualCell = qualOut;
-      if (qualOut && qualDriveLink) {
-        qualCell = `=HYPERLINK("${escForFormula(qualDriveLink)}","${escForFormula(qualOut)}")`;
+      const qualLink = qualDriveLink || driveFolderLink || null;
+      if (qualOut && qualLink) {
+        qualCell = `=HYPERLINK("${escForFormula(qualLink)}","${escForFormula(qualOut)}")`;
       }
       return [
         nowIso,                                                  // A — DATE ADDED
