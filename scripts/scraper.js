@@ -12128,20 +12128,41 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
           hasPass = await page.$('input[type="password"]:not([disabled])').catch(() => null);
         }
         if (!hasPass) { return { ok: false, reason: 'no-password-after-continue' }; }
-        // STEP 2 — password
-        await page.evaluate(() => {
-          const vis = (el) => el && el.offsetParent !== null && !el.disabled;
-          const el = Array.from(document.querySelectorAll('input[type="password"]')).find(vis);
-          if (el) {
-            document.querySelectorAll('[data-mx-mlogin]').forEach((e) => e.removeAttribute('data-mx-mlogin'));
-            el.setAttribute('data-mx-mlogin', 'pass');
-            try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
-          }
-        }).catch(() => null);
-        try { await page.click('[data-mx-mlogin="pass"]', { clickCount: 3 }); } catch (_) {}
-        await page.type('[data-mx-mlogin="pass"]', password, { delay: 25 });
-        const submitted = await page.evaluate(CLICK_CONTINUE).catch(() => null);
-        console.log(`    🟦 mercell-tender: password submitted (btn="${submitted || 'none'}") — waiting for auth round-trip`);
+        // STEP 2 — password. Run 116: after username+Continue, Mercell
+        // redirects to Auth0 Universal Login (auth.mercell.com/u/login/password,
+        // a React SPA) with input#password. The previous approach (tag via
+        // evaluate → type → click "Continue") failed: CLICK_CONTINUE found
+        // no button (btn="none") so the form never submitted. Auth0 forms
+        // submit reliably on ENTER. Let the SPA hydrate, type directly into
+        // the field, verify the value registered, then press Enter (with a
+        // submit-button click as fallback).
+        await new Promise((r) => setTimeout(r, 1200)); // allow Auth0 hydration
+        const passHandle = await page.$('input[type="password"]:not([disabled])').catch(() => null);
+        if (!passHandle) { return { ok: false, reason: 'password-handle-lost' }; }
+        try { await passHandle.click({ clickCount: 3 }); } catch (_) {}
+        await passHandle.type(password, { delay: 30 });
+        // Verify the value actually landed in the field (React can reset it).
+        const typedLen = await page.evaluate(() => {
+          const el = Array.from(document.querySelectorAll('input[type="password"]')).find((e) => e.offsetParent !== null);
+          return el ? (el.value || '').length : -1;
+        }).catch(() => -1);
+        console.log(`    🟦 mercell-tender: password typed (field len=${typedLen}) — submitting via Enter`);
+        let submittedVia = 'enter';
+        try { await passHandle.press('Enter'); } catch (_) { try { await page.keyboard.press('Enter'); } catch (_) {} }
+        // Fallback: if still on the password page after a beat, click the
+        // primary submit button (Auth0: button[type=submit][name=action]).
+        await new Promise((r) => setTimeout(r, 1500));
+        const stillHasPassNow = await page.$('input[type="password"]:not([disabled])').catch(() => null);
+        if (stillHasPassNow) {
+          const clicked = await page.evaluate(() => {
+            const btn = document.querySelector('button[type="submit"][name="action"]')
+              || Array.from(document.querySelectorAll('button, input[type="submit"]')).find((b) => b.offsetParent !== null && /continue|log\s*in|sign\s*in|submit/i.test((b.value || b.innerText || b.textContent || '')));
+            if (btn) { try { btn.click(); return true; } catch (_) {} }
+            return false;
+          }).catch(() => false);
+          if (clicked) submittedVia = 'enter+button';
+        }
+        console.log(`    🟦 mercell-tender: password submitted (via=${submittedVia}) — waiting for auth round-trip`);
         await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null);
         await new Promise((r) => setTimeout(r, 1800));
         const stillPass = await page.$('input[type="password"]:not([disabled]):not([aria-hidden="true"])').catch(() => null);
@@ -12457,11 +12478,13 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
       const loginRes = await mercellClassicLogin();
       if (loginRes.ok) {
         // After login the ReturnUrl should land us back on the tender page.
-        // Give the redirect a moment; if still on a logon URL, navigate to
-        // the original tender source explicitly.
+        // Auth0 may instead leave us on auth.mercell.com or a my.mercell
+        // dashboard, so explicitly navigate back to the tender source
+        // unless we're already on a www.mercell.com /tender/ page.
         await new Promise((r) => setTimeout(r, 1500));
-        if (/\/m\/logon\/|logon\.aspx/i.test(page.url())) {
+        if (!/(^|\.)mercell\.com$/i.test((() => { try { return new URL(page.url()).hostname; } catch (_) { return ''; } })()) || !/\/tender\//i.test(page.url())) {
           try {
+            console.log(`    🟦 mercell-tender: not on tender page (${page.url().slice(0, 70)}) — navigating back to source`);
             await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
             await new Promise((r) => setTimeout(r, 1500));
           } catch (_) {}
