@@ -15373,6 +15373,22 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         if (head.startsWith('{') || head.startsWith('[')) return 'json';
         return 'unknown';
       };
+      // 2026-06-08 — Mercell SPA shell detector. The OriginalNotice file
+      // endpoints (app.mercell.com/files/<id>/download for "Contract Doffin /
+      // TED / MeForm / EUSupply") frequently return the Angular/React app
+      // shell (857B "<!doctype html>…<div id=root></div>…main.<hash>.js")
+      // instead of the real eForms XML. detectFormat() calls any "<…>" payload
+      // 'html' and the xml branch accepted 'html', so the shell was wrongly
+      // accepted as the notice XML — the fetch loop then stopped at that first
+      // bad URL and never tried the alternate endpoints that can return the
+      // real XML (which embeds the doffin.no / eu-supply portal link).
+      const isMercellSpaShell = (buf) => {
+        if (!buf || buf.length > 4000) return false; // real notices are larger
+        let head = '';
+        try { head = buf.slice(0, 1200).toString('utf8'); } catch (_) { return false; }
+        return /<div id="root">/i.test(head) &&
+          /(browser-check\.js|supportedBrowsers\.js|main\.[0-9a-f]+\.js|polyfills\.[0-9a-f]+\.js)/i.test(head);
+      };
       const magicMatchesExt = (buf, ext) => {
         const got = detectFormat(buf);
         const ex = String(ext || '').toLowerCase();
@@ -15380,6 +15396,9 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         if (ex === 'docx' || ex === 'xlsx' || ex === 'odt' || ex === 'ods' || ex === 'zip') return got === 'zip';
         if (ex === 'doc' || ex === 'xls') return got === 'cfb';
         if (ex === 'rtf') return got === 'rtf';
+        // Reject the Mercell SPA shell for text-ish formats so the fetch loop
+        // keeps trying other endpoints instead of accepting an empty app page.
+        if ((ex === 'txt' || ex === 'xml' || ex === 'json') && isMercellSpaShell(buf)) return false;
         if (ex === 'txt') return got !== 'html'; // accept anything plausible
         // XML — accept anything that detectFormat classified as 'html'
         // (which covers `<?xml`, `<html`, and any other `<…>`-prefixed
@@ -18235,7 +18254,12 @@ async function runScraper() {
       // galima rasti"). Only stays plain text when nothing was uploaded.
       let reqCell = reqOut;
       const reqDriveLink = reqSourceFile ? resolveDriveFile(reqSourceFile) : null;
-      const reqLink = reqDriveLink || driveFolderLink || null;
+      // 2026-06-08 (user request) — L (Requirements for supplier) must link
+      // ONLY to a specific resolved file, NEVER to the tender Drive folder.
+      // A folder link here was misleading (looked like a doc link but opened a
+      // directory). If the specific source file can't be resolved, leave L as
+      // plain text.
+      const reqLink = reqDriveLink || null;
       if (reqOut && reqLink) {
         reqCell = `=HYPERLINK("${escForFormula(reqLink)}","${escForFormula(reqOut)}")`;
       }
@@ -18244,6 +18268,15 @@ async function runScraper() {
       if (qualOut && qualLink) {
         qualCell = `=HYPERLINK("${escForFormula(qualLink)}","${escForFormula(qualOut)}")`;
       }
+      // 2026-06-08 TEMP DEBUG — diagnose why L/M don't link to a SPECIFIC file.
+      // Shows the AI-returned source filenames vs the actual Drive upload keys,
+      // so we can tell whether the AI omitted the source file (empty) or
+      // returned a name that doesn't match any uploaded file. REMOVE after fix.
+      try {
+        if (qualOut || reqOut) {
+          console.log(`    🐞 DEBUG L/M link: reqSrc="${reqSourceFile}" (link=${reqDriveLink ? 'FILE' : '-'}) | qualSrc="${qualSourceFile}" (link=${qualDriveLink ? 'FILE' : (driveFolderLink ? 'FOLDER-fallback' : '-')}) | driveKeys=[${Object.keys(driveFiles).join(' | ')}]`);
+        }
+      } catch (_) {}
       return [
         nowIso,                                                  // A — DATE ADDED
         fmtDate(d.publicationDate || t.publicationDate || ''),   // B — BIDDING ANNOUCEMENT DATE
