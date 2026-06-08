@@ -11766,6 +11766,152 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
 //   6. Return { sourceFilesText, bodyTextPreview, sourceHost, ... }
 //      shape compatible with fetchSourcePageDetails.
 // =====================================================================
+// =====================================================================
+// fetchDoffinDocuments  (2026-06-08, part-b)
+// ---------------------------------------------------------------------
+// Norway fallback. Mercell hands Norwegian tenders as permalink.mercell.com
+// → my.mercell.com (login wall) and the OriginalNotice "Contract Doffin"
+// file IDs only return Mercell's marketing webpage — so the qualification
+// docs are unreachable via Mercell. Every Norwegian tender, however, has a
+// PUBLIC notice on doffin.no (no login) that links out to the actual
+// tendering system (app.artifik.no, eu.eu-supply.com, kommersannons, etc.)
+// where the Konkurransegrunnlag / Kvalifikasjonskrav live anonymously.
+//
+// Strategy (best-effort, diagnostic-heavy — Doffin is a React SPA, exact
+// DOM may shift; we log generously so selectors can be tuned over runs):
+//   1. Search https://www.doffin.no/search?searchString=<ref or title>
+//   2. Open the first matching notice (/notices/<id>...)
+//   3. Capture the notice body innerText (often carries selection criteria
+//      inline) AND harvest external "competition documents" links.
+//   4. If an external link points to a portal we already handle
+//      (artifik.no / eu-supply), delegate to that handler so the real
+//      documents get downloaded + parsed.
+//   5. Return [text blocks]. No-op (returns []) if nothing usable found.
+//
+// ctx = { referenceNumber, title, country }
+// =====================================================================
+async function fetchDoffinDocuments(browser, ctx = {}) {
+  const ref = (ctx.referenceNumber || '').trim();
+  const title = (ctx.title || '').trim();
+  const searchTerm = ref && ref.length >= 4 ? ref : title;
+  if (!searchTerm || searchTerm.length < 4) {
+    console.log(`    🇳🇴 doffin: no usable reference/title to search — skipping`);
+    return [];
+  }
+  let page = null;
+  try {
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(25000);
+    page.setDefaultTimeout(25000);
+    try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
+    try {
+      const ua = await page.browser().userAgent();
+      await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'languages', { get: () => ['nb-NO', 'no', 'en-US', 'en'] });
+      });
+    } catch (_) {}
+    const searchUrl = `https://www.doffin.no/search?searchString=${encodeURIComponent(searchTerm)}`;
+    console.log(`    🇳🇴 doffin: searching "${searchTerm.slice(0, 60)}" → ${searchUrl.slice(0, 90)}`);
+    try {
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    } catch (e) {
+      console.log(`    🇳🇴 doffin: search nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 2000));
+    // Find the first notice link. Doffin notice URLs look like
+    // /notices/<guid>/... or /nb/notices/... — match broadly.
+    const noticeUrl = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      for (const a of anchors) {
+        const href = a.getAttribute('href') || '';
+        if (/\/notices?\/[0-9a-f-]{6,}/i.test(href) || /\/notice\/\d+/i.test(href)) {
+          try { return new URL(href, location.href).toString(); } catch (_) { return href; }
+        }
+      }
+      return null;
+    }).catch(() => null);
+    if (!noticeUrl) {
+      // Diagnostic dump so we can tune the selector on a future run.
+      const diag = await page.evaluate(() => ({
+        url: location.href,
+        bodyPreview: (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 200),
+        anchorSample: Array.from(document.querySelectorAll('a[href]'))
+          .slice(0, 12).map((a) => (a.getAttribute('href') || '').slice(0, 70)),
+      })).catch(() => null);
+      console.log(`    🇳🇴 doffin: 0 notice links for "${searchTerm.slice(0, 40)}" — diag: ${JSON.stringify(diag).slice(0, 300)}`);
+      return [];
+    }
+    console.log(`    🇳🇴 doffin: opening notice ${noticeUrl.slice(0, 90)}`);
+    try {
+      await page.goto(noticeUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    } catch (e) {
+      console.log(`    🇳🇴 doffin: notice nav warn: ${(e.message || '').slice(0, 80)}`);
+    }
+    try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 1800));
+    // Harvest: (a) external portal links, (b) the notice body text.
+    const harvest = await page.evaluate(() => {
+      const PORTAL_RE = /(artifik\.no|eu-supply\.com|kommersannons\.se|tendsign\.com|mercell\.com|visma|amesto|tendwell|opic)/i;
+      const ext = [];
+      const seen = new Set();
+      for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+        let href = a.getAttribute('href') || '';
+        if (!/^https?:\/\//i.test(href)) continue;
+        let host = '';
+        try { host = new URL(href).hostname; } catch (_) { continue; }
+        if (!PORTAL_RE.test(host)) continue;
+        if (seen.has(href)) continue;
+        seen.add(href);
+        ext.push({ href, host, text: (a.innerText || a.textContent || '').trim().slice(0, 80) });
+      }
+      return {
+        externalLinks: ext.slice(0, 10),
+        body: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 40000),
+      };
+    }).catch(() => ({ externalLinks: [], body: '' }));
+    console.log(`    🇳🇴 doffin: notice body ${harvest.body.length}ch, ${harvest.externalLinks.length} external portal link(s)`);
+    for (const l of harvest.externalLinks.slice(0, 6)) {
+      console.log(`       ↗ ${l.host} — "${l.text}" → ${l.href.slice(0, 80)}`);
+    }
+    const out = [];
+    // (a) delegate to a known portal handler for the real documents
+    for (const l of harvest.externalLinks) {
+      try {
+        let portalTexts = [];
+        if (/(^|\.)artifik\.no$/i.test(l.host)) {
+          portalTexts = await fetchArtifikDocuments(browser, l.href);
+        } else if (/(^|\.)eu-supply\.com$/i.test(l.host)) {
+          portalTexts = await fetchEuSupplyDocuments(browser, l.href);
+        }
+        if (portalTexts && portalTexts.length) {
+          console.log(`    🇳🇴 doffin: delegated to ${l.host} handler → ${portalTexts.length} block(s)`);
+          out.push(...portalTexts);
+          break; // one good portal is enough
+        }
+      } catch (e) {
+        console.log(`    🇳🇴 doffin: portal delegation (${l.host}) failed: ${(e.message || '').slice(0, 80)}`);
+      }
+    }
+    // (b) always include the Doffin notice body — Norwegian notices often
+    // render Kvalifikasjonskrav / Tildelingskriterier inline.
+    if (harvest.body && harvest.body.length > 500) {
+      out.push(`--- (doffin notice) ${noticeUrl} ---\n${harvest.body}`);
+    }
+    if (!out.length) {
+      console.log(`    🇳🇴 doffin: notice reached but no portal docs or usable body text`);
+      return [];
+    }
+    return out;
+  } catch (e) {
+    console.log(`    ⚠️  doffin handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    return [];
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
 async function fetchMercellTenderDocuments(browser, sourceUrl) {
   let u = new URL(sourceUrl);
 
@@ -15389,6 +15535,33 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         return /<div id="root">/i.test(head) &&
           /(browser-check\.js|supportedBrowsers\.js|main\.[0-9a-f]+\.js|polyfills\.[0-9a-f]+\.js)/i.test(head);
       };
+      // 2026-06-08 (b/part-a) — Mercell MARKETING WEBPAGE detector. Run 111
+      // showed the OriginalNotice fallback endpoint
+      // (permalink.mercell.com/api/v1/files/<id>/download) returns the FULL
+      // 158KB Mercell marketing/Next.js page (GTM-PT97B8N tag manager +
+      // res.cloudinary.com/du0fs5dsp hero images + Mercell branding), NOT the
+      // eForms XML. That 158KB blob passes the small-shell check (>4000B) and
+      // the "<…>"→html magic, so it was wrongly accepted as the notice XML and
+      // polluted pdfText with marketing copy. Detect the Mercell web-app
+      // fingerprints regardless of size and reject.
+      const isMercellWebPage = (buf) => {
+        if (!buf) return false;
+        let head = '';
+        try { head = buf.slice(0, 8000).toString('utf8'); } catch (_) { return false; }
+        return /GTM-PT97B8N|res\.cloudinary\.com\/du0fs5dsp|cloudinary\.com\/[a-z0-9]+\/image\/upload/i.test(head)
+          || (/<div id="root">/i.test(head) && /main\.[0-9a-f]+\.js|_next\/static/i.test(head));
+      };
+      // 2026-06-08 (part-a) — positive eForms/notice-XML validator. Only
+      // ACCEPT an OriginalNotice "xml" payload when it actually looks like a
+      // procurement notice (TED eForms / OASIS UBL ContractNotice / Doffin).
+      // Everything else (Mercell marketing HTML, error pages) is rejected so
+      // it never reaches the AI as if it were real notice content.
+      const looksLikeNoticeXml = (buf) => {
+        if (!buf || buf.length < 200) return false;
+        let head = '';
+        try { head = buf.slice(0, 12000).toString('utf8'); } catch (_) { return false; }
+        return /<\?xml|<(?:efbc|efac|cac|cbc|ext):|ContractNotice|TED_EXPORT|urn:oasis:names:specification:ubl|doffin|StandardForms|F0[0-9]_20|<FORM_SECTION|noticeNumber|<NOTICE\b/i.test(head);
+      };
       const magicMatchesExt = (buf, ext) => {
         const got = detectFormat(buf);
         const ex = String(ext || '').toLowerCase();
@@ -15396,15 +15569,16 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
         if (ex === 'docx' || ex === 'xlsx' || ex === 'odt' || ex === 'ods' || ex === 'zip') return got === 'zip';
         if (ex === 'doc' || ex === 'xls') return got === 'cfb';
         if (ex === 'rtf') return got === 'rtf';
-        // Reject the Mercell SPA shell for text-ish formats so the fetch loop
-        // keeps trying other endpoints instead of accepting an empty app page.
-        if ((ex === 'txt' || ex === 'xml' || ex === 'json') && isMercellSpaShell(buf)) return false;
+        // Reject the Mercell SPA shell + marketing webpage for text-ish
+        // formats so the fetch loop keeps trying other endpoints instead of
+        // accepting an empty app page or 158KB of marketing copy.
+        if ((ex === 'txt' || ex === 'xml' || ex === 'json') && (isMercellSpaShell(buf) || isMercellWebPage(buf))) return false;
         if (ex === 'txt') return got !== 'html'; // accept anything plausible
-        // XML — accept anything that detectFormat classified as 'html'
-        // (which covers `<?xml`, `<html`, and any other `<…>`-prefixed
-        // payload). We don't distinguish XML from HTML at the magic-byte
-        // level; the parser strips both safely.
-        if (ex === 'xml') return got === 'html';
+        // XML — was: accept anything detectFormat called 'html'. That let the
+        // Mercell marketing page through. Now require the payload to actually
+        // look like a procurement notice (eForms / UBL / Doffin / TED). This
+        // keeps real OriginalNotice XML and rejects marketing/error HTML.
+        if (ex === 'xml') return got === 'html' && looksLikeNoticeXml(buf);
         // JSON — matches the 'json' detector, but ALSO be permissive when
         // the bytes are plain text starting with `{` or `[`. Some servers
         // serve JSON with surrogate framing or BOMs that detectFormat
@@ -16682,6 +16856,44 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       }
     } else {
       console.log('    (no "Go to source" button / data-linkurl)');
+    }
+
+    // 2026-06-08 (part-b) — DOFFIN FALLBACK for Norway.
+    // Mercell hands NO tenders as permalink/my.mercell (login wall) and the
+    // OriginalNotice file IDs only return Mercell's marketing page, so quals
+    // stay empty. Every NO tender has a public doffin.no notice that links
+    // to the real portal (artifik/eu-supply). Trigger when: looks Norwegian
+    // AND we still have little/no document text AND we have a search key.
+    try {
+      const pdfLen = (details.pdfText || '').length;
+      const srcHostL = String(details.sourceHost || '').toLowerCase();
+      const looksNorwegian =
+        (details.country || '').toLowerCase() === 'norway' ||
+        /(^|\.)(my|permalink)\.mercell\.com$/i.test(srcHostL) ||
+        /(^|\.)(artifik\.no|eu-supply\.com|doffin\.no)$/i.test(srcHostL);
+      const doffinRef = (details.fileReferenceNumber && details.fileReferenceNumber.trim())
+        || details.referenceNumber || '';
+      const doffinKey = doffinRef || details.title || '';
+      if (looksNorwegian && pdfLen < 1000 && doffinKey && doffinKey.length >= 4) {
+        console.log(`    🇳🇴 Doffin fallback: NO tender with thin docs (pdfText=${pdfLen}ch) — searching doffin.no (key="${doffinKey.slice(0, 50)}")`);
+        const doffinTexts = await fetchDoffinDocuments(browser, {
+          referenceNumber: doffinRef,
+          title: details.title || '',
+          country: details.country || 'Norway',
+        });
+        if (doffinTexts && doffinTexts.length) {
+          const HARD_CAP = 200000;
+          const existing = details.pdfText || '';
+          const sep = existing ? '\n\n' : '';
+          details.pdfText = (existing + sep + doffinTexts.join('\n\n')).slice(0, HARD_CAP);
+          details.doffinFallbackUsed = true;
+          console.log(`    🇳🇴 Doffin fallback: merged ${doffinTexts.length} block(s) → pdfText now ${details.pdfText.length}ch`);
+        } else {
+          console.log(`    🇳🇴 Doffin fallback: no usable content found`);
+        }
+      }
+    } catch (e) {
+      console.log(`    ⚠️ Doffin fallback error: ${(e.message || '').slice(0, 100)}`);
     }
 
     return details;
