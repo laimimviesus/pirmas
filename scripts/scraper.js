@@ -1138,14 +1138,22 @@ async function extractFieldsWithAI(text, meta = {}) {
     let lotStructure = 'single';
     if (/^partial$/.test(rawLot) || /partial[-\s_]bid/.test(rawLot) || /^per[-\s]?lot$/.test(rawLot)) lotStructure = 'partial';
     else if (/^all[-\s_]?required$/.test(rawLot) || /all[\s_]?lots?[\s_]?required/.test(rawLot) || /full[-\s_]?bundle/.test(rawLot)) lotStructure = 'all-required';
-    return {
+    // 2026-06-08 (Task #181) — KRITINIS FIX: trūkstami laukai grąžinime.
+    // Anksčiau scraper.js niekad neperdaviu ai.budgetSource, ai.requirementsSourceFile,
+    // ai.qualificationsSourceFile į post-AI logiką → L/M stulpeliuose niekada
+    // nebuvo HYPERLINK'o, J fall-back'ino į "Mercell tender notice". 100%
+    // tenderių run 117 turėjo reqSrc="" qualSrc="" dėl ŠITO bug'o.
+    const aiObj = {
       maxBudget: (parsed.maxBudget || '').toString().trim(),
       estimatedBudgetEur: (parsed.estimatedBudgetEur || '').toString().trim(),
       estimationConfidence: (parsed.estimationConfidence || '').toString().trim().toLowerCase(),
       estimationReasoning: (parsed.estimationReasoning || '').toString().trim().slice(0, 200),
+      budgetSource: (parsed.budgetSource || '').toString().trim(),
       duration: (parsed.duration || '').toString().trim(),
       requirementsForSupplier: (parsed.requirementsForSupplier || '').toString().trim(),
+      requirementsSourceFile: (parsed.requirementsSourceFile || '').toString().trim().slice(0, 240),
       qualificationRequirements: (parsed.qualificationRequirements || '').toString().trim(),
+      qualificationsSourceFile: (parsed.qualificationsSourceFile || '').toString().trim().slice(0, 240),
       offerWeighingCriteria: (parsed.offerWeighingCriteria || '').toString().trim(),
       scopeOfAgreement: (parsed.scopeOfAgreement || '').toString().trim(),
       lotStructure,
@@ -1153,6 +1161,16 @@ async function extractFieldsWithAI(text, meta = {}) {
       rejectReason: (parsed.rejectReason || '').toString().trim(),
       rejectCategory: (parsed.rejectCategory || '').toString().trim(),
     };
+    // 2026-06-08 (Task #181) — Variant C diag: log raw AI JSON snippet kai
+    // source-file laukai tušti nors text laukas non-placeholder. Padeda
+    // patikrinti ar (a) AI grąžina laukus tuščius (b) ar visai praleidžia.
+    const reqHasText = aiObj.requirementsForSupplier && !/^\(no explicit/i.test(aiObj.requirementsForSupplier);
+    const qualHasText = aiObj.qualificationRequirements && !/^\(no explicit/i.test(aiObj.qualificationRequirements);
+    if ((reqHasText && !aiObj.requirementsSourceFile) || (qualHasText && !aiObj.qualificationsSourceFile)) {
+      const snippet = candidateJson.slice(0, 400).replace(/\s+/g, ' ');
+      console.log(`    🐞 AI source-file gap: reqText=${reqHasText} reqSrc="${aiObj.requirementsSourceFile.slice(0, 60)}" | qualText=${qualHasText} qualSrc="${aiObj.qualificationsSourceFile.slice(0, 60)}" | rawJSON snippet: ${snippet}`);
+    }
+    return aiObj;
   } catch (e) {
     _markAiFailure(e);
     // Always set extraction-failure flag — covers 429/529 "exhausted retries"
@@ -19221,6 +19239,61 @@ async function runScraper() {
           // 2026-06-04 (Task #168) — same idea for requirements source file.
           if (!dd.requirementsSourceFile && ai.requirementsSourceFile) {
             dd.requirementsSourceFile = String(ai.requirementsSourceFile).slice(0, 240);
+          }
+          // 2026-06-08 (Task #181) — PROGRAMATINIS resolver (Variant C FIX B).
+          // Safety net: jei AI grąžino tuščius source-file laukus, BET turim
+          // pdfText su `--- (handler) <filename> ---` antraštėmis, IR turim
+          // AI ekstrakcijos tekstą → ieškom kuriame failo bloke yra tas tekstas.
+          // Tai DETERMINISTINIS resolver'is — nepriklauso nuo AI compliance.
+          const findSourceFileInPdfText = (extractedText, pdfText) => {
+            if (!extractedText || !pdfText) return '';
+            // Imam pirmus reikšmingus 60ch be punktuacijos
+            const fragment = String(extractedText)
+              .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 60);
+            if (fragment.length < 20) return ''; // per trumpas — netinka match'ui
+            // Sukuriam pdfText'o normalizuotą kopiją kad atitiktų fragmento normalizaciją
+            const normPdf = String(pdfText).replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ');
+            const idx = normPdf.toLowerCase().indexOf(fragment.toLowerCase());
+            if (idx === -1) return '';
+            // Mapuojam normalized indeksą atgal į originalų pdfText'ą — apytikslis,
+            // bet pakanka rasti ankstesnį `--- (handler) filename ---` antraštę.
+            // Paprasta heuristika: skanuojam ORIGINALŲ pdfText'ą atgal nuo
+            // pradžios ieškodami fragmento pirmų 30ch (su space variantais).
+            const shortFrag = fragment.slice(0, 30);
+            const shortRe = new RegExp(shortFrag.split(' ').map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+'), 'i');
+            const m = pdfText.match(shortRe);
+            if (!m) return '';
+            const matchIdx = m.index;
+            // Eiti atgal nuo matchIdx ieškant artimiausio `--- (handler) <filename> ---`
+            const headerRe = /---\s*\(([^)]+)\)\s+([^-\n]+?)\s*---/g;
+            let lastHeader = '';
+            let lm;
+            const searchSlice = pdfText.slice(0, matchIdx);
+            while ((lm = headerRe.exec(searchSlice)) !== null) {
+              lastHeader = lm[2].trim();
+            }
+            return lastHeader;
+          };
+          // Apply jei AI'us nepridėjo bet turim ekstrakcijos tekstą + pdfText
+          const placeholderRe = /^\s*\(no explicit/i;
+          if (!dd.requirementsSourceFile && dd.requirementsForSupplier &&
+              !placeholderRe.test(dd.requirementsForSupplier) && dd.pdfText) {
+            const found = findSourceFileInPdfText(dd.requirementsForSupplier, dd.pdfText);
+            if (found) {
+              dd.requirementsSourceFile = found.slice(0, 240);
+              console.log(`    🔧 resolved requirementsSourceFile via pdfText scan → "${found.slice(0, 80)}"`);
+            }
+          }
+          if (!dd.qualificationsSourceFile && dd.qualificationRequirements &&
+              !placeholderRe.test(dd.qualificationRequirements) && dd.pdfText) {
+            const found = findSourceFileInPdfText(dd.qualificationRequirements, dd.pdfText);
+            if (found) {
+              dd.qualificationsSourceFile = found.slice(0, 240);
+              console.log(`    🔧 resolved qualificationsSourceFile via pdfText scan → "${found.slice(0, 80)}"`);
+            }
           }
           // 2026-06-04 (Task #175) — non-LT atveju override'inam handler'io
           // original-language criteria.
