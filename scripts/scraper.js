@@ -73,6 +73,16 @@ const MAX_TENDERS = TEST_MODE ? 9 : Number(process.env.MAX_TENDERS || 500);
 const DETAILS_LIMIT = TEST_MODE ? 9 : Number(process.env.DETAILS_LIMIT || 500);
 const FLUSH_BATCH = TEST_MODE ? 1 : Number(process.env.FLUSH_BATCH || 5);
 const SOURCE_NAV_TIMEOUT = 25000;
+// 2026-06-08 (Task #180) — known slow-but-alive portals get extended timeout.
+// Galicia SILEX (conselleriadefacenda.es) renders >30s from GitHub runners;
+// 25s default Chrome timeout fires before any content shows → classified as
+// dead-site. Bump to 60s for these hosts; failing tenders fall through to
+// PLACSP federal fallback (line ~16750) so the cost is still bounded.
+const SLOW_SOURCE_HOSTS = [
+  'conselleriadefacenda.es',
+  'sirecftdpriexp.chap.junta-andalucia.es',
+];
+const SOURCE_NAV_TIMEOUT_SLOW = 60000;
 
 if (COUNTRY_FILTER_ACTIVE) {
   console.log(`🔎 COUNTRY_FILTER active: only collecting tenders from ${Array.from(COUNTRY_FILTER).join(', ')} (max pages: ${MAX_PAGES})`);
@@ -4662,6 +4672,51 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
               }
             }
           } catch (_) {}
+        }
+      }
+
+      // 2026-06-08 (Task #179) — DIRECT-URL FALLBACK.
+      // Kai popup'as neturi download URL viduje (eAssociateUser.do confirmation
+      // page tik su Atšaukti/closeForm buttons), bandom tiesioginį
+      // downloadContractDocument.do URL'ą. Log'e matėm, kad pagrindinio puslapio
+      // anchor'as faktiškai turi:
+      //   "OneDrive_xxx.zip" → /epps/cft/downloadContractDocument.do?documentId=<docId>&resourceId=<resId>
+      // Fetch'inam su page kontekstu (session cookies), check'inam binary magic.
+      if (!captured.has(d.docId) && resourceId && d.docId) {
+        const directUrl = `https://viesiejipirkimai.lt/epps/cft/downloadContractDocument.do?documentId=${encodeURIComponent(d.docId)}&resourceId=${encodeURIComponent(resourceId)}`;
+        try {
+          const directResult = await page.evaluate(async (url) => {
+            try {
+              const r = await fetch(url, { credentials: 'include', redirect: 'follow' });
+              if (!r.ok) return { ok: false, status: r.status };
+              const ct = r.headers.get('content-type') || '';
+              const ab = await r.arrayBuffer();
+              return { ok: true, status: r.status, ct, url: r.url || url, data: Array.from(new Uint8Array(ab)) };
+            } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
+          }, directUrl).catch(() => null);
+          if (directResult && directResult.ok && directResult.data && directResult.data.length > 500) {
+            const buf = Buffer.from(directResult.data);
+            const b0 = buf[0], b1 = buf[1];
+            const isBin = (b0 === 0x25 && b1 === 0x50) ||  // PDF
+                          (b0 === 0x50 && b1 === 0x4B) ||  // ZIP/DOCX/XLSX
+                          (b0 === 0xD0 && b1 === 0xCF);    // legacy Office
+            if (isBin) {
+              captured.set(d.docId, {
+                url: directResult.url,
+                ct: directResult.ct,
+                buf,
+                ts: Date.now(),
+              });
+              console.log(`    🇱🇹 viesiejipirkimai: ✓ DIRECT URL fallback ${buf.length}B for id=${d.docId} (resourceId=${resourceId})`);
+            } else {
+              console.log(`    ⚠️  viesiejipirkimai: direct URL returned non-binary (magic=${buf.slice(0, 4).toString('hex')}, ${buf.length}B, ct=${directResult.ct.slice(0, 60)})`);
+            }
+          } else {
+            const reason = directResult?.error || `status=${directResult?.status || '?'}`;
+            console.log(`    ⚠️  viesiejipirkimai: direct URL fetch failed (${reason}) for id=${d.docId}`);
+          }
+        } catch (e) {
+          console.log(`    ⚠️  viesiejipirkimai: direct URL fallback threw: ${(e.message || '').slice(0, 80)}`);
         }
       }
 
@@ -13026,10 +13081,21 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
     };
     srcPage.on('request', blockHandler);
 
+    // 2026-06-08 (Task #180) — slow-host timeout extension.
+    let effectiveTimeout = SOURCE_NAV_TIMEOUT;
+    try {
+      const _srcHost = new URL(sourceUrl).hostname;
+      if (SLOW_SOURCE_HOSTS.some(h => _srcHost === h || _srcHost.endsWith('.' + h))) {
+        effectiveTimeout = SOURCE_NAV_TIMEOUT_SLOW;
+        console.log(`    🐢 slow-host: ${_srcHost} → ${effectiveTimeout}ms timeout`);
+        await srcPage.setDefaultNavigationTimeout(effectiveTimeout).catch(() => {});
+        await srcPage.setDefaultTimeout(effectiveTimeout).catch(() => {});
+      }
+    } catch (_) {}
     try {
       await srcPage.goto(sourceUrl, {
         waitUntil: 'domcontentloaded',
-        timeout: SOURCE_NAV_TIMEOUT,
+        timeout: effectiveTimeout,
       });
     } catch (e) {
       console.log(`    source nav warn: ${e.message}`);
@@ -16702,8 +16768,19 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
       // Generalised: any 'dead-site' skip + Spanish-looking host triggers
       // the scan. Cheap to attempt — single regex + one extra
       // fetchSourcePageDetails call only if a PLACSP URL is actually found.
-      if (src?.skipped === 'dead-site' && details.pdfText) {
-        const placspMatch = details.pdfText.match(
+      if (src?.skipped === 'dead-site') {
+        // 2026-06-08 (Task #180) — scan MULTIPLE text sources for PLACSP
+        // federal URL (run 117 [153] Galicia AMT-2026-0081: pdfText was 0ch
+        // because TED XML failed, but Mercell description / scopeOfAgreement /
+        // fullTextSnippet often mention contrataciondelestado.es as
+        // dual-publication. Concatenate everything we have.
+        const scanText = [
+          details.pdfText || '',
+          details.scopeOfAgreement || '',
+          details.fullTextSnippet || '',
+          details.title || '',
+        ].filter(Boolean).join('\n');
+        const placspMatch = scanText.match(
           /https?:\/\/(?:www\.)?contrataciondelestado\.es\/wps\/[^\s"'<>)]+/i
         );
         if (placspMatch) {
@@ -16726,7 +16803,12 @@ async function fetchTenderDetails(browser, page, tenderUrl) {
             console.log(`    ✗ PLACSP fallback threw: ${(e.message || '').slice(0, 80)}`);
           }
         } else {
-          console.log(`    ℹ️  dead-site (${src.sourceHost}) — no PLACSP federal URL in TED text, skipping`);
+          // 2026-06-08 (Task #180) — no PLACSP URL found anywhere. Log full
+          // diag (referenceNumber + sourceHost) so user knows what to look
+          // up manually. For Galicia SILEX / Andalucía SiRec these dead-site
+          // bails would require TED API access (rate-limited, key-gated)
+          // OR manual federal-aggregator lookup by reference number.
+          console.log(`    ℹ️  dead-site (${src.sourceHost}) — no PLACSP federal URL in any text source (pdfText=${(details.pdfText || '').length}ch, scope=${(details.scopeOfAgreement || '').length}ch, snippet=${(details.fullTextSnippet || '').length}ch); ref="${(details.referenceNumber || '').slice(0, 40)}" — manual lookup needed`);
         }
       }
 
@@ -18917,6 +18999,11 @@ async function runScraper() {
     let budgetFilteredCount = 0;
     let contentFilteredCount = 0;
     let aiDeferredCount = 0;
+    // 2026-06-08 (Task #178) — pre-AI filter: atfiltruoti tenderius, kurių
+    // bidding deadline (col G) yra mažiau nei DEADLINE_MIN_DAYS dienų į
+    // priekį. Tikslas: per vėlu paruošti pasiūlymą, taupom AI tokens.
+    let deadlineFilteredCount = 0;
+    const DEADLINE_MIN_DAYS = 14;
     const contentFilterCategories = {};
 
     for (let i = 0; i < toFetch.length; i++) {
@@ -18982,6 +19069,36 @@ async function runScraper() {
         if (dd.duration && /\d{1,4}[\/.\-]\d{1,2}[\/.\-]\d{1,4}\s*[-–—]\s*\d{1,4}[\/.\-]\d{1,2}[\/.\-]\d{1,4}/.test(dd.duration)) {
           console.log(`    ⚠️ discarding date-range duration: "${dd.duration}"`);
           dd.duration = '';
+        }
+
+        // --- PRE-AI DEADLINE FILTER --------------------------------
+        // 2026-06-08 (Task #178) — atfiltruoti tenderius, kurių pateikimo
+        // terminas yra mažiau nei DEADLINE_MIN_DAYS (14d) į priekį. Per
+        // vėlu paruošti pasiūlymą — neapkraunam sheet'o ir taupom AI tokens.
+        // Parse'ina ISO YYYY-MM-DD (po fmtDate), DD/MM/YYYY, DD.MM.YYYY.
+        // Jei deadline neparseable ar tuščias → KEEP (don't filter).
+        const dlRaw = String(dd.deadline || toFetch[i].deadlineRaw || '').trim();
+        if (dlRaw) {
+          let dlDate = null;
+          let m = dlRaw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+          if (m) {
+            dlDate = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+          } else {
+            m = dlRaw.match(/^(\d{1,2})[\/.](\d{1,2})[\/.](\d{4})/);
+            if (m) dlDate = new Date(Date.UTC(+m[3], +m[2] - 1, +m[1]));
+          }
+          if (dlDate && !Number.isNaN(dlDate.getTime())) {
+            const now = new Date();
+            const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+            const diffDays = Math.floor((dlDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+            if (diffDays < DEADLINE_MIN_DAYS) {
+              deadlineFilteredCount++;
+              console.log(`    ⏭️  skipping: deadline too soon ("${dlRaw}" → ${diffDays}d remaining, min=${DEADLINE_MIN_DAYS}d)`);
+              toFetch[i].details = dd;
+              await new Promise(r => setTimeout(r, 200));
+              continue;
+            }
+          }
         }
 
         // --- PRE-AI BUDGET FILTER -----------------------------------
@@ -19357,9 +19474,10 @@ async function runScraper() {
     console.log(`New tenders: ${newTenders.length}`);
     console.log(`Rows appended: ${totalAppended}`);
     console.log(`Rows appended to "For training": ${totalAppendedTraining}`);
-    console.log(`Budget-filtered (<500K EUR): ${budgetFilteredCount}`);
-    console.log(`Content-filtered (poor fit):  ${contentFilteredCount}`);
-    console.log(`AI-deferred (retry next run): ${aiDeferredCount}`);
+    console.log(`Budget-filtered (<500K EUR):   ${budgetFilteredCount}`);
+    console.log(`Deadline-filtered (<${DEADLINE_MIN_DAYS}d):       ${deadlineFilteredCount}`);
+    console.log(`Content-filtered (poor fit):   ${contentFilteredCount}`);
+    console.log(`AI-deferred (retry next run):  ${aiDeferredCount}`);
     if (contentFilteredCount > 0) {
       const breakdown = Object.entries(contentFilterCategories)
         .sort((a, b) => b[1] - a[1])
