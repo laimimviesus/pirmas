@@ -1005,7 +1005,23 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- lotStructure: one of "single" | "partial" | "all-required". Mark "single" if the tender procures one consolidated scope. Mark "partial" for multi-lot tenders where bidders MAY submit for individual lots/categories independently (look for phrases like "Tilbud på deler av oppdraget er tillatt", "Adgang til å gi tilbud på deler", "Det er adgang til å gi tilbud på enkeltkategorier", "Lots: division into lots = yes", "partial bids allowed", "tilbud på enkelte delkontrakter", "anbud på delar"). Mark "all-required" for multi-lot tenders where bidders MUST cover EVERY lot to win (look for phrases like "Det er ikke adgang til å gi tilbud på deler av oppdraget", "no partial bids", "tilbud må omfatte hele leveransen", "bidders must submit for all lots"). When unclear in a multi-lot tender, default to "all-required".\n' +
     '- itLotsScope: ONLY when lotStructure=="partial". A bullet-style list of lots that are software development / web/mobile app dev / bespoke IT system creation. Format: "Lot 2B – Architecture, development, data and integration: <one-line description>". Include ONLY lots we (custom software development firm) could realistically bid for. Empty string if lotStructure!="partial" OR no IT-relevant lots.\n' +
     '- rejectReason: short English string (≤120 chars) explaining WHY this tender is a poor fit, OR empty string if a good fit. We are a custom-software development firm that BUILDS systems from scratch. Reject (set rejectReason) when ANY of these apply:\n' +
-    '   • SaaS Provision/Creation: Tender procures a SaaS subscription, or asks to build a SaaS platform for them to resell. Set rejectReason="saas_provision_or_creation".\n' +
+    '   • SaaS Provision/Creation: Tender procures a SaaS subscription (vendor provides + operates the software), or asks to build a SaaS platform for buyer to resell. Set rejectReason="saas_provision_or_creation". We are a CUSTOM-build firm, not a SaaS vendor — we deliver source code & deployment, we do NOT operate hosted services for clients on a subscription model.\n' +
+    '     ❌ EXPLICIT SaaS markers (any one is sufficient — REJECT):\n' +
+    '       ✗ EN: "SaaS solution", "as a SaaS solution", "Software as a Service", "SaaS-based", "SaaS offering", "Hosted by supplier", "Supplier-hosted solution", "Vendor-hosted", "Cloud-hosted by [supplier/vendor]", "Supplier-selected datacenters", "Operated by the supplier", "Hosting and operation by contractor", "Multi-tenant cloud platform"\n' +
+    '       ✗ NL: "als SaaS oplossing", "SaaS dienst", "SaaS-applicatie", "door leverancier gehost"\n' +
+    '       ✗ DE: "SaaS-Lösung", "Software-as-a-Service", "vom Anbieter gehostet", "Anbieter-gehostete Plattform"\n' +
+    '       ✗ FR: "Solution SaaS", "Logiciel en tant que service", "Hébergé par le fournisseur", "Mode SaaS"\n' +
+    '       ✗ ES: "Solución SaaS", "Software como servicio", "Alojado por el proveedor", "Modalidad SaaS"\n' +
+    '       ✗ IT: "Soluzione SaaS", "Software come servizio", "Ospitato dal fornitore"\n' +
+    '       ✗ LT: "SaaS sprendimas", "Programinė įranga kaip paslauga"\n' +
+    '       ✗ Combined signal: "Supply AND operation" of named software + multi-year (3+ years) subscription term — implies vendor provides + runs the software (e.g., "Supply and operation of X software for 60 months")\n' +
+    '       ✗ "Provide software" + "buyer-selected datacenter is NOT used" (i.e., contractor brings their own infra)\n' +
+    '       ✗ Scope describes ONGOING service delivery (continuous operation, monthly SLAs, uptime guarantees) rather than a delivered codebase\n' +
+    '     ✅ NOT SaaS (do not reject under this category):\n' +
+    '       ✓ Custom development where the buyer will host/operate the software themselves after delivery\n' +
+    '       ✓ Build-operate-transfer: contractor builds, briefly operates during transition, then hands over\n' +
+    '       ✓ "Maintenance and support" of buyer-owned/buyer-hosted system after custom build\n' +
+    '       ✓ Cloud-hosted just refers to the DEV environment (CI/CD) not the production service\n' +
     '   • Off-The-Shelf (COTS) — Existing Market Solution: The CORE TEST is semantic, NOT brand-list:\n' +
     '     ❓ KEY QUESTION: "Is the buyer procuring an EXISTING software product / system / service / environment from a market vendor (paying to receive or operate a finished thing), OR is the buyer commissioning a CUSTOM-BUILT solution (paying engineers to design and construct something new)?"\n' +
     '     If the answer is "existing market solution" → set rejectReason="cots_implementation_or_licenses". This applies whether the product is named (Atlassian, SAP, Microsoft Dynamics, SharePoint, Power BI, SSRS, etc.) or unnamed but clearly a market product (e.g. "ERP system", "GIS platform", "Document Management System", "case management system", "library system", "BI environment", "ticketing system" as catalog purchases).\n' +
@@ -1047,12 +1063,65 @@ async function extractFieldsWithAI(text, meta = {}) {
     '     Set rejectReason="cots_implementation_or_licenses" whenever the decision algorithm lands on COTS.\n' +
     '   • Existing Software Purchase (vertical-domain / named product): Tender procures an EXISTING software product/system — either by brand name OR by referring to a specific vertical-domain solution that buyers shop for as a market product, rather than commissioning a build. Hallmarks: (a) the title/description names a SPECIFIC software category as the thing being procured ("HTA software", "EHR system", "LMS platform", "ERP solution", "CRM system", "DMS solution", "case management system" as a market category), (b) scope is "supply + implementation + integration with existing buyer systems (e.g., Lifecare PIS, X-Road, SAP)", (c) text uses language like "the software must support X feature", "the solution shall replace current Y" — implying the buyer expects to RECEIVE a working product, not pay for its development. INCLUDES: healthcare HTA/EHR/PACS software, legal practice management systems, library management systems, school information systems, accounting/HR ERP suites, document management platforms, CRM/CMS/LMS solutions sold as products. Pavyzdys: "Care Needs Assessment (HTA) Software for Wellbeing Area ... must facilitate care needs assessment ... integrate with the Lifecare patient information system" → set rejectReason="existing_software_purchase". DIFFERENCE from "cots_implementation_or_licenses": COTS targets named global enterprise platforms; existing_software_purchase targets vertical/niche domain products including those that may have multiple vendor implementations. DIFFERENCE from "saas_provision_or_creation": SaaS is subscription-style; this is product-purchase style. WHEN IN DOUBT — if the tender is a one-off PROCUREMENT of an already-existing solution category (not a build-from-scratch project), reject as existing_software_purchase.\n' +
     '   • Helpdesk/Support Only: Primary scope is L1/L2 helpdesk, end-user support, client management, or continuous maintenance of systems we did not build. Set rejectReason="helpdesk_support_only".\n' +
+    '   • PM / Admin Consulting Only: Tender procures PURE project management, PMO, technical office (oficina técnica), or administrative consulting — NO custom software development. We are software engineers, not PM consultants. Hallmarks:\n' +
+    '       • FR: "Assistance à maîtrise d\'œuvre" (AMOE), "Assistance à maîtrise d\'ouvrage" (AMOA / AMO), "Pilotage de projet", "Conseil en gestion de projet"\n' +
+    '       • ES: "Oficina técnica de apoyo", "Consultoría especializada", "Asistencia técnica" (without dev scope), "Servicios de gestión de proyectos"\n' +
+    '       • EN: "PMO services", "Project Management Office", "Project management consulting", "Technical office support", "Programme management services"\n' +
+    '       • DE: "Projektmanagement-Beratung", "Projektsteuerung", "PMO-Dienstleistungen"\n' +
+    '       • LT: "Projekto vadovavimas", "Techninė pagalba" (kai nėra dev), "Pirkimo procedūrų administravimas"\n' +
+    '     Role signal: required team consists ONLY of Project Manager / PMO Lead / Coordinator / Scrum Master / Business Analyst — NO Developer / Architect / DevOps / QA / UI-UX. Required references describe "managed N projects" not "built N systems".\n' +
+    '     POSITIVE (do NOT reject): scope includes BOTH project management AND custom dev (full SDLC team requested with PM + Architects + Developers + QA). Pure PM-assistance for client\'s internal IT department, with no actual code being written by the contractor, is the rejectable pattern. Set rejectReason="pm_admin_consulting_only".\n' +
     '   • Training/Workshops: Scope is purely delivering educational courses, IT training, or workshops without software development. Set rejectReason="training_workshops_only".\n' +
-    '   • Non-IT / Construction: Construction, physical engineering, physical security, cleaning. Set rejectReason="non_it_construction".\n' +
+    '   • Non-IT / Construction / Repair / Renovation: Tender procures PHYSICAL building works — construction, renovation, modernization, repair, refurbishment of buildings or infrastructure. We are a software development firm and CANNOT execute construction. Hallmarks (any one is sufficient):\n' +
+    '       • LT: "statybos rangos darbai", "remonto darbai", "atnaujinimo (modernizavimo) statybos", "stogo remontas/atnaujinimas", "fasadų šiltinimas", "sienų šiltinimas", "betonavimo darbai", "mūro darbai", "metalo konstrukcijų montavimo darbai", "įėjimo aikštelių ir laiptelių remontas", "atestuotas statybos vadovas", "SSVA arba SPSC įmonės atestatas", "ypatingų gyvenamosios paskirties pastatų", "aukštalipio sertifikatas", "pramoninis alpinizmas"\n' +
+    '       • EN: "construction works", "renovation works", "building modernization", "modernization construction", "roofing works", "roof repair", "facade insulation", "wall insulation", "concrete works", "masonry", "asphalt paving", "earthworks"\n' +
+    '       • DE: "Bauarbeiten", "Sanierung", "Renovierung", "Modernisierung", "Fassadendämmung", "Dachsanierung", "Betonarbeiten", "Maurerarbeiten"\n' +
+    '       • FR: "Travaux de construction", "Rénovation", "Travaux de modernisation", "Travaux de réhabilitation", "Maçonnerie", "Couverture-étanchéité"\n' +
+    '       • ES: "Obras de construcción", "Renovación", "Modernización", "Reforma", "Rehabilitación", "Albañilería"\n' +
+    '       • IT: "Lavori di costruzione", "Ristrutturazione", "Riqualificazione edilizia"\n' +
+    '     ALSO covers: physical engineering services, civil engineering, road construction, physical security guards, janitorial / cleaning services, landscaping, asbestos removal, demolition. Set rejectReason="non_it_construction".\n' +
+    '   • On-Site Physical Work Required (non-construction): Tender requires PHYSICAL on-site presence as a CORE deliverable that we cannot fulfill remotely from Lithuania — even if the work is not pure construction. Examples:\n' +
+    '       • Field engineering / on-site equipment installation (e.g. installing servers/switches in client racks)\n' +
+    '       • Daily on-site IT support requiring physical presence at client premises\n' +
+    '       • Physical audits as primary scope (visiting buildings/factories to inspect)\n' +
+    '       • Equipment delivery + on-site setup\n' +
+    '       • Catering, food service, vending machines, mail handling, courier services\n' +
+    '       • Driver services, transportation, vehicle delivery\n' +
+    '       • In-person event support, AV/staging crew\n' +
+    '     Hallmark wording: "Rangovas privalo apsilankyti darbų atlikimo vietoje" (LT), "On-site presence required", "Service to be delivered at buyer\'s premises", "Daily attendance required at [address]", "Vor-Ort-Service", "Sur site". DO NOT trigger this for: brief kick-off / handover meetings, hybrid teams with occasional client visits, generic clauses about "site visits if needed". Trigger ONLY when scope is fundamentally on-site work. Set rejectReason="onsite_physical_work".\n' +
     '   • Surveys/Research: Conducting public surveys, sociological polling, non-IT market research. Set rejectReason="surveys_market_research".\n' +
+    '   • Pre-Tender Market Consultation: Buyer is gathering market INFORMATION from suppliers BEFORE issuing an actual tender — NOT inviting offers/bids. We don\'t participate in pre-procurement consultations. Hallmarks: (a) title/description explicitly labels the notice as a market consultation/research/sourcing exercise (NOT a tender for services); (b) "noticeType" is "Prior Information Notice" with consultation purpose; (c) no real submission of offers requested — only feedback, expressions of interest, or capability info. Look for these multilingual phrases:\n' +
+    '       • DE: "Markterkundung", "Markterkundungsverfahren", "Marktkonsultation", "Bekanntmachung einer Marktkonsultation", "vorgeschaltete Markterkundung"\n' +
+    '       • EN: "Market consultation", "Market research" (when buyer is consulting suppliers), "Pre-tender consultation", "Pre-procurement consultation", "Request for Information (RFI)" (in pre-procurement context, not actual RFP), "Prior Information Notice with consultation"\n' +
+    '       • LT: "Rinkos konsultacija", "Rinkos tyrimas" (pirkimo kontekste — perkanti organizacija renka info iš tiekėjų)\n' +
+    '       • FR: "Consultation préalable", "Sourcing public", "Consultation du marché", "Avis de pré-information avec consultation"\n' +
+    '       • ES: "Consulta preliminar de mercado", "Consulta al mercado", "Sondeo de mercado"\n' +
+    '       • IT: "Consultazione preliminare di mercato", "Indagine di mercato"\n' +
+    '       • NL: "Marktconsultatie", "Marktverkenning"\n' +
+    '       • Scandinavian: "Markedsdialog", "Marknadsundersökning" (in pre-procurement context)\n' +
+    '     Set rejectReason="pre_tender_market_consultation". DIFFERENCE from "surveys_market_research": the latter is buyer asking US TO CONDUCT surveys as a paid service; this category is buyer asking us to PROVIDE market info before issuing a real tender — no paid work, just consultation.\n' +
     '   • GIS / Geo-specific: Geographic Information Systems (GIS), geological mapping, spatial data systems requiring specific local geographical knowledge/access. Set rejectReason="gis_geospatial".\n' +
     '   • Physical/Infrastructure: Hardware delivery, cabling, network/telecom infra. Set rejectReason="hardware_network_infra".\n' +
+    '   • Foreign Local Presence Required: Tender REQUIRES all contractor personnel/data to be physically located in a SPECIFIC country other than Lithuania. We are a Lithuanian company that delivers remotely from Lithuania — cannot satisfy national-sovereignty / data-residency requirements. Hallmarks (any one is sufficient):\n' +
+    '       • Mandatory wording: "All personnel must be located in [country]", "All work must be executed exclusively on [country] territory", "Personnel must reside in [country]", "Mainland and overseas territories" (DROM-COM, Outre-mer, etc.)\n' +
+    '       • Data residency tied to ONE country: "No data processing, storage, consultation or manipulation from outside [country]", "Datacenters exclusively in [country]", "Cloud providers must have datacenters exclusively in [country]"\n' +
+    '       • National sovereign-cloud certifications REQUIRED alongside residency: SecNumCloud (FR), BSI C5 + national hosting (DE), ENS Alta with national-cloud requirement (ES), AgID Qualifications (IT) — but ONLY when combined with explicit national-territory residency requirement\n' +
+    '       • Bidder must have local office / branch / fiscal presence in the country: "siège ou établissement secondaire en France", "Niederlassung in Deutschland", "sede o sucursal en España"\n' +
+    '     COUNTRIES that trigger this category: any country other than Lithuania, EU-wide remote delivery is normally allowed for EU procurements, so trigger ONLY when the tender EXPLICITLY mandates physical / data presence in a specific named country. Do NOT trigger when (a) the buyer simply lists their own country in the tender notice metadata, (b) language requirement is mentioned but not residency, (c) "GDPR compliance" or generic ISO certifications are required (those are EU-wide). Set rejectReason="requires_foreign_local_presence".\n' +
     '   • 24/7 Operational Support Required: Tender MANDATES round-the-clock (24/7, 24x7, 24h) operational support, on-call duty, after-hours response SLA (e.g., 1h response any time), live ops coverage, NOC services, or shift-based monitoring as a CORE deliverable. We are a development firm without 24/7 ops capacity. Look for phrases like "24/7 support", "døgnvakt", "24-timers vakt", "24 Stunden", "support 24h/7j", "operativ støtte døgnet rundt", "24/7 SLA", "1-hour response time at all hours", "around-the-clock", "soporte 24/7", "supporto 24 ore", "monitoraggio continuativo". DO NOT trigger this category for normal business-hours support, best-effort response, or maintenance windows. Set rejectReason="requires_24_7_support".\n' +
+    '   • Cybersecurity-Only Services (SOC/MDR/SIEM/Pentest/Audit): Tender procures cybersecurity OPERATIONAL or AUDIT services as the CORE deliverable — not custom software development. We are a custom-software development firm, NOT a cybersecurity operations / red-team / audit firm.\n' +
+    '     ❌ NEGATIVE SIGNALS — pure cybersecurity (REJECT):\n' +
+    '       ✗ Scope verbs: "SOC services", "Security Operations Center", "Managed Detection and Response (MDR)", "Managed EDR (M-EDR)", "Managed XDR", "SIEM operations / administration", "NDR (Network Detection and Response)", "continuous monitoring of cyber threats", "threat hunting", "incident response services", "vulnerability assessment / management", "penetration testing", "Red Team exercises", "security audit", "ISMS audit", "Digital Surveillance services", "threat intelligence services"\n' +
+    '       ✗ Lithuanian phrases: "Saugumo operacijų centras", "SOC paslaugos", "SIEM administravimas", "kibernetinių grėsmių žvalgyba", "kibernetinių incidentų atakos grandinės sudarymas", "pažangi saugumo analitika", "informacijos saugumo auditas"\n' +
+    '       ✗ Required role titles WITHOUT broader development context: "SOC Manager", "SOC Analyst (L1/L2/L3)", "SIEM Administrator", "Security Architect", "Incident Response Lead/Analyst", "Threat Intelligence Analyst", "Penetration Tester", "Red Team Operator", "Security Auditor"\n' +
+    '       ✗ Required certifications dominant: CISSP, CISM, CEH (Certified Ethical Hacker), OSCP (OffSec Certified Professional), OSCE, CompTIA Security+ / CASP+, ISACA CRISC, ISACA CISA, CTIA (Certified Threat Intelligence Analyst), GIAC GCIH/GCIA/GREM, CHFI\n' +
+    '       ✗ Title or description names the deliverable as a security service category: "SOC services tender", "Cybersecurity Operations Procurement", "Managed Security Services", "Vulnerability Management Service"\n' +
+    '     ✅ POSITIVE SIGNALS — do NOT reject as cybersecurity-only (security is a sub-component of broader custom software work):\n' +
+    '       ✓ Tender is a CUSTOM SOFTWARE BUILD that mentions security testing / OWASP / DPIA / GDPR as one work-stream among many (architecture + UI + backend + db + security testing)\n' +
+    '       ✓ Generic ISO 27001 certification required for the bidding company, but the SCOPE is custom development\n' +
+    '       ✓ "Security by design" or "secure SDLC" mentioned as a methodology requirement on a development project\n' +
+    '       ✓ Penetration testing required as a single deliverable WITHIN a broader system development contract\n' +
+    '     🧠 DECISION RULE: if the scopeOfAgreement is dominated by security OPERATIONS (monitoring/detection/response/audit/pentest) and there is no custom software DEVELOPMENT being commissioned, set rejectReason="cybersecurity_only". For multi-lot tenders where security is one lot among many, only reject if EVERY lot is pure security.\n' +
     '   • Mixed Lots Required Together: lotStructure=="all-required" AND the umbrella scope covers non-IT work (construction, physical security, cleaning, logistics, food service, training-only, etc.) that we cannot perform alongside the IT portion. Set rejectReason="mixed_lots_all_required".\n' +
     '   • Multi-lot Framework Without IT Lots: lotStructure=="partial" but NONE of the available lots is custom software development (e.g. all lots are management consulting, legal advisory, HR, surveys, hardware supply). Set rejectReason="framework_no_it_lots".\n' +
     '   AMBIGUOUS PROCUREMENT: If it says "system implementation" but implies configuring an off-the-shelf product → REJECT. ACCEPT (empty rejectReason) ONLY if it is custom software development, web/mobile app dev from scratch, bespoke architecture, or maintenance/evolution of custom systems. For partial-bid multi-lot tenders, ACCEPT (empty rejectReason) when AT LEAST ONE lot is custom software development — itLotsScope must list those lot(s).\n' +
@@ -18807,7 +18876,15 @@ async function runScraper() {
         sourceUrlOut = sourceUrlOut.replace(/\/general(\?|$)/i, '/documents$1');
       }
       // Source URL Q: prefer specific file > tender folder > Mercell URL
-      const qualDriveLink = qualSourceFile ? resolveDriveFile(qualSourceFile) : null;
+      // 2026-06-08 (Task #181) — single-file shortcut: jei AI nepateikė
+      // qualificationsSourceFile, BET į Drive įkėlėm TIK 1 failą, akivaizdu
+      // kad qualifications iš jo (run 119 [66/80] case: 1 Kvietimas...pdf).
+      const driveFileKeys = Object.keys(driveFiles);
+      const singleDriveFile = driveFileKeys.length === 1 ? driveFiles[driveFileKeys[0]] : null;
+      let qualDriveLink = qualSourceFile ? resolveDriveFile(qualSourceFile) : null;
+      if (!qualDriveLink && !qualSourceFile && singleDriveFile && qualOut) {
+        qualDriveLink = singleDriveFile;
+      }
       if (qualDriveLink) {
         sourceUrlOut = qualDriveLink;
       } else if (driveFolderLink) {
@@ -19022,6 +19099,22 @@ async function runScraper() {
     // priekį. Tikslas: per vėlu paruošti pasiūlymą, taupom AI tokens.
     let deadlineFilteredCount = 0;
     const DEADLINE_MIN_DAYS = 14;
+    // 2026-06-09 (Task #188) — duration filter: skip tenderius su projekto
+    // trukme > 4 metai (kai trukmė nurodyta). Empty/unparseable → KEEP.
+    let durationFilteredCount = 0;
+    const DURATION_MAX_MONTHS = 48; // 4 years
+    // Multilingual duration parser — apima daugumą EU kalbų formatų
+    const parseDurationMonths = (s) => {
+      if (!s) return null;
+      const str = String(s).toLowerCase();
+      // year patterns: anglų, LT, FR, DE, ES, IT, NO/DK/SE, NL
+      let m = str.match(/(\d+(?:[.,]\d+)?)\s*(?:years?|year-?long|metai|metų|metus|ans?|année?s?|jahre?|años?|año|anni|anno|år|jaar)\b/);
+      if (m) return Math.round(parseFloat(m[1].replace(',', '.')) * 12);
+      // month patterns
+      m = str.match(/(\d+)\s*(?:months?|mo\b|mėn(?:esi(?:ai|ų)?)?|mois|monate?|monat|meses|mes\b|mesi|mese|måneder|maanden)\b/);
+      if (m) return parseInt(m[1], 10);
+      return null;
+    };
     const contentFilterCategories = {};
 
     for (let i = 0; i < toFetch.length; i++) {
@@ -19116,6 +19209,21 @@ async function runScraper() {
               await new Promise(r => setTimeout(r, 200));
               continue;
             }
+          }
+        }
+
+        // --- PRE-AI DURATION FILTER --------------------------------
+        // 2026-06-09 (Task #188) — atfiltruoti tenderius, kurių projekto
+        // trukmė > 4 metai. Empty/unparseable → KEEP. Re-check post-AI taip
+        // pat (AI gali užpildyti dd.duration jei pradžioje buvo tuščia).
+        if (dd.duration) {
+          const months = parseDurationMonths(dd.duration);
+          if (months !== null && months > DURATION_MAX_MONTHS) {
+            durationFilteredCount++;
+            console.log(`    ⏭️  skipping (pre-AI): duration too long ("${dd.duration}" → ${months}mo, max=${DURATION_MAX_MONTHS}mo)`);
+            toFetch[i].details = dd;
+            await new Promise(r => setTimeout(r, 200));
+            continue;
           }
         }
 
@@ -19323,6 +19431,20 @@ async function runScraper() {
           toFetch[i].details = dd;
           await new Promise(r => setTimeout(r, 200));
           continue;
+        }
+
+        // --- POST-AI DURATION FILTER -------------------------------
+        // 2026-06-09 (Task #188) — AI gali užpildyti dd.duration jei
+        // pradžioje buvo tuščia. Re-check 4-metų limit'ą.
+        if (dd.duration) {
+          const postMonths = parseDurationMonths(dd.duration);
+          if (postMonths !== null && postMonths > DURATION_MAX_MONTHS) {
+            durationFilteredCount++;
+            console.log(`    ⏭️  skipping (post-AI): duration too long ("${dd.duration}" → ${postMonths}mo, max=${DURATION_MAX_MONTHS}mo)`);
+            toFetch[i].details = dd;
+            await new Promise(r => setTimeout(r, 200));
+            continue;
+          }
         }
 
         // --- POST-AI MULTI-LOT FRAMEWORK NARROWING -----------------
@@ -19549,6 +19671,7 @@ async function runScraper() {
     console.log(`Rows appended to "For training": ${totalAppendedTraining}`);
     console.log(`Budget-filtered (<500K EUR):   ${budgetFilteredCount}`);
     console.log(`Deadline-filtered (<${DEADLINE_MIN_DAYS}d):       ${deadlineFilteredCount}`);
+    console.log(`Duration-filtered (>${DURATION_MAX_MONTHS}mo):       ${durationFilteredCount}`);
     console.log(`Content-filtered (poor fit):   ${contentFilteredCount}`);
     console.log(`AI-deferred (retry next run):  ${aiDeferredCount}`);
     if (contentFilteredCount > 0) {
