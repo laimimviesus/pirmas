@@ -4,51 +4,51 @@
 // =====================================================================
 // Paleidimas: node scripts/scraper.js
 // Env vars: MERCELL_USERNAME, MERCELL_PASSWORD, GOOGLE_SERVICE_ACCOUNT_KEY,
-// GOOGLE_SHEET_ID, (opt) SHEET_TAB_NAME, (opt) TEST_MODE
+//           GOOGLE_SHEET_ID, (opt) SHEET_TAB_NAME, (opt) TEST_MODE
 // =====================================================================
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
 
-// --- Config --------------------------------------------------------------
+// --- Config ------------------------------------------------------------
 const TEST_MODE = process.env.TEST_MODE === 'true';
-// COUNTRY_FILTER — comma-separated country names (eg "Spain" or
-// "Spain,Portugal"). When set, the listing page collector skips
+// COUNTRY_FILTER — comma-separated country names (e.g. "Spain" or
+// "Spain,Portugal"). When set, the listing-page collector skips
 // tenders whose country doesn't match. Useful for one-off debug runs
-// against a specific procurement portal (eg Spain → PLACSP /
+// against a specific procurement portal (e.g. Spain → PLACSP /
 // contrataciondelestado.es).
 // Country variants — Mercell tender cards expose `country` as a plain
-// English string ("Netherlands"/"United Kingdom"/etc.). User typing
+// English string ("Netherlands"/"United Kingdom"/etc.). Users typing
 // COUNTRY_FILTER often write the colloquial / lowercased form ("uk",
 // "netherlands", "the netherlands"). To avoid silent zero-match runs
 // (2026-05-12 Netherlands run: 420 tenders all filtered out), every
-// filter token is normalized to lowercase AND expanded to a small set
+// filter token is normalised to lowercase AND expanded to a small set
 // of equivalent aliases before comparison.
 const COUNTRY_ALIASES = {
-  'netherlands': ['netherlands', 'the netherlands', 'holland', 'nl'],
-  'the netherlands': ['netherlands', 'the netherlands', 'holland', 'nl'],
-  'holland': ['netherlands', 'the netherlands', 'holland', 'nl'],
-  'united kingdom': ['united kingdom', 'uk', 'great britain', 'britain', 'england'],
-  'uk': ['united kingdom', 'uk', 'great britain', 'britain', 'england'],
-  'great britain': ['united kingdom', 'uk', 'great britain', 'britain', 'england'],
-  'czech republic': ['czech republic', 'czechia'],
-  'czechia': ['czech republic', 'czechia'],
-  'germany': ['germany', 'deutschland'],
-  'deutschland': ['germany', 'deutschland'],
-  'spain': ['spain', 'españa', 'espana'],
-  'sweden': ['sweden', 'sverige'],
-  'finland': ['finland', 'suomi'],
-  'norway': ['norway', 'norge'],
-  'denmark': ['denmark', 'danmark'],
-  'france': ['france'],
-  'belgium': ['belgium', 'belgique', 'belgië', 'belgie'],
-  'estonia': ['estonia', 'eesti'],
-  'lithuania': ['lithuania', 'lietuva'],
-  'latvia': ['latvia', 'latvija'],
-  'austria': ['austria', 'österreich', 'osterreich'],
-  'switzerland': ['switzerland', 'switzerland', 'suisse', 'svizzera'],
-  'portugal': ['portugal'],
-  'ireland': ['ireland', 'éire', 'eire'],
+  'netherlands':       ['netherlands', 'the netherlands', 'holland', 'nl'],
+  'the netherlands':   ['netherlands', 'the netherlands', 'holland', 'nl'],
+  'holland':           ['netherlands', 'the netherlands', 'holland', 'nl'],
+  'united kingdom':    ['united kingdom', 'uk', 'great britain', 'britain', 'england'],
+  'uk':                ['united kingdom', 'uk', 'great britain', 'britain', 'england'],
+  'great britain':     ['united kingdom', 'uk', 'great britain', 'britain', 'england'],
+  'czech republic':    ['czech republic', 'czechia'],
+  'czechia':           ['czech republic', 'czechia'],
+  'germany':           ['germany', 'deutschland'],
+  'deutschland':       ['germany', 'deutschland'],
+  'spain':             ['spain', 'españa', 'espana'],
+  'sweden':            ['sweden', 'sverige'],
+  'finland':           ['finland', 'suomi'],
+  'norway':            ['norway', 'norge'],
+  'denmark':           ['denmark', 'danmark'],
+  'france':            ['france'],
+  'belgium':           ['belgium', 'belgique', 'belgië', 'belgie'],
+  'estonia':           ['estonia', 'eesti'],
+  'lithuania':         ['lithuania', 'lietuva'],
+  'latvia':            ['latvia', 'latvija'],
+  'austria':           ['austria', 'österreich', 'osterreich'],
+  'switzerland':       ['switzerland', 'schweiz', 'suisse', 'svizzera'],
+  'portugal':          ['portugal'],
+  'ireland':           ['ireland', 'éire', 'eire'],
 };
 const COUNTRY_FILTER_RAW = (process.env.COUNTRY_FILTER || '')
   .split(',').map(s => s.trim()).filter(Boolean);
@@ -60,7 +60,7 @@ for (const token of COUNTRY_FILTER_RAW) {
 }
 const COUNTRY_FILTER_ACTIVE = COUNTRY_FILTER.size > 0;
 // When a filter is active, allow many more listing pages than usual —
-// matching tenders may be sparse (eg Spanish IT tenders are <2% of
+// matching tenders may be sparse (e.g. Spanish IT tenders are <2% of
 // the global feed), so a 1-page cap in TEST_MODE would never find any.
 const MAX_PAGES = COUNTRY_FILTER_ACTIVE
   ? Number(process.env.MAX_PAGES || 50)
@@ -76,7 +76,7 @@ const SOURCE_NAV_TIMEOUT = 25000;
 // 2026-06-08 (Task #180) — known slow-but-alive portals get extended timeout.
 // Galicia SILEX (conselleriadefacenda.es) renders >30s from GitHub runners;
 // 25s default Chrome timeout fires before any content shows → classified as
-// dead site. Bump to 60s for these hosts; failing tenders fall through to
+// dead-site. Bump to 60s for these hosts; failing tenders fall through to
 // PLACSP federal fallback (line ~16750) so the cost is still bounded.
 const SLOW_SOURCE_HOSTS = [
   'conselleriadefacenda.es',
@@ -88,12 +88,12 @@ if (COUNTRY_FILTER_ACTIVE) {
   console.log(`🔎 COUNTRY_FILTER active: only collecting tenders from ${Array.from(COUNTRY_FILTER).join(', ')} (max pages: ${MAX_PAGES})`);
 }
 
-// --- Anthropic Claude API -------------------------------------------
+// --- Anthropic Claude API ---------------------------------------------
 // Naudojam Claude Haiku 4.5 (pigus, greitas) dviem užduotims:
-// 1. Pavadinimo ir scope tekstų vertimui į anglų kalbą
-// 2. Struktūrizuotų laukų ištraukimui iš Mercell description'o +
-// šaltinio puslapio teksto (maxBudget, requirements, qualifications,
-// offerWeighingCriteria)
+//   1. Pavadinimo ir scope tekstų vertimui į anglų kalbą
+//   2. Struktūrizuotų laukų ištraukimui iš Mercell description'o +
+//      šaltinio puslapio teksto (maxBudget, requirements, qualifications,
+//      offerWeighingCriteria)
 // Jei nėra ANTHROPIC_API_KEY — AI žingsniai praleidžiami, scraper'is
 // veikia kaip anksčiau.
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
@@ -117,23 +117,23 @@ async function _throttleClaude() {
       return;
     }
     const waitMs = 60000 - (now - _claudeCallTimes[0]) + 250;
-    console.log(` ⏳ Claude rate-limit wait ${(waitMs/1000).toFixed(1)}s (${_claudeCallTimes.length}/${AI_MAX_PER_MIN} in last 60s)`);
+    console.log(`    ⏳ Claude rate-limit wait ${(waitMs/1000).toFixed(1)}s (${_claudeCallTimes.length}/${AI_MAX_PER_MIN} in last 60s)`);
     await _sleep(waitMs);
   }
 }
 
 // --- Portal credentials --------------------------------------------------
-// Mercell "Go to source" now available in different platforms and platforms (Hansel,
+// Mercell „Go to source" nuoroda dažnai veda į kitos platformos (Hansel,
 // tarjouspalvelu.fi, eu-supply, e-tendering, mercell.com pati, etc.) login
 // puslapį. Norėdami atsisiųsti tender'io priedus iš tų portalų, laikom
 // vartotojo / slaptažodžio porą JSON'e su hostname raktais. Paslaptis nustatoma
 // GitHub Actions secret'u `PORTAL_CREDS_JSON`. Pavyzdys:
 // {
-// "tarjouspalvelu.fi": { "username": "u@e.com", "password": "..." },
-// "eu.eu-supply.com": { "username": "u@e.com", "password": "..." },
-// "permalink.mercell.com": { "username": "u@e.com", "password": "..." }
+//   "tarjouspalvelu.fi":      { "username": "u@e.com", "password": "..." },
+//   "eu.eu-supply.com":       { "username": "u@e.com", "password": "..." },
+//   "permalink.mercell.com":  { "username": "u@e.com", "password": "..." }
 // }
-// Niekada nelaikom tų reikšmių code. `getPortalCreds()` priima visą URL arba
+// Niekada nelaikom tų reikšmių kode. `getPortalCreds()` priima visą URL arba
 // hostname'ą, normalizuoja iki host, daro exact-match, tada suffix-match
 // (`sub.example.com` → `example.com`).
 let _portalCreds = {};
@@ -161,7 +161,7 @@ const PORTAL_HOST_ALIASES = {
   // Bavaria DEVA — public-facing front-end is evergabe.bayern.de but the
   // user-facing login (and the redirect target after clicking through
   // the supplier deeplink) lives on auftraege.bayern.de. User registered
-  // the account at auftraege.bayern.de 2026-05-20; aka the front end
+  // the account at auftraege.bayern.de 2026-05-20; alias the front-end
   // so credentials look-up by source-host hits the same cred entry
   // regardless of which DEVA URL Mercell handed us.
   'evergabe.bayern.de': 'auftraege.bayern.de',
@@ -182,7 +182,7 @@ function getPortalCreds(hostOrUrl) {
     if (host === k || host.endsWith('.' + k)) return _portalCreds[key];
   }
   // SSO alias — recursively look up the aliased host. Allows the
-  // creds JSON to keep a single entry (eg "cloudia.net") that
+  // creds JSON to keep a single entry (e.g. "cloudia.net") that
   // covers every fronted portal (tarjouspalvelu.fi, etc.).
   if (PORTAL_HOST_ALIASES[host]) {
     const aliasCreds = getPortalCreds(PORTAL_HOST_ALIASES[host]);
@@ -194,19 +194,19 @@ function getPortalCreds(hostOrUrl) {
 // Hosts that ALWAYS need login, even when the loginGated heuristic doesn't
 // fire. These portals serve a thin "shell" page (~100–500 chars) when the
 // visitor is anonymous and lazy-load actual tender content via AJAX after
-// authentication. Login marker regex misses them because the shell page
+// authentication. Login-marker regex misses them because the shell page
 // shows almost no body text. Real-world example: e-avrop.com renders
 // "Download and Subscribe / Go to My Subscriptions / Current Notices /
 // Places / RÄDDNINGSTJÄNSTEN STORGÖTEBORG / NOTICE / SV EN / Register
 // account / © 1999-2026 Antirio AB Help Support" — total ≈190 chars,
-// only 1 marker matches ("Register account"), according to the heuristic skips
+// only 1 marker matches ("Register account"), so the heuristic skips
 // login. We force login here.
 const ALWAYS_LOGIN_HOSTS = [
-  'e-avrop.com', // Swedish — Antirio platform shell
+  'e-avrop.com',          // Swedish — Antirio platform shell
   // tendsign.com — re-added 2026-05-14. Public anonymous view
   // (/public/p_meformsnotice.aspx) exposes the Announcement summary
-  // and a "Document" tab anchor of shape
-  // <a href="../doc.aspx?MeFormsNoticeId=<id>&Goto=Docs">Document</a>
+  // and a "Dokument" tab anchor of shape
+  //   <a href="../doc.aspx?MeFormsNoticeId=<id>&Goto=Docs">Dokument</a>
   // but clicking it lands on a LOGIN wall (user-confirmed DOM 2026-05-14
   // for MeFormsNoticeId=91377). So we need credentials to reach the
   // actual document URLs (Flow A p_documents.aspx / Flow B
@@ -214,41 +214,41 @@ const ALWAYS_LOGIN_HOSTS = [
   // the session cookie carries through the public→doc.aspx redirect
   // chain, unlocking Documents content for fetchTendSignDocuments.
   'tendsign.com',
-  'kommersannons.se', // Swedish FMV — Kommers Annons shell
-  'tarjouspalvelu.fi', // Finnish — Cloudia-fronted (SSO via login.cloudia.net)
+  'kommersannons.se',      // Swedish FMV — Kommers Annons shell
+  'tarjouspalvelu.fi',     // Finnish — Cloudia-fronted (SSO via login.cloudia.net)
   // evergabe-online.de — German federal procurement portal (cosinex
   // platform). Anonymous /tenderdetails.html?id=X pages render a small
   // summary (~10-25k bodyLen) but tender DOCUMENTS are behind a login
-  // wall (Wicket-based "AnA-Web user account"). User registered
+  // wall (Wicket-based "AnA-Web user account"). User registered an
   // account 2026-05-16 and added creds to PORTAL_CREDS_JSON. The login
   // modal trigger has misleading "Register" text — handled by a
   // per-host pre-trigger in attemptPortalLogin (see comment block
-  // there). Adding to ALWAYS_LOGIN_HOSTS even when the anonymous
+  // there). Adding to ALWAYS_LOGIN_HOSTS so even when the anonymous
   // summary renders successfully (and thus is not flagged login-gated
   // by default heuristics), we still force login to reach the docs.
   'evergabe-online.de',
   // evergabe.de (Healy Hudson) — German national procurement portal.
-  // Anonymous /documents/<uuid>/delivery routes landing page renders a small
-  // shell ("Licenses and Support One Identity ... In the tendering process
-  // participate ... The client will be automatically informed immediately")
-  // with NO downloadable tender documents visible without login. users
+  // Anonymous /unterlagen/<uuid>/zustellwege landing page renders a small
+  // shell ("Lizenzen und Support One Identity ... Am Vergabeverfahren
+  // teilnehmen ... Der Auftraggeber wird sofort automatisch informiert")
+  // with NO downloadable Vergabeunterlagen visible without login. User
   // registered an account 2026-05-20 and added creds to PORTAL_CREDS_JSON.
-  // Force login here so we reach the post-registration tender documents
-  // download (typically a ZIP bundle reachable via the "Vergabedokumente" - tender documents)
-  // download" anchor on the authenticated page).
+  // Force login here so we reach the post-registration Vergabeunterlagen
+  // download (typically a ZIP bundle reachable via the "Vergabeunterlagen
+  // herunterladen" anchor on the authenticated page).
   'evergabe.de',
   // auftraege.bayern.de (DEVA — Bavaria) — Mercell hands us a deeplink at
   // evergabe.bayern.de/evergabe.bieter/api/supplier/external/deeplink/sub/<id>
   // which redirects to auftraege.bayern.de. The anonymous DEVA shell shows
-  // only "Register / Benefits for registered companies / Download
-  // Download the tender documents as a zip container — the ZIP IS
+  // only "Anmelden / Vorteile für angemeldete Unternehmen / Laden Sie
+  // Vergabeunterlagen gesammelt als zip-Container herunter" — the ZIP IS
   // there but login-gated. User registered 2026-05-20. Both hosts in
   // ALWAYS_LOGIN_HOSTS for safety: source hostname is sometimes captured
   // as evergabe.bayern.de (pre-redirect) and sometimes as auftraege.bayern.de
   // (post-redirect) depending on timing.
   'auftraege.bayern.de',
   'evergabe.bayern.de',
-  // fbhh-evergabe.web.hamburg.de — Hamburg DEVA (Free and Hanseatic City of Hamburg)
+  // fbhh-evergabe.web.hamburg.de — Hamburg DEVA (Freie und Hansestadt
   // Hamburg). Same Healy Hudson platform as Bavaria; same supplier
   // deeplink pattern (/evergabe.bieter/api/supplier/external/deeplink/sub/<id>)
   // → login-gated documents. Requires separate Hamburg account
@@ -258,8 +258,8 @@ const ALWAYS_LOGIN_HOSTS = [
   // 2026-05-26 removal. Background:
   //
   // 2026-05-26 removal (Task #94): the anonymous flow
-  // <a onclick="downloadDocForAnonymous('id')">filename</a>
-  // <button onclick="downloadForAnonymousUser()">ATSISIŲSTI ZIP</button>
+  //   <a onclick="downloadDocForAnonymous('id')">filename</a>
+  //   <button onclick="downloadForAnonymousUser()">ATSISIŲSTI ZIP</button>
   // worked for SOME tenders, and the user wanted to avoid CVPP's auto-
   // subscription emails that arrive after every authenticated view.
   //
@@ -273,14 +273,14 @@ const ALWAYS_LOGIN_HOSTS = [
   // concern is gone. Forcing login lets attemptPortalLogin establish a
   // CVPP session cookie BEFORE fetchViesiejiPirkimaiDocuments runs; the
   // existing handler harvester then sees the full tender content
-  // (Pirkimo documentai tab + downloadZip/viewCD/eAssociateUser paths)
+  // (Pirkimo dokumentai tab + downloadZip/viewCD/eAssociateUser paths)
   // that anonymous users never get to see.
   'viesiejipirkimai.lt',
-  // pmp.b2g.etat.lu — Luxembourg e-Procurement (Platforme Marchés
+  // pmp.b2g.etat.lu — Luxembourg e-Procurement (Plateforme Marchés
   // Publics). Anonymous fetch of /entreprise/consultation/<id> renders
-  // the catalog header + "Se connecter" prompt, not the tender detail.
+  // the catalogue header + "Se connecter" prompt, not the tender detail.
   // After TAM authentication (see LOGIN_URLS['pmp.b2g.etat.lu']) the
-  // same URL renders the purchase notice with downloadable
+  // same URL renders the procurement notice with downloadable
   // "Pièces du dossier" / DCE documents. Creds in PORTAL_CREDS_JSON
   // (CCT account, registered 2026-06-01).
   'pmp.b2g.etat.lu',
@@ -289,7 +289,7 @@ const ALWAYS_LOGIN_HOSTS = [
   // achatpublic.com — French SAFE TENDER platforma. Mercell rodo subdomain
   // tenders-<buyer>.achatpublic.com tender URL'ą. Anonymous: source page
   // login-gated (passwordField=true, bodyLen=6459). Registracija PERREDIRECTINA
-  // į marchesonline.com (tos pačios platformsos login portal'as) — taigi
+  // į marchesonline.com (tos pačios platformos login portal'as) — taigi
   // creds tikrai naudojami ten. Abu host'ai PORTAL_CREDS_JSON'e.
   'achatpublic.com',
   'marchesonline.com',
@@ -298,15 +298,15 @@ const ALWAYS_LOGIN_HOSTS = [
   // šabloną be tender turinio. Login → tender detail + DCE.
   'e-marchespublics.com',
   // anogov.com — Portuguese procurement portal (Anogov). Mercell rodo
-  // login-gated tender URL'ą. Acceptable post login fetch tikslui.
+  // login-gated tender URL'ą. Acceptable post-login fetch tikslui.
   'anogov.com',
-  // acingov.pt — Portuguese ACINGOV ​​procurement platforma. Anonymous shell
-  // su login prompt'u; tender detail + documentation prieinami tik authenticated.
+  // acingov.pt — Portuguese ACINGOV procurement platforma. Anonymous shell
+  // su login prompt'u; tender detail + dokumentai prieinami tik authenticated.
   'acingov.pt',
   // procontract.due-north.com — UK Due North ProContract platforma. Mercell
   // tiesiogiai rodo procontract.due-north.com/ homepage URL'ą (be tender
   // ID), kuris yra "Log In User Name / Password / Already registered?"
-  // format. Po login'o supplier'is gauna access prie buyer'ių tenderio
+  // forma. Po login'o supplier'is gauna access prie buyer'ių tenderio
   // detail page'ų + DCE failų.
   'procontract.due-north.com',
   // dtvp.de — REMOVED 2026-05-14 (briefly added then reverted same day).
@@ -314,17 +314,17 @@ const ALWAYS_LOGIN_HOSTS = [
   // The Germany run revealed two facts that make forced-login a NET
   // NEGATIVE for dtvp.de:
   //
-  // 1. The bulk-documents ZIP ("All documents as a ZIP file")
-  // download") is anonymously downloadable on most dtvp.de
-  // notice pages — the existing source-prefetch flow grabs it
-  // without auth (proven on tender CXS0YYEYTPNPSNPC: 9 MB ZIP →
-  // 30 000 ch text → AI extracted suitability criteria correctly).
+  // 1. The bulk-documents ZIP ("Alle Dokumente als ZIP-Datei
+  //    herunterladen") is anonymously downloadable on most dtvp.de
+  //    notice pages — the existing source-prefetch flow grabs it
+  //    without auth (proven on tender CXS0YYEYTPNPSNPC: 9 MB ZIP →
+  //    30 000 ch text → AI extracted Eignungskriterien correctly).
   //
   // 2. The id.dtvp.de Keycloak login form's submit currently fails
-  // ("login submission did not clear password field"). The fail
-  // path triggers a POST-LOGIN source re-fetch that OVERWRITES the
-  // sourceFilesText we already collected, wiping out the 30 000 ch
-  // of ZIP content. Net result: less context for the AI.
+  //    ("login submission did not clear password field"). The fail
+  //    path triggers a POST-LOGIN source re-fetch that OVERWRITES the
+  //    sourceFilesText we already collected, wiping out the 30 000 ch
+  //    of ZIP content. Net result: less context for the AI.
   //
   // Until either the anonymous ZIP fails (proven failing case) OR the
   // Keycloak login is debugged + merged (instead of overwrite), keep
@@ -340,7 +340,7 @@ function hostRequiresLogin(host) {
 
 // Dedicated login URLs for portals where the tender page (Mercell "Go to
 // source" target) does NOT contain a login form. attemptPortalLogin's
-// default behavior of navigating to the source URL fails on these
+// default behaviour of navigating to the source URL fails on these
 // portals because the announcement page renders only an empty shell —
 // the actual login form lives at a separate URL (typically a /Default
 // or /Login route). When a host appears in this map, we navigate to
@@ -350,7 +350,7 @@ function hostRequiresLogin(host) {
 const LOGIN_URLS = {
   // e-avrop.com — confirmed direct login URL is /login.aspx (not the
   // earlier /e-User/Default.aspx which renders without a visible form).
-  'e-avrop.com': 'https://www.e-avrop.com/login.aspx',
+  'e-avrop.com':              'https://www.e-avrop.com/login.aspx',
   // kommersannons.se hosts MULTIPLE buyer tenants under the same root
   // domain (/fmv/, /elite/, /roslagsvatten/, /goteborgshamn/, etc.) and
   // each tenant has its OWN /<tenant>/Account/Login.aspx login form. The
@@ -358,9 +358,9 @@ const LOGIN_URLS = {
   // because the form uses tenant-relative paths and ASP.NET path-
   // scopes its auth cookie. We therefore derive the login URL from the
   // source URL's first path segment at call time (see
-  // getDedicatedLoginUrl). The entry below is just a host presence
+  // getDedicatedLoginUrl). The entry below is just a host-presence
   // marker — the value is used as a fallback when source URL has no
-  // tenant prefix (ie it's the bare root).
+  // tenant prefix (i.e. it's the bare root).
   // 2026-05-12 fix: switched from /Default.aspx → /Account/Login.aspx.
   // /Default.aspx is the tenant HOMEPAGE — it renders header/footer
   // and a generic "Login" button that links to Account/Login.aspx. The
@@ -368,23 +368,23 @@ const LOGIN_URLS = {
   // password-field scan returned 0 fields and we hit a random submit
   // button (search/contact). Account/Login.aspx is the actual login
   // form with email + password inputs.
-  'kommersannons.se': 'https://www.kommersannons.se/fmv/Account/Login.aspx',
+  'kommersannons.se':         'https://www.kommersannons.se/fmv/Account/Login.aspx',
   // tarjouspalvelu.fi (Finnish national tender front-end) doesn't host
   // its own login form — the Cloudia SaaS platform serves authentication
   // at login.cloudia.net. After login there, session cookies are valid
   // for tarjouspalvelu.fi via shared backend (Cloudia SSO).
   // Credentials look up via PORTAL_HOST_ALIASES (tarjouspalvelu.fi
   // → cloudia.net).
-  'tarjouspalvelu.fi': 'https://login.cloudia.net/user/login',
+  'tarjouspalvelu.fi':        'https://login.cloudia.net/user/login',
   // evergabe-online.de — login modal is opened by clicking the
   // confusingly-named "Register" button on the main start page. We
   // navigate to /start.html so the per-host pre-trigger (in
   // attemptPortalLogin) can find and click that button to open the
   // Wicket AJAX login modal. Form fields:
-  // input[name="usernameFormGroup:usernameTextField"]
-  // input[name="passwordFormGroup:passwordTextField"]
-  // button[name="submitButton"] (text also says "Register" — misleading)
-  'evergabe-online.de': 'https://www.evergabe-online.de/start.html',
+  //   input[name="usernameFormGroup:usernameTextField"]
+  //   input[name="passwordFormGroup:passwordTextField"]
+  //   button[name="submitButton"] (text also says "Register" — misleading)
+  'evergabe-online.de':       'https://www.evergabe-online.de/start.html',
   // marches-publics.gouv.fr — the source URL itself has a "Login" button
   // in the corner; clicking it pops up a form whose fields are
   // form[_username] / form[_password] (action=/entreprise/login). The
@@ -393,9 +393,9 @@ const LOGIN_URLS = {
   // tendsign.com keeps its login form on the tender URL via redirect,
   // so the default flow works — no override needed.
   //
-  // pmp.b2g.etat.lu — Luxembourg e-Procurement (Platforme Marchés
+  // pmp.b2g.etat.lu — Luxembourg e-Procurement (Plateforme Marchés
   // Publics). Anonymous viewing of /entreprise/consultation/<id> redirects
-  // to a search catalog (not the specific tender). Tender details +
+  // to a search catalog (not the specific tender). Tender detail +
   // documents require authentication. Login form is hosted on a SEPARATE
   // host (login.b2g.etat.lu) via IBM Tivoli Access Manager (TAM) servlet.
   // After successful TAM auth, the session cookie is set on the parent
@@ -405,28 +405,28 @@ const LOGIN_URLS = {
   // /entreprise/login so the post-auth redirect lands inside the supplier
   // portal. The "TAM_OP=login&AUTHNLEVEL=3" params trigger the username
   // /password form (rather than smart-card / certificate auth).
-  'pmp.b2g.etat.lu': 'https://login.b2g.etat.lu/login/TAMLoginServlet?TAM_OP=login&AUTHNLEVEL=3&HOSTNAME=pmp.b2g.etat.lu&METHOD=GET&PROTOCOL=https&REFERER=https%3A%2F%2Fpmp.b2g.etat.lu%2Fentreprise&URL=%2Fentreprise%2Flogin&redirectUrl=https%3A%2F%2Fpmp.b2g.etat.lu%2Fentreprise%2Flogin&authMode=UP',
-  // subreport-elvis.de — German Subreport ELViS Procurement Portal. Source
-  // URLs like /download/bund/E.../<id>/known redirect to the
+  'pmp.b2g.etat.lu':          'https://login.b2g.etat.lu/login/TAMLoginServlet?TAM_OP=login&AUTHNLEVEL=3&HOSTNAME=pmp.b2g.etat.lu&METHOD=GET&PROTOCOL=https&REFERER=https%3A%2F%2Fpmp.b2g.etat.lu%2Fentreprise&URL=%2Fentreprise%2Flogin&redirectUrl=https%3A%2F%2Fpmp.b2g.etat.lu%2Fentreprise%2Flogin&authMode=UP',
+  // subreport-elvis.de — German Subreport ELViS Vergabeportal. Source
+  // URLs like /download/bund/E.../<id>/bekanntmachung redirect to the
   // root page (no login form there). Dedicated login page is at
   // /elvis.public/portal.do?method=portalLogin — Wicket-based form
   // with username + password fields. Confirmed via login page HTML
   // template (sales@cornercasetech.com / CornerCase2025@ in PORTAL_CREDS).
-  'subreport-elvis.de': 'https://www.subreport-elvis.de/elvis.public/portal.do?method=portalLogin',
+  'subreport-elvis.de':       'https://www.subreport-elvis.de/elvis.public/portal.do?method=portalLogin',
   // 2026-06-15 — achatpublic.com login forma faktiškai gyvena
   // marchesonline.com (kai user'is kuria profilį, redirect'ina ten).
-  // To the pačios SAFE TENDER platformsos abi host'ai dalinasi sesiją.
+  // Tos pačios SAFE TENDER platformos abi host'ai dalinasi sesiją.
   // Default-jam navigate'inam į marchesonline.com identification page.
-  'achatpublic.com': 'https://www.marchesonline.com/extranet/connexion/login.cfm',
-  'marchesonline.com': 'https://www.marchesonline.com/extranet/connexion/login.cfm',
+  'achatpublic.com':          'https://www.marchesonline.com/extranet/connexion/login.cfm',
+  'marchesonline.com':        'https://www.marchesonline.com/extranet/connexion/login.cfm',
   // e-marchespublics.com — French aggregator. Login URL pattern
   // /index.cfm?fuseaction=connexion.afficheConnexion. Po login'o session
   // suteikia priėjimą prie /appel-offre/<id> DCE failų.
-  'e-marchespublics.com': 'https://www.e-marchespublics.com/index.cfm?fuseaction=connexion.afficheConnexion',
-  // anogov.com — Portuguese Anogov supplier portal (panašu į contractaciondelestado).
-  'anogov.com': 'https://www.anogov.com/anogov-supplier-portal/login.xhtml',
-  // acingov.pt — ACINGOV ​​Portuguese e-procurement.
-  'acingov.pt': 'https://community.acingov.pt/Account/Login',
+  'e-marchespublics.com':     'https://www.e-marchespublics.com/index.cfm?fuseaction=connexion.afficheConnexion',
+  // anogov.com — Portuguese Anogov supplier portal (panašu į contrataciondelestado).
+  'anogov.com':               'https://www.anogov.com/anogov-supplier-portal/login.xhtml',
+  // acingov.pt — ACINGOV Portuguese e-procurement.
+  'acingov.pt':               'https://community.acingov.pt/Account/Login',
   // procontract.due-north.com — UK Due North ProContract supplier login
   // URL pattern. Form: User Name (input[name="UserName"]) +
   // Password (input[name="Password"]) → Submit button. Po login'o
@@ -443,12 +443,12 @@ const LOGIN_URLS = {
 // hit ERR_NAME_NOT_RESOLVED on typo'd domains.
 //
 // Currently handles:
-// - marchespublics.gouv.fr (no hyphen) → marches-publics.gouv.fr
-// - http://marches-publics.gouv.fr → https:// (forced HTTPS)
-// - dtvp.de /Satellite/notice/<id> → /Satellite/notice/<id>/documents
-// - VMP-Cosinex /VMPSatellite/notice/<id> → /VMPSatellite/notice/<id>/documents
-// (evergabe.nrw.de, vergabe.metropoleruhr.de, vergabemarktplatz.brandenburg.de,
-// and similar German procurement portals on Cosinex platform)
+//   - marchespublics.gouv.fr (no hyphen) → marches-publics.gouv.fr
+//   - http://marches-publics.gouv.fr     → https:// (forced HTTPS)
+//   - dtvp.de /Satellite/notice/<id> → /Satellite/notice/<id>/documents
+//   - VMP-Cosinex /VMPSatellite/notice/<id> → /VMPSatellite/notice/<id>/documents
+//     (evergabe.nrw.de, vergabe.metropoleruhr.de, vergabemarktplatz.brandenburg.de,
+//      and similar German Vergabe portals on Cosinex platform)
 //
 // Safe to call repeatedly — operations are idempotent.
 function normalizeSourceUrl(rawUrl) {
@@ -483,16 +483,16 @@ function normalizeSourceUrl(rawUrl) {
 
   // 2026-05-27 — VMP-Cosinex /VMPSatellite/notice/<id> rewrite to
   // /VMPSatellite/notice/<id>/documents. Identical fix pattern as dtvp.de
-  // but for the family of German procurement portals built on Cosinex's
-  // Procurement Management Platform (VMP). Each host's notice + documents
+  // but for the family of German Vergabe portals built on Cosinex's
+  // Vergabe-Management-Plattform (VMP). Each hosts notice + documents
   // tabs at the same path scheme; the /documents page is where the
-  // "Download all documents as a ZIP file" bulk-ZIP link lives.
+  // "Alle Dokumente als ZIP-Datei herunterladen" bulk-ZIP link lives.
   //
   // Confirmed hosts (log 27 audit):
-  // evergabe.nrw.de, vergabe.metropoleruhr.de,
-  // vergabemarktplatz.brandenburg.de, landesverwaltung.vergabe.rlp.de,
-  // evergabe.sachsen.de, ausschreibungen.landbw.de,
-  // evergabe.bundesverkehrsverwaltung.de, etc.
+  //   evergabe.nrw.de, vergabe.metropoleruhr.de,
+  //   vergabemarktplatz.brandenburg.de, landesverwaltung.vergabe.rlp.de,
+  //   evergabe.sachsen.de, ausschreibungen.landbw.de,
+  //   evergabe.bundesverkehrsverwaltung.de, etc.
   // We catch the family via any host that exposes /VMPSatellite/notice/.
   {
     const vmpNoticeMatch = u.pathname.match(/^\/VMPSatellite\/notice\/([A-Z0-9]{6,40})(?:\/.*)?$/i);
@@ -513,17 +513,17 @@ function getDedicatedLoginUrl(host, sourceUrl) {
   // kommersannons.se — multi-tenant: extract /<tenant>/ from the source
   // URL and build /<tenant>/Account/Login.aspx so we log in on the SAME
   // path scope as the tender page. Falls through to the static
-  // LOGIN_URLS entry if no tenant prefix is ​​parseable.
+  // LOGIN_URLS entry if no tenant prefix is parseable.
   // 2026-05-12: user confirmed the actual login form lives at
   // /<tenant>/Account/Login.aspx (not /<tenant>/Default.aspx — that's
   // the homepage, which contains only header navigation and a "Login"
-  ( // button that links here).
+  // button that links here).
   if (h === 'kommersannons.se' || h.endsWith('.kommersannons.se')) {
     try {
       if (sourceUrl) {
         const u = new URL(sourceUrl);
         // Path looks like "/elite/Notice/NoticeOverview.aspx" — first
-        // non-empty segment is the tenant. Whitelist alphanumeric +
+        // non-empty segment is the tenant. Whitelist alphanumerics +
         // hyphen to avoid stray segments like "Notice" (which would
         // happen if the URL was already on /Notice/...).
         const segs = u.pathname.split('/').filter(Boolean);
@@ -534,7 +534,7 @@ function getDedicatedLoginUrl(host, sourceUrl) {
         }
       }
     } catch (_) { /* fall through */ }
-    return LOGIN_URLS['kommersannons.se'] || zero;
+    return LOGIN_URLS['kommersannons.se'] || null;
   }
   // e-avrop.com — earlier attempt at /<tenant>/login.aspx revealed
   // those URLs don't exist (server 302s to bare root). Stick with
@@ -555,22 +555,22 @@ function getDedicatedLoginUrl(host, sourceUrl) {
 // ---------------------------------------------------------------------
 // Scan a flattened public-notice text (TED, FTS, Doffin, hilma, etc.)
 // for known qualification-section anchors and return up to ~6000 chars
-// of structured snippets (one per anchor hit). The caller prepares the
-// result to the AI ​​input so Claude sees the qualification cues UP-FRONT
+// of structured snippets (one per anchor hit). The caller prepends the
+// result to the AI input so Claude sees the qualification cues UP-FRONT
 // instead of buried in 30k chars of breadcrumbs / metadata.
 //
 // Anchors are multilingual because TED renders in 24 EU langs and many
 // portals republish the notice in the buyer's local language. We match
 // case-insensitively, on word boundaries, and look for headings that
 // sit on their own line OR start a sentence (TED's flat text often
-// concatenates: "5.1.9.\nSelection criteria\n Criterion: Type:
+// concatenates: "5.1.9.\nSelection criteria\n  Criterion: Type:
 // Suitability...\n").
 //
 // Output format (compact, keeps Claude focused):
-// [HINT: Selection criteria]
-// <up to 1200 chars of context>
-// [HINT: Eligibility criteria]
-// <…>
+//   [HINT: Selection criteria]
+//   <up to 1200 chars of context>
+//   [HINT: Eignungskriterien]
+//   <…>
 // Returns '' (empty string) if no anchors hit.
 // =====================================================================
 function extractQualificationHints(text) {
@@ -578,7 +578,7 @@ function extractQualificationHints(text) {
   const ANCHORS = [
     // English (TED / FTS)
     /\b(Selection criteria|Conditions for participation|Suitability to pursue the professional activity|Economic and financial standing|Technical and professional ability|Award criteria)\b/i,
-    // TED eForms structural patterns — these are stable across languages
+    // TED eForms structural patterns — these are stable across language
     // renderings because TED eForms uses English internal labels even
     // when the buyer language is non-English. "Type:" appears at the
     // start of each criterion block; "Procurement Term" labels frame
@@ -587,15 +587,15 @@ function extractQualificationHints(text) {
     /(?:^|\s)(5\.1\.(?:9|10|11)|BT-7[0-9]{2})\.?\s/,
     /\b(Type:\s*(?:Suitability|Economic|Technical|Other)|Procurement\s+Term|Lot\s+\d+\s*[:.\-—]\s*Conditions?)\b/i,
     // Spanish (PLACSP, BOE)
-    /\b(Solvencia económica(?: y financiera)?|Solvencia técnica(?: o profesional)?|Criterios? de selección|Criterios de adjudicación|Condiciones de admisión|Criterio de Solvencia (?: Técnica|Económica)|Aptitud para ejercer|Capacidad para contratar|Requisitos? de aptitud)\b/i,
+    /\b(Solvencia económica(?: y financiera)?|Solvencia técnica(?: o profesional)?|Criterios? de selección|Criterios de adjudicación|Condiciones de admisión|Criterio de Solvencia (?:Técnica|Económica)|Aptitud para ejercer|Capacidad para contratar|Requisitos? de aptitud)\b/i,
     // German (DTVP, evergabe)
-    /\b(Suitability criteria|Suitability evidence|Selection criteria|Award criteria|Economic and financial capacity|Technical and professional capacity|Requirements for the bidder|Suitability requirements)\b/i,
+    /\b(Eignungskriterien|Eignungsnachweise|Auswahlkriterien|Zuschlagskriterien|Wirtschaftliche und finanzielle Leistungsfähigkeit|Technische und berufliche Leistungsfähigkeit|Anforderungen an den Bieter|Eignungsanforderungen)\b/i,
     // French (marches-publics, awsolutions)
-    /\b(Critères de sélection|Conditions de participation|Capacité économique et financière|Capacité technique et professionnelle|Critères d['']attribution|Aptitude à exercer)\b/i,
+    /\b(Critères de sélection|Conditions de participation|Capacité économique et financière|Capacité technique et professionnelle|Critères d['’]attribution|Aptitude à exercer)\b/i,
     // Dutch (tenderned)
     /\b(Selectiecriteria|Geschiktheidseisen|Economische en financiële draagkracht|Technische en beroepsbekwaamheid|Gunningscriteria|Eisen aan inschrijver|Geschiktheid om de beroepsactiviteit)\b/i,
     // Swedish (e-avrop, kommersannons, tendsign)
-    /\b(Urvalskriterier|Kvalificeringskrav|Krav på leverantören|Tilldelningskriterier|Ekonomisk(?: och finansiell)? ställning|Teknisk(?: och yrkestlich)? kapacitet|Lämplighet att utöva)\b/i,
+    /\b(Urvalskriterier|Kvalificeringskrav|Krav på leverantören|Tilldelningskriterier|Ekonomisk(?: och finansiell)? ställning|Teknisk(?: och yrkesmässig)? kapacitet|Lämplighet att utöva)\b/i,
     // Finnish (tarjouspalvelu, hilma)
     /\b(Valintaperusteet|Soveltuvuusvaatimukset|Taloudellinen ja rahoituksellinen tilanne|Tekninen ja ammatillinen pätevyys|Vertailuperusteet|Kelpoisuus harjoittaa)\b/i,
     // Norwegian (doffin)
@@ -650,13 +650,13 @@ function extractQualificationHints(text) {
 // the next iteration.
 //
 // Returns a short string like:
-// "nearMisses: 'criterion of selection' @1234, 'capacidad técnica' @5678"
+//   "nearMisses: 'criterion of selection' @1234, 'capacidad técnica' @5678"
 // or '' if no near-misses found either.
 // =====================================================================
 function hintExtractorDiagnostic(text) {
   if (!text || typeof text !== 'string') return '';
   const STEMS = [
-    'criter', 'capac', 'solven', 'suitability', 'kvalif', 'urval', 'sélect', 'select',
+    'criter', 'capac', 'solven', 'eignung', 'kvalif', 'urval', 'sélect', 'select',
     'soveltuvuus', 'taloud', 'tekni', 'eligibility', 'aptit', 'requisit',
     'requirement', 'condici', 'condition', 'auswahl', 'zuschlag', 'gunning',
   ];
@@ -677,26 +677,26 @@ function hintExtractorDiagnostic(text) {
 // ---------------------------------------------------------------------
 // extractTedNoticeStructured
 // ---------------------------------------------------------------------
-// TED-specific HTML preprocessor. Default tag strip (in extractTextFrom
+// TED-specific HTML preprocessor. Standard tag-strip (in extractTextFrom
 // Buffer 'xml' branch) collapses ALL whitespace including newlines, which
 // destroys TED's section boundaries — and that in turn prevents the
 // hint-extractor regex from anchoring to "Selection criteria" etc.
 //
 // This function applies a structure-preserving strip BEFORE collapsing
 // whitespace:
-// - Block-level tags (</p>, </li>, </tr>, </h*>, </section>, </div>,
-// <br>) → newline
-// - Definition-list pairs (<dt>x</dt><dd>y</dd>) → "x: y\n"
-// - Inline tags → space
+//   - Block-level tags (</p>, </li>, </tr>, </h*>, </section>, </div>,
+//     <br>) → newline
+//   - Definition-list pairs (<dt>x</dt><dd>y</dd>) → "x: y\n"
+//   - Inline tags → space
 //
 // The output is "semi-structured" text where each criterion / section
 // header sits on its own line, which:
-// 1. Lets extractQualificationHints anchor reliably on section heads
-// 2. Gives Claude a clearly-formatted block to extract from
+//   1. Lets extractQualificationHints anchor reliably on section heads
+//   2. Gives Claude a clearly-formatted block to extract from
 //
 // Applied only when the public-notice host is ted.europa.eu so we don't
 // disturb processing of attachment ZIPs / PDFs from TED, or HTML from
-// other public notice sources.
+// other public-notice sources.
 // =====================================================================
 function extractTedNoticeStructured(bytes) {
   if (!bytes || !bytes.length) return '';
@@ -730,12 +730,12 @@ function extractTedNoticeStructured(bytes) {
 
   // Decode entities
   html = html
-    .replace(/ /g, ' ')
-    .replace(/&/g, '&')
-    .replace(/</g, '<')
-    .replace(/>/g, '>')
-    .replace(/"/g, '"')
-    .replace(/'/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
     .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
       try { return String.fromCodePoint(parseInt(hex, 16)); }
       catch (_e) { return ' '; }
@@ -745,15 +745,15 @@ function extractTedNoticeStructured(bytes) {
       catch (_e) { return ' '; }
     });
 
-  // Normalize whitespace while PRESERVING line breaks:
-  // - tabs + multiple spaces → single space
-  // - lines with only whitespace → empty
-  // - 3+ blank lines → 2 blank lines (paragraph break)
+  // Normalise whitespace while PRESERVING line breaks:
+  //   - tabs + multiple spaces → single space
+  //   - lines with only whitespace → empty
+  //   - 3+ blank lines → 2 blank lines (paragraph break)
   html = html
-    .replace(/[ \t\f\v]+/g, ' ') // horizontal whitespace
-    .replace(/^[ ]+|[ ]+$/gm, '') // leading/trailing spaces per line
-    .replace(/\n{3,}/g, ​​'\n\n') // cap blank-line runs
-    .replace(/(?:^\s*\n){2,}/g, ​​'\n\n') // collapse leading blanks
+    .replace(/[ \t\f\v]+/g, ' ')          // horizontal whitespace
+    .replace(/^[ ]+|[ ]+$/gm, '')          // leading/trailing spaces per line
+    .replace(/\n{3,}/g, '\n\n')            // cap blank-line runs
+    .replace(/(?:^\s*\n){2,}/g, '\n\n')    // collapse leading blanks
     .trim();
 
   return html;
@@ -772,7 +772,7 @@ async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperat
   const body = JSON.stringify({
     model: AI_MODEL,
     max_tokens: maxTokens,
-    temperature
+    temperature,
     system: systemPrompt,
     messages: [{ role: 'user', content: userPrompt }],
   });
@@ -793,7 +793,7 @@ async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperat
               'anthropic-version': '2023-06-01',
               'content-length': Buffer.byteLength(body),
             },
-            timeout: 45000
+            timeout: 45000,
           },
           (res) => {
             let chunks = '';
@@ -835,8 +835,8 @@ async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperat
         // Drop the timestamp we just reserved — the call didn't actually succeed,
         // and we want the next attempt to wait the Retry-After window, not skip.
         _claudeCallTimes.pop();
-        const wait = e._retryAfter || (5000 * attempts);
-        console.log(` ⏳ Claude 429 (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${(wait/1000).toFixed(1)}s`);
+        const wait = e._retryAfter || (5000 * attempt);
+        console.log(`    ⏳ Claude 429 (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${(wait/1000).toFixed(1)}s`);
         await _sleep(wait);
         continue;
       }
@@ -853,7 +853,7 @@ async function callClaude(systemPrompt, userPrompt, { maxTokens = 1024, temperat
       if (isTransient && attempt < MAX_ATTEMPTS) {
         _claudeCallTimes.pop();
         const wait = 3000 * attempt;
-        console.log(` ⏳ Claude transient error (attempt ${attempt}/${MAX_ATTEMPTS}): ${msg.slice(0, 80)} — retrying in ${(wait/1000).toFixed(1)}s`);
+        console.log(`    ⏳ Claude transient error (attempt ${attempt}/${MAX_ATTEMPTS}): ${msg.slice(0, 80)} — retrying in ${(wait/1000).toFixed(1)}s`);
         await _sleep(wait);
         continue;
       }
@@ -887,14 +887,14 @@ let _lastAiExtractionFailure = null;
 // touching the network or the rate limiter. Saves wall-clock time during
 // outages (no 30–45s rate-limit waits for calls we know will fail). Lasts
 // for the rest of the process lifetime — a fresh GitHub Actions run starts
-// the process cleans and the circuit closes again.
+// the process clean and the circuit closes again.
 let _aiCircuitOpen = false;
 let _aiCircuitReason = '';
 function _tripAiCircuit(err) {
   if (_aiCircuitOpen) return;
   _aiCircuitOpen = true;
   _aiCircuitReason = String(err && err.message || 'unknown').slice(0, 200);
-  console.log(` 🔌 AI circuit breaker OPEN — skipping all further AI calls this run (${_aiCircuitReason.slice(0, 120)})`);
+  console.log(`    🔌 AI circuit breaker OPEN — skipping all further AI calls this run (${_aiCircuitReason.slice(0, 120)})`);
 }
 
 function _isAiNonRetryable(err) {
@@ -918,21 +918,21 @@ function _markAiFailure(err) {
 async function translateToEnglish(text, { hint = '', skipHeuristic = false } = {}) {
   if (!AI_ENABLED || !text) return '';
   const trimmed = String(text).slice(0, 6000);
-  // Heuristics tik ilgiems tekstams (scope), kad netrinktume Haiku'o dėl
-  // aiškiai angliško turinio. Trumpiems pavadinimams heuristics klysta
-  // (pvz., vokiškas “Procurement of a school management system” neturi
+  // Heuristika tik ilgiems tekstams (scope), kad netrinktume Haiku'o dėl
+  // aiškiai angliško turinio. Trumpiems pavadinimams heuristika klysta
+  // (pvz., vokiškas „Beschaffung eines Schulmanagementsystems" neturi
   // umlautų), tad jiems perduodam skipHeuristic=true.
   //
-  // Diakrikos klasė apima: vakarų Europos (ä ö ü ß ñ ç ø æ å ...),
+  // Diakritikos klasė apima: vakarų Europos (ä ö ü ß ñ ç ø æ å ...),
   // baltų (ą č ę ė į š ų ū ž), lenkų (ć ł ń ó ś ź ż), čekų/slovakų
   // (ď ě ň ř ť ů ý ĺ ŕ), estų/vengrų (õ ő ű) — tai praktiškai padengia
   // visus EU 24 oficialiose kalbose paplitusius akcentuotus simbolius.
   // Stopword'ai padengia LT/PL/CZ/SK/ET/HU/HR/SL atvejus, kuriuose
-  // diakritikų gali ir nebūti (pvz. “IT sistemos pirkimas” — be
-  // diacriticų, bet ne anglų).
+  // diakritikų gali ir nebūti (pvz. „IT sistemos pirkimas" — be
+  // diakritikų, bet ne anglų).
   if (!skipHeuristic) {
-    const hasNonEnglishDiacritic = /[äöüßñçéèêáíóúîôûàèìòùâêîôûãõÿøœæåÄÖÜÑÉÈÊÁÍÓÚÎÔÛÃÕŸØŒÆÅąčęėįšų ūžĄČĘĖĮŠŲŪŽćłńóśźżĆŁŃÓŚŹŻďěňřťůýĎĚŇŘŤŮÝĺŕĹŔőűŐŰ]/.test(trimmed);
-    const hasNonEnglishStopword = /\b(?:och|and|the|the|den|that|dem|for|with|on|at|after|is|are|they|you|het|van|een|voor|naar|niet|wel|als|aan|maar|ook|waar|dan|alleen|geen|meer|kan|el|la|los|l as|para|del|por|que|con|una|uno|les|pour|sur|avec|sans|dans|sous|dei|delle|della|degli|alla|allo|zur|zum|med|till|fra|men|att|som|inte|och|eller|ir|su|dėl|kad|yra|ka ip|bei|arba|taip|šis|tas|tos|kas|kuris|todėl|prie|po|nuo|iki|i|w|na|dla|z|ze|nie|jest|się|że|do|oraz|który|przez|przy|jako|lub|jeśli|a|je|ve|do|by|se|jako|nebo|pokud |který|však|neboť|vo|zo|sa|alebo|však|preto|ja|on|ei|et|ka|oma|või|kui|aga|és|az|egy|hogy|vagy|van|nem|csak|már|i|u|sa|je|li|nije|ali|ima|kao|samo)\b/i.test(trimmed);
+    const hasNonEnglishDiacritic = /[äöüßñçéèêáíóúîôûàèìòùâêîôûãõÿøœæåÄÖÜÑÉÈÊÁÍÓÚÎÔÛÃÕŸØŒÆÅąčęėįšųūžĄČĘĖĮŠŲŪŽćłńóśźżĆŁŃÓŚŹŻďěňřťůýĎĚŇŘŤŮÝĺŕĹŔőűŐŰ]/.test(trimmed);
+    const hasNonEnglishStopword = /\b(?:och|und|der|die|den|das|dem|für|mit|auf|bei|nach|ist|sind|wir|sie|ihr|het|van|een|voor|naar|niet|wel|als|aan|maar|ook|waar|dan|alleen|geen|meer|kan|el|la|los|las|para|del|por|que|con|una|uno|les|pour|sur|avec|sans|dans|sous|dei|delle|della|degli|alla|allo|zur|zum|med|till|fra|men|att|som|inte|och|eller|ir|su|dėl|kad|yra|kaip|bei|arba|taip|šis|tas|tos|kas|kuris|todėl|prie|po|nuo|iki|i|w|na|dla|z|ze|nie|jest|się|że|do|oraz|który|przez|przy|jako|lub|jeśli|a|je|ve|do|by|se|jako|nebo|pokud|který|však|neboť|vo|zo|sa|alebo|však|preto|ja|on|ei|et|ka|oma|või|kui|aga|és|az|egy|hogy|vagy|van|nem|csak|már|i|u|sa|je|li|nije|ali|ima|kao|samo)\b/i.test(trimmed);
     const looksEnglish = !hasNonEnglishDiacritic && !hasNonEnglishStopword;
     if (looksEnglish) return trimmed;
   }
@@ -940,10 +940,10 @@ async function translateToEnglish(text, { hint = '', skipHeuristic = false } = {
     const out = await callClaude(
       'You are a precise translator from any European language into English. The user text is from a public procurement notice. ' +
       'ALWAYS translate non-English text into English — do NOT return the source verbatim if it is not already English. ' +
-      'If the text is already English, return it unchanged. ' +
-      'Preserve tender reference numbers, organization names, country names, CPV codes, and product/brand names verbatim. ' +
+      'If the text already IS English, return it unchanged. ' +
+      'Preserve tender reference numbers, organisation names, country names, CPV codes, and product/brand names verbatim. ' +
       'Return ONLY the translation: no preface, no explanations, no quotes, no language label.',
-      `${hint? `Context: ${hint}\n\n` : ''}Text to translate:\n${trimmed}`,
+      `${hint ? `Context: ${hint}\n\n` : ''}Text to translate:\n${trimmed}`,
       { maxTokens: 800, temperature: 0 }
     );
     let result = out || trimmed;
@@ -951,18 +951,18 @@ async function translateToEnglish(text, { hint = '', skipHeuristic = false } = {
     // is clearly NOT English (non-ASCII diacritics OR non-English stopwords),
     // force a second pass with an even more direct instruction. Avoids the
     // common Haiku failure mode where it hands back the source string
-    // because the system promptly felt ambiguous.
+    // because the system prompt felt ambiguous.
     //
     // 2026-06-03 (Task #151) — Bug fix: Dutch tender text like "Het doel
     // van deze aanbesteding is het afsluiten..." has NO diacritics → was
     // all-ASCII → hasNonAscii=false → retry skipped → echoed Dutch landed
-    // in the sheet's O column. Real-world: tendered 427479 (DSU Managed
+    // in the sheet's O column. Real-world: tenderned 427479 (DSU Managed
     // Hosting), 427496 (TA-WAN). Fix: trust the stopword heuristic which
     // already correctly flags such cases (the same regex used above to
     // decide whether to skip translation entirely).
     const echoed = out && out.trim() === trimmed.trim();
     const hasNonAscii = /[^\x00-\x7F]/.test(trimmed);
-    const hasNonEnglishStopwordForRetry = /\b(?:och|and|the|the|den|that|dem|for|with|on|at|after|is|are|they|you|het|van|een|voor|naar|niet|wel|als|aan|maar|ook|waar|dan|alleen|geen|meer|kan|el|la|los|l as|para|del|por|que|con|una|uno|les|pour|sur|avec|sans|dans|sous|dei|delle|della|degli|alla|allo|zur|zum|med|till|fra|men|att|som|inte|och|eller|ir|su|dėl|kad|yra|ka ip|bei|arba|taip|šis|tas|tos|kas|kuris|todėl|prie|po|nuo|iki|i|w|na|dla|z|ze|nie|jest|się|że|do|oraz|który|przez|przy|jako|lub|jeśli|a|je|ve|do|by|se|jako|nebo|pokud |który|však|neboť|vo|zo|sa|alebo|však|preto|ja|on|ei|et|ka|oma|või|kui|aga|és|az|egy|hogy|vagy|van|nem|csak|már|i|u|sa|je|li|nije|ali|ima|kao|samo)\b/i.test(trimmed);
+    const hasNonEnglishStopwordForRetry = /\b(?:och|und|der|die|den|das|dem|für|mit|auf|bei|nach|ist|sind|wir|sie|ihr|het|van|een|voor|naar|niet|wel|als|aan|maar|ook|waar|dan|alleen|geen|meer|kan|el|la|los|las|para|del|por|que|con|una|uno|les|pour|sur|avec|sans|dans|sous|dei|delle|della|degli|alla|allo|zur|zum|med|till|fra|men|att|som|inte|och|eller|ir|su|dėl|kad|yra|kaip|bei|arba|taip|šis|tas|tos|kas|kuris|todėl|prie|po|nuo|iki|i|w|na|dla|z|ze|nie|jest|się|że|do|oraz|który|przez|przy|jako|lub|jeśli|a|je|ve|do|by|se|jako|nebo|pokud|który|však|neboť|vo|zo|sa|alebo|však|preto|ja|on|ei|et|ka|oma|või|kui|aga|és|az|egy|hogy|vagy|van|nem|csak|már|i|u|sa|je|li|nije|ali|ima|kao|samo)\b/i.test(trimmed);
     if (echoed && (hasNonAscii || hasNonEnglishStopwordForRetry)) {
       try {
         const forced = await callClaude(
@@ -978,7 +978,7 @@ async function translateToEnglish(text, { hint = '', skipHeuristic = false } = {
     return result;
   } catch (e) {
     _markAiFailure(e);
-    console.log(` ⚠️ translate failed: ${e.message}`);
+    console.log(`    ⚠️ translate failed: ${e.message}`);
     return trimmed;
   }
 }
@@ -999,10 +999,10 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- maxBudget: total ceiling / max contract value AS STATED in the tender. Empty string if not explicitly stated.\n' +
     '- estimatedBudgetEur: integer EUR estimate, ONLY fill if maxBudget is empty AND description gives enough basis. Use conservative market rates for comparable EU government IT contracts: web/CMS dev 24mo €0.5-2M; framework agreement multi-year €2-10M; enterprise system 36mo €3-15M; security/audit single 12mo €0.2-0.8M; small support contract €0.1-0.4M. Multiply by duration. Empty string if confidence is low (see below).\n' +
     '- estimationConfidence: "high" | "medium" | "low" | "" (empty if maxBudget was stated, not estimated). Criteria:\n' +
-    ' • HIGH: detailed scope (≥1000ch of substantive description in DOCUMENTS), duration known, lot structure clear, deliverables enumerated, comparable public benchmarks support the estimate within ±30%. Example: detailed RFT with quantified deliverables ("3 web estimate portals", "10 microservices", "24 months operations") AND duration → numeric is meaningful.\n' +
-    ' • MEDIUM: scope outlined but vague on deliverables, duration known, no comparable benchmark or numerical anchors. Estimate may be off by 2-3×.\n' +
-    ' • LOW: short description (<500ch), no clear duration, ambiguous scope, no quantification, or multi-lot framework where individual lot sizes are unknown. Estimate is essentially a guess.\n' +
-    ' • Empty string: maxBudget was directly stated (no estimation needed) or estimatedBudgetEur is empty.\n' +
+    '   • HIGH: detailed scope (≥1000ch of substantive description in DOCUMENTS), duration known, lot structure clear, deliverables enumerated, comparable public benchmarks support the estimate within ±30%. Example: detailed RFT with quantified deliverables ("3 web portals", "10 microservices", "24 months operations") AND duration → numeric estimate is meaningful.\n' +
+    '   • MEDIUM: scope outlined but vague on deliverables, duration known, no comparable benchmark or numeric anchors. Estimate may be off by 2-3×.\n' +
+    '   • LOW: short description (<500ch), no clear duration, ambiguous scope, no quantification, or multi-lot framework where individual lot sizes are unknown. Estimate is essentially a guess.\n' +
+    '   • Empty string: maxBudget was directly stated (no estimation needed) or estimatedBudgetEur is empty.\n' +
     '- estimationReasoning: 1 short sentence (≤140 chars) explaining the estimate basis IF estimationConfidence is high/medium. Examples: "24mo CMS dev + maintenance, comparable to NL gov web portal ~€2.4M". Empty otherwise.\n' +
     '- budgetSource: WHERE the budget value was found. The DOCUMENTS section of the user message has headers like "--- (handler-name) filename.ext ---" before each parsed file. Identify which one carries the budget number you used. Values: (a) "Document: <filename>" — when budget number appears inside any parsed document (use the exact filename from the nearest "--- (...) filename ---" header BEFORE the matched text); (b) "Source page" — when budget number is in the MERCELL_PAGE section but not in any document; (c) "Mercell tender notice" — when budget number is only in the TITLE/DESCRIPTION sections (Mercell API JSON); (d) "AI estimate" — when maxBudget is empty and you populated estimatedBudgetEur from description context only. Empty string if neither maxBudget nor estimatedBudgetEur was set.\n' +
     '- duration: contract length in months or years. Empty string if not stated.\n' +
@@ -1010,174 +1010,174 @@ async function extractFieldsWithAI(text, meta = {}) {
     '- requirementsSourceFile: **MANDATORY when requirementsForSupplier is non-placeholder**. The exact filename (from the nearest "--- (handler) <filename> ---" header preceding the text you extracted) where the requirements were found. Examples: "Aanbestedingsleidraad.pdf", "0_Pirkimo sąlygos A Specialioji dalis.docx", "Bijlage 12 Gemeentelijke_ict_kwaliteitsnormen_2024.pdf". This filename is used to construct a clickable hyperlink in the spreadsheet. Empty string ONLY if requirements came from MERCELL_PAGE / TITLE / DESCRIPTION sections (no document) OR no requirements were stated.\n' +
     '- qualificationRequirements: FORMAL SUPPLIER COMPANY ELIGIBILITY. This is the supplier-side ENTRY criteria — the bar a bidder must clear to be ALLOWED to submit. It is NOT a description of work, NOT a list of capabilities to deliver, NOT the system features being built.\n' +
     '\n' +
-    ' 2026-06-02 GUIDANCE — EXTRACT FROM INLINE TEXT, NOT JUST SECTION HEADERS:\n' +
-    ' LT CVPP "Pirkimo documentai" / "Specialiosios sąlygos" rarely have a dedicated section header — qualification requirements appear INLINE in numbered lists, tables, or bullet items. EXTRACT them when you see specific numerical/named patterns even WITHOUT a section header. Look for these formulations:\n' +
-    ' • LT phrases: "Tiekėjas turi turėti", "Tiekėjui keliami reikalavimai", "Tiekėjas privalo turėti", "Tiekėjo kvalifikacija turi būti", "Reikalavimai tiekėjų kvalifikacijai", "Tiekėjų kvalifikacijos reikalavimai", "Techninis ir profesinis pajėgumas", "Ekonominis ir finansinis pajėgumas", "Teisė verstis veikla", "Specialistas turi/privalo", "Informacinių sistemų programuotojas... privalo", "Projekto vadovas... privalo", "ne mažiau kaip X (...) specialistas", "per pastaruosius X (...) metus", "vykdė... paslaugas ne mažiau kaip Y sutartyje", "sėkmingai įvykdytoje (baigtoje) sutartyje".\n' +
-    ' • EN: "Supplier must", "Tenderer shall have", "Minimum annual turnover", "Key personnel", "Project manager: minimum X years experience", "At least X reference projects within Y years".\n' +
-    ' • ES: "Solvencia técnica", "Capacidad económica y financiera", "El licitador deberá", "Habilitación profesional", "Volume anual de negocios ≥ X EUR".\n' +
-    ' • FR: "Capacité économique et financière", "Capacité technique et professionnelle", "Le candidat doit justifier", "Chiffre d\'affaires annuel ≥ X EUR", "Références exigées".\n' +
-    ' • DE: "Eligibility criteria", "Bidder must", "Minimum annual turnover", "References", "Key personnel".\n' +
-    ' Also look for explicit sections titled "Qualification requirements", "Kvalifikasjonskrav", "Kvalifikacijos reikalavimai", "Tiekėjo kvalifikaciniai reikalavimai", "Kvaligungskrav", "Vaatimukset tarjoajalle", "Wymagania kwalifikacyjne", "Requisitos de aptitud", "Requisiti di partecipazione".\n' +
+    '   2026-06-02 GUIDANCE — EXTRACT FROM INLINE TEXT, NOT JUST SECTION HEADERS:\n' +
+    '   LT CVPP "Pirkimo dokumentai" / "Specialiosios sąlygos" rarely have a dedicated section header — qualification requirements appear INLINE in numbered lists, tables, or bullet items. EXTRACT them when you see specific numerical/named patterns even WITHOUT a section header. Look for these formulations:\n' +
+    '   • LT phrases: "Tiekėjas turi turėti", "Tiekėjui keliami reikalavimai", "Tiekėjas privalo turėti", "Tiekėjo kvalifikacija turi būti", "Reikalavimai tiekėjų kvalifikacijai", "Tiekėjų kvalifikacijos reikalavimai", "Techninis ir profesinis pajėgumas", "Ekonominis ir finansinis pajėgumas", "Teisė verstis veikla", "Specialistas turi/privalo", "Informacinių sistemų programuotojas... privalo", "Projekto vadovas... privalo", "ne mažiau kaip X (...) specialistas", "per pastaruosius X (...) metus", "vykdė... paslaugas ne mažiau kaip Y sutartyje", "sėkmingai įvykdytoje (baigtoje) sutartyje".\n' +
+    '   • EN: "Supplier must", "Tenderer shall have", "Minimum annual turnover", "Key personnel", "Project manager: minimum X years experience", "At least X reference projects within Y years".\n' +
+    '   • ES: "Solvencia técnica", "Capacidad económica y financiera", "El licitador deberá", "Habilitación profesional", "Volumen anual de negocios ≥ X EUR".\n' +
+    '   • FR: "Capacité économique et financière", "Capacité technique et professionnelle", "Le candidat doit justifier", "Chiffre d\'affaires annuel ≥ X EUR", "Références exigées".\n' +
+    '   • DE: "Eignungskriterien", "Bieter muss", "Mindestjahresumsatz", "Referenzen", "Schlüsselpersonal".\n' +
+    '   Also look for explicit sections titled "Qualification requirements", "Kvalifikasjonskrav", "Kvalifikacijos reikalavimai", "Tiekėjo kvalifikaciniai reikalavimai", "Kvalifikationskrav", "Vaatimukset tarjoajalle", "Wymagania kwalifikacyjne", "Requisitos de aptitud", "Requisiti di partecipazione".\n' +
     '\n' +
-    ' The four canonical families: (a) LEGAL — company registration ("Įmonės registracijos pažymėjimas", Firmenattest, business registry), (b) ECONOMIC — turnover thresholds ("Apyvarta ne mažiau X EUR per Y metų"), credit rating, audited annual accounts, (c) TECHNICAL — reference projects ("ne mažiau metų") AND named specialist roles with years of experience ("Projekto vadovas: 2 metai patirties IS projektuose", "Architektas: 5 metai", "Saugos specialistas: ISO 27001 sertifikuotas"), (d) QUALITY — ISO certifications (9001, 14001, 27001).\n' +
+    '   The four canonical families: (a) LEGAL — company registration ("Įmonės registracijos pažymėjimas", Firmaattest, business registry), (b) ECONOMIC — turnover thresholds ("Apyvarta ne mažiau X EUR per Y metų"), credit rating, audited annual accounts, (c) TECHNICAL — reference projects ("ne mažiau X panašių projektų per Y metų") AND named specialist roles with years of experience ("Projekto vadovas: 2 metai patirties IS projektuose", "Architektas: 5 metai", "Saugos specialistas: ISO 27001 sertifikuotas"), (d) QUALITY — ISO certifications (9001, 14001, 27001).\n' +
     '\n' +
-    ' ❌ ANTI-PATTERNS — do NOT put these in qualifications field (they belong in scopeOfAgreement):\n' +
-    ' ✗ "Software development and system integration capabilities" ← this is SCOPE, not qualification\n' +
-    ' ✗ "Ability to update and extend functionality of meteorological tool" ← this is SCOPE\n' +
-    ' ✗ "SLIS programinės įrangos palaikymo paslaugų teikimas" ← this is SCOPE\n' +
-    ' ✗ "Experience with meteorological data systems" ← too generic; needs a NUMBER (years, projects count)\n' +
-    ' ✗ Generic "technical expertise" / "data validation capabilities" ← these describe WORK, not entry criteria\n' +
+    '   ❌ ANTI-PATTERNS — do NOT put these in qualifications field (they belong in scopeOfAgreement):\n' +
+    '     ✗ "Software development and system integration capabilities" ← this is SCOPE, not qualification\n' +
+    '     ✗ "Ability to update and extend functionality of meteorological tool" ← this is SCOPE\n' +
+    '     ✗ "SLIS programinės įrangos palaikymo paslaugų teikimas" ← this is SCOPE\n' +
+    '     ✗ "Experience with meteorological data systems" ← too generic; needs a NUMBER (years, projects count)\n' +
+    '     ✗ Generic "technical expertise" / "data validation capabilities" ← these describe WORK, not entry criteria\n' +
     '\n' +
-    ' ✅ ACCEPTABLE patterns — these are real supplier qualifications:\n' +
-    ' ✓ "The price is 500,000 euros for 3 months"\n' +
-    ' ✓ "Projekto vadovas: minimum 2 metai patirties analogiškuose IS projektuose"\n' +
-    ' ✓ "Informacinių sistemų programuotojas Nr. 1 (ne mažiau kaip 1 specialistas) privalo: per pastaruosiusius 3 metus vykdė mobiliosios aplikacijos vystymo "front-end" paslaugas ne mažiau kaip 1 sėkmingai įvykdytoje sutartyje"\n' +
-    ' ✓ "Ne mažiau 2 reference projectai per 3 metus tame pačiame domene"\n' +
-    ' ✓ "ISO 27001 ir ISO 9001 sertifikatai"\n' +
-    ' ✓ "Ekonominis pajėgumas 30% sutarties vertės"\n' +
+    '   ✅ ACCEPTABLE patterns — these are real supplier qualifications:\n' +
+    '     ✓ "Įmonės metinė apyvarta ne mažiau 500 000 EUR per pastaruosius 3 metus"\n' +
+    '     ✓ "Projekto vadovas: minimum 2 metai patirties analogiškuose IS projektuose"\n' +
+    '     ✓ "Informacinių sistemų programuotojas Nr. 1 (ne mažiau kaip 1 specialistas) privalo: per pastaruosius 3 metus vykdė mobiliosios aplikacijos vystymo „front-end" paslaugas ne mažiau kaip 1 sėkmingai įvykdytoje sutartyje"\n' +
+    '     ✓ "Ne mažiau 2 reference projektai per 3 metus tame pačiame domene"\n' +
+    '     ✓ "ISO 27001 ir ISO 9001 sertifikatai"\n' +
+    '     ✓ "Ekonominis pajėgumas 30% sutarties vertės"\n' +
     '\n' +
-    ' PER-SPECIALIST DETAIL: when documents list named specialist roles (Projekto vadovas, Architekturas, Informacinių sistemų programuotojas No. 1/No. 2, Testuotojas, Analytikas, Saugos specialistas, Jefe de proyecto, Auditor, Project manager, Lead developer), include EACH role separately with its minimum-experience requirement. Concatenate with semicolons.\n' +
-    ' LANGUAGE RULE: When outputLanguage==en (non-Lithuanian tenders), TRANSLATE ALL extracted text to English — including specialist role titles, sentences, and numbered list items. Keep numeric values ​​(EUR amounts, years, percentages) exact, but every Spanish/French/German/Dutch/Italian/Polish/Estonian/Norwegian/Swedish/Finnish/Danish noun, verb, and adjective MUST be translated. NEVER leave Spanish phrases like "Volumen anual de negocios" or "Jefe/a de proyecto: experiencia superior a 5 años" — translate to "Annual turnover" or "Project manager: experience over 5 years". The qualificationRequirements field must be read fluently in English. Same rule applies to requirementsForSupplier and offerWeighingCriteria. Only outputLanguage==lt keeps original Lithuanian.\n' +
+    '   PER-SPECIALIST DETAIL: when documents list named specialist roles (Projekto vadovas, Architektas, Informacinių sistemų programuotojas Nr. 1/Nr. 2, Testuotojas, Analytikas, Saugos specialistas, Jefe de proyecto, Auditor, Project manager, Lead developer), include EACH role separately with its minimum-experience requirement. Concatenate with semicolons.\n' +
+    '   LANGUAGE RULE: When outputLanguage==en (non-Lithuanian tenders), TRANSLATE ALL extracted text to English — including specialist role titles, sentences, and numbered list items. Keep numeric values (EUR amounts, years, percentages) exact, but every Spanish/French/German/Dutch/Italian/Polish/Estonian/Norwegian/Swedish/Finnish/Danish noun, verb, and adjective MUST be translated. NEVER leave Spanish phrases like "Volumen anual de negocios" or "Jefe/a de proyecto: experiencia superior a 5 años" — translate to "Annual turnover" or "Project manager: experience over 5 years". The qualificationRequirements field must read fluently in English. Same rule applies to requirementsForSupplier and offerWeighingCriteria. Only outputLanguage==lt keeps original Lithuanian.\n' +
     '\n' +
-    ' FALLBACK RULE: Only write "(no explicit supplier qualification requirements stated in tender documents)" if you have CAREFULLY scanned the DOCUMENTS section AND found NO supplier-eligibility pattern matching ANY language variant above (turnover number, year count, specialist role with experience years, ISO certification, reference project count). Do NOT use this placeholder when the documents contain clear quantitative supplier criteria — extract those even if they appear in numbered lists without a section header. Leaving this field empty is better than filling with scope-like content, BUT extracting verbatim numbered/named supplier criteria is ALWAYS better than the placeholder.\n' +
+    '   FALLBACK RULE: Only write "(no explicit supplier qualification requirements stated in tender documents)" if you have CAREFULLY scanned the DOCUMENTS section AND found NO supplier-eligibility pattern matching ANY language variant above (turnover number, year count, specialist role with experience years, ISO certification, reference project count). Do NOT use this placeholder when the documents contain clear quantitative supplier criteria — extract those even if they appear in numbered lists without a section header. Leaving this field empty is better than filling with scope-like content, BUT extracting verbatim numbered/named supplier criteria is ALWAYS better than the placeholder.\n' +
     '- qualificationsSourceFile: **MANDATORY when qualificationRequirements is non-placeholder**. The exact filename (from the nearest "--- (handler) <filename> ---" header preceding the extracted text) where the qualifications were found. Return ONLY the filename (no handler prefix, no path). Examples: "4_priedas_Reikalavimai tiekėjų kvalifikacijai.docx", "PCAP_LICITACION.pdf", "Annex IV - PQQ.pdf". If qualifications come from multiple files, return the PRIMARY one (richest source). Empty string ONLY when qualifications came from MERCELL_PAGE / TITLE / DESCRIPTION sections or no qualifications were stated.\n' +
     '\n' +
-    ' ⚠️ CRITICAL: Both requirementsSourceFile and qualificationsSourceFile MUST be populated whenever you extracted real text into those fields. Empty source-file values ​​cause broken hyperlinks in the output spreadsheet. The DOCUMENTS section headers look like "--- (viesiejipirkimai ZIP-bundle(N)) 0_Pirkimo sąlygos A.docx ---" or "--- (tendsign) Aanbestedingsleidraad.pdf ---" — extract the filename portion (after "(handler) " up to " ---"). Do NOT return the handler name. Do NOT return the section heading. Do NOT return a path. J ust the filename like the AI ​​prompt examples above.\n' +
-    '- offerWeighingCriteria: award criteria with EXACT WEIGHTS. ALWAYS list every criterion with its percentage/weight verbatim from the tender (eg, "Price 40%, Quality 60% (subdivided: solution specification 30%, establishment plan 30%)"). For Lithuanian tenders look for "Kainos lyginamasis svoris X%", "Ekonominio naudingumo X%", "Specialistų kvalifikacija ir patirtis X%". If quality sub-criteria are scored individually (Y1, Y2, Y3 etc.), list each with what is measured and the point range (eg, "Y1 Project manager additional experience: 1 pt per 1 IS project, 2 pts for 2+ projects"). DO NOT lose subdivision detail — these scoring rules drive the award.\n' +
+    '   ⚠️ CRITICAL: Both requirementsSourceFile and qualificationsSourceFile MUST be populated whenever you extracted real text into those fields. Empty source-file values cause broken hyperlinks in the output spreadsheet. The DOCUMENTS section headers look like "--- (viesiejipirkimai ZIP-bundle(N)) 0_Pirkimo sąlygos A.docx ---" or "--- (tendsign) Aanbestedingsleidraad.pdf ---" — extract the filename portion (after "(handler) " up to " ---"). Do NOT return the handler name. Do NOT return the section heading. Do NOT return a path. Just the filename like the AI prompt examples above.\n' +
+    '- offerWeighingCriteria: award criteria with EXACT WEIGHTS. ALWAYS list every criterion with its percentage/weight verbatim from the tender (e.g., "Price 40%, Quality 60% (subdivided: solution specification 30%, establishment plan 30%)"). For Lithuanian tenders look for "Kainos lyginamasis svoris X%", "Ekonominio naudingumo X%", "Specialistų kvalifikacija ir patirtis X%". If quality sub-criteria are scored individually (Y1, Y2, Y3 etc.), list each with what is measured and the point range (e.g., "Y1 Project manager additional experience: 1 pt per 1 IS project, 2 pts for 2+ projects"). DO NOT lose subdivision detail — these scoring rules drive the award.\n' +
     '- scopeOfAgreement: 1–3 sentence English summary of what is being procured. Must be English. SPECIAL CASE: if lotStructure=="partial" AND there are IT/software-development lots, the scope should describe ONLY the IT lots (not the umbrella framework). If lotStructure=="all-required", describe the whole umbrella.\n' +
-    '- lotStructure: one of "single" | "partial" | "all required". Mark "single" if the tender procures one consolidated scope. Mark "partial" for multi-lot tenders where bidders MAY submit for individual lots/categories independently (look for phrases like "Tilbud på deler av oppdraget er tillatt", "Adgang til å gi tilbud på deler", "Det er adgang til å gi tilbud på enkeltcategorier", "Lots: division into lots = yes", "partial bids allowed", "tilbud på enkelte delkontakter", "anbud på delar"). Mark "all-required" for multi-lot tenders where bidders MUST cover EVERY lot to win (look for phrases like "Det he ikke adgang til å gi tilbud på deler av oppdraget", "no partial bids", "tilbud må omfatte hele leveransen", "bidders must submit for all lots"). When unclear in a multi-lot tender, default to "all-required".\n' +
+    '- lotStructure: one of "single" | "partial" | "all-required". Mark "single" if the tender procures one consolidated scope. Mark "partial" for multi-lot tenders where bidders MAY submit for individual lots/categories independently (look for phrases like "Tilbud på deler av oppdraget er tillatt", "Adgang til å gi tilbud på deler", "Det er adgang til å gi tilbud på enkeltkategorier", "Lots: division into lots = yes", "partial bids allowed", "tilbud på enkelte delkontrakter", "anbud på delar"). Mark "all-required" for multi-lot tenders where bidders MUST cover EVERY lot to win (look for phrases like "Det er ikke adgang til å gi tilbud på deler av oppdraget", "no partial bids", "tilbud må omfatte hele leveransen", "bidders must submit for all lots"). When unclear in a multi-lot tender, default to "all-required".\n' +
     '- itLotsScope: ONLY when lotStructure=="partial". A bullet-style list of lots that are software development / web/mobile app dev / bespoke IT system creation. Format: "Lot 2B – Architecture, development, data and integration: <one-line description>". Include ONLY lots we (custom software development firm) could realistically bid for. Empty string if lotStructure!="partial" OR no IT-relevant lots.\n' +
-    '- rejectReason: short English string (≤120 chars) explaining WHY this tender is a poor fit, OR empty string if a good fit. We are a custom software development company that BUILDS systems from scratch. Reject (set rejectReason) when ANY of these apply:\n' +
-    ' • SaaS Provision/Creation: Tender procures a SaaS subscription (vendor provides + operates the software), or asks to build a SaaS platform for buyer to resell. Set rejectReason="saas_provision_or_creation". We are a CUSTOM-build firm, not a SaaS vendor — we deliver source code & deployment, we do NOT operate hosted services for clients on a subscription model.\n' +
-    ' ❌ EXPLICIT SaaS markers (any one is sufficient — REJECT):\n' +
-    ' ✗ EN: "SaaS solution", "as a SaaS solution", "Software as a Service", "SaaS-based", "SaaS offering", "Hosted by supplier", "Supplier-hosted solution", "Vendor-hosted", "Cloud-hosted by [supplier/vendor]", "Supplier-selected datacenters", "Operated by the supplier", "Hosting and operation by contractor", "Multi-tenant cloud platform"\n' +
-    ' ✗ NL: "as SaaS oplossing", "SaaS service", "SaaS application", "door leverancier hosted"\n' +
-    ' ✗ DE: "SaaS solution", "Software-as-a-Service", "vendor-hosted", "vendor-hosted platform"\n' +
-    ' ✗ FR: "Solution SaaS", "Logiciel en tant que service", "Hébergé par le fournisseur", "Mode SaaS"\n' +
-    ' ✗ ES: "Solución SaaS", "Software como servicio", "Alojado por el proveedor", "Modalidad SaaS"\n' +
-    ' ✗ IT: "Soluzione SaaS", "Software come servicio", "Ospitato dal fornitore"\n' +
-    ' ✗ LT: "SaaS sprendimas", "Programinė įranga kaip paslauga"\n' +
-    ' ✗ Combined signal: "Supply AND operation" of named software + multi-year (3+ years) subscription term — implies vendor provides + runs the software (eg, "Supply and operation of X software for 60 months")\n' +
-    ' ✗ "Provide software" + "buyer-selected datacenter is NOT used" (ie, contractor brings their own infrastructure)\n' +
-    ' ✗ Scope describes ONGOING service delivery (continuous operation, monthly SLAs, uptime guarantees) rather than a delivered codebase\n' +
-    ' ✅ NOT SaaS (do not reject under this category):\n' +
-    ' ✓ Custom development where the buyer will host/operate the software themselves after delivery\n' +
-    ' ✓ Build-operate-transfer: contractor builds, briefly operates during transition, then hands over\n' +
-    ' ✓ "Maintenance and support" of buyer-owned/buyer-hosted system after custom build\n' +
-    ' ✓ Cloud-hosted just refers to the DEV environment (CI/CD) not the production service\n' +
-    ' • Off-The-Shelf (COTS) — Existing Market Solution: The CORE TEST is semantic, NOT brand-list:\n' +
-    ' ❓ KEY QUESTION: "Is the buyer procuring an EXISTING software product / system / service / environment from a market vendor (paying to receive or operate a finished thing), OR is the buyer commissioning a CUSTOM-BUILT solution (paying engineers to design and construct something new)?"\n' +
-    ' If the answer is "existing market solution" → set rejectReason="cots_implementation_or_licenses". This applies whether the product is named (Atlassian, SAP, Microsoft Dynamics, SharePoint, Power BI, SSRS, etc.) or unnamed but clearly a market product (eg "ERP system", "GIS platform", "Document Management System", "case management system", "library system", "BI environment", "ticketing system" as catalog purchases).\n' +
+    '- rejectReason: short English string (≤120 chars) explaining WHY this tender is a poor fit, OR empty string if a good fit. We are a custom-software development firm that BUILDS systems from scratch. Reject (set rejectReason) when ANY of these apply:\n' +
+    '   • SaaS Provision/Creation: Tender procures a SaaS subscription (vendor provides + operates the software), or asks to build a SaaS platform for buyer to resell. Set rejectReason="saas_provision_or_creation". We are a CUSTOM-build firm, not a SaaS vendor — we deliver source code & deployment, we do NOT operate hosted services for clients on a subscription model.\n' +
+    '     ❌ EXPLICIT SaaS markers (any one is sufficient — REJECT):\n' +
+    '       ✗ EN: "SaaS solution", "as a SaaS solution", "Software as a Service", "SaaS-based", "SaaS offering", "Hosted by supplier", "Supplier-hosted solution", "Vendor-hosted", "Cloud-hosted by [supplier/vendor]", "Supplier-selected datacenters", "Operated by the supplier", "Hosting and operation by contractor", "Multi-tenant cloud platform"\n' +
+    '       ✗ NL: "als SaaS oplossing", "SaaS dienst", "SaaS-applicatie", "door leverancier gehost"\n' +
+    '       ✗ DE: "SaaS-Lösung", "Software-as-a-Service", "vom Anbieter gehostet", "Anbieter-gehostete Plattform"\n' +
+    '       ✗ FR: "Solution SaaS", "Logiciel en tant que service", "Hébergé par le fournisseur", "Mode SaaS"\n' +
+    '       ✗ ES: "Solución SaaS", "Software como servicio", "Alojado por el proveedor", "Modalidad SaaS"\n' +
+    '       ✗ IT: "Soluzione SaaS", "Software come servizio", "Ospitato dal fornitore"\n' +
+    '       ✗ LT: "SaaS sprendimas", "Programinė įranga kaip paslauga"\n' +
+    '       ✗ Combined signal: "Supply AND operation" of named software + multi-year (3+ years) subscription term — implies vendor provides + runs the software (e.g., "Supply and operation of X software for 60 months")\n' +
+    '       ✗ "Provide software" + "buyer-selected datacenter is NOT used" (i.e., contractor brings their own infra)\n' +
+    '       ✗ Scope describes ONGOING service delivery (continuous operation, monthly SLAs, uptime guarantees) rather than a delivered codebase\n' +
+    '     ✅ NOT SaaS (do not reject under this category):\n' +
+    '       ✓ Custom development where the buyer will host/operate the software themselves after delivery\n' +
+    '       ✓ Build-operate-transfer: contractor builds, briefly operates during transition, then hands over\n' +
+    '       ✓ "Maintenance and support" of buyer-owned/buyer-hosted system after custom build\n' +
+    '       ✓ Cloud-hosted just refers to the DEV environment (CI/CD) not the production service\n' +
+    '   • Off-The-Shelf (COTS) — Existing Market Solution: The CORE TEST is semantic, NOT brand-list:\n' +
+    '     ❓ KEY QUESTION: "Is the buyer procuring an EXISTING software product / system / service / environment from a market vendor (paying to receive or operate a finished thing), OR is the buyer commissioning a CUSTOM-BUILT solution (paying engineers to design and construct something new)?"\n' +
+    '     If the answer is "existing market solution" → set rejectReason="cots_implementation_or_licenses". This applies whether the product is named (Atlassian, SAP, Microsoft Dynamics, SharePoint, Power BI, SSRS, etc.) or unnamed but clearly a market product (e.g. "ERP system", "GIS platform", "Document Management System", "case management system", "library system", "BI environment", "ticketing system" as catalog purchases).\n' +
     '\n' +
-    ' ✅ POSITIVE SIGNALS — custom development (DO NOT reject as COTS):\n' +
-    ' ✓ "Develop a new <thing>", "Build from scratch", "Create a bespoke <X>"\n' +
-    ' ✓ "Architecture, design AND development", "Software engineering from requirements"\n' +
-    ' ✓ "Custom-built solution", "Tailored <X>", "Sukurti naują <X>", "Sukūrimas"\n' +
-    ' ✓ The IP / source code is OWNED by the buyer after delivery\n' +
-    ' ✓ Required roles are GENERIC software engineering: Backend Developer, Frontend Developer, Software Architect, DevOps Engineer, QA / Test Engineer, UI/UX Designer — with technology stack expressed as open standards (Java, .NET, Python, React, Angular, PostgreSQL, Kubernetes, REST/SOAP, microservices, OAuth2)\n' +
-    ' ✓ Reference projects required are "similar custom development commitments", "previous bespoke software delivery"\n' +
+    '     ✅ POSITIVE SIGNALS — custom development (DO NOT reject as COTS):\n' +
+    '       ✓ "Develop a new <thing>", "Build from scratch", "Create a bespoke <X>"\n' +
+    '       ✓ "Architecture, design AND development", "Software engineering from requirements"\n' +
+    '       ✓ "Custom-built solution", "Tailored <X>", "Sukurti naują <X>", "Sukūrimas"\n' +
+    '       ✓ The IP / source code is OWNED by the buyer after delivery\n' +
+    '       ✓ Required roles are GENERIC software engineering: Backend Developer, Frontend Developer, Software Architect, DevOps Engineer, QA / Test Engineer, UI/UX Designer — with technology stack expressed as open standards (Java, .NET, Python, React, Angular, PostgreSQL, Kubernetes, REST/SOAP, microservices, OAuth2)\n' +
+    '       ✓ Reference projects required are "similar custom development engagements", "previous bespoke software delivery"\n' +
     '\n' +
-    ' ❌ NEGATIVE SIGNALS — existing market solution (REJECT as COTS):\n' +
-    ' ✗ Scope verbs are SUPPLY-CENTRIC: "procurement of <X> licenses/subscriptions", "supply", "acquisition", "renewal of licenses", "purchase of <X> software"\n' +
-    ' ✗ Scope verbs are EXISTING-SOLUTION operation: "implementation and configuration of <X>", "deployment of <X>", "installation of <X>", "migration to <X>", "upgrade of <X>", "modernization of <X> environment", "maintenance of <X> system", "support and operation of <X>"\n' +
-    ' ✗ Scope verbs are MODIFICATION-OF-EXISTING: "customization of <X>", "extending <X> functionality", "configuration of <X> workflows", "developing additional modules within <X>", "report-authoring in <X>", "data-modeling in <X>", "developing on the existing <X> platform"\n' +
-    ' ✗ "Expert consulting for <X> environment / platform / system" — the work is admin / config / authoring inside a vendor product\n' +
-    ' ✗ "Maintain and develop the existing <X>" — extending vendor product, not building new\n' +
-    ' ✗ "Integration with existing <X> system" as the PRIMARY scope (when integration IS the project, not just a sub-task of new build)\n' +
-    ' ✗ Title or description names a specific product or product category as the THING being bought ("HTA software", "ERP solution", "case management system" as catalog purchases)\n' +
-    ' ✗ Requirements list VENDOR PARTNER STATUS as mandatory: "Platinum / Gold / Premier / Crest / Summit Partner with <Vendor>", "Certified <Vendor> Partner", "Authorized Reseller of <Vendor>"\n' +
-    ' ✗ Requirements list VENDOR-SPECIFIC CERTIFICATIONS: certification codes like "ACP-XXX", "MS-XXX / AZ-XXX / MB-XXX / PL-XXX / DP-XXX", "SAP C_XXX", "AWS Certified ...", "Cisco CCNA/CCNP", "Salesforce Certified Administrator/Developer", "Oracle OCP", "RHCE", or any "<Brand> Certified" credential as REQUIRED for bidders\n' +
-    ' ✗ Required roles are PRODUCT-ADMIN, not engineering: "<Brand> Administrator", "<Brand> Consultant", "<Brand> Specialist", "BI Developer (Power BI / Tableau)", "Solution Architect (SAP / Salesforce)", "Atlassian Admin", "SharePoint Administrator", "Salesforce Configurator"\n' +
-    ' ✗ Multi-lot tender where EVERY lot is scoped to the same named product family (Lot 1 = X licenses, Lot 2 = X expert services for X) — license-supply vs partner-services split within the SAME product\n' +
+    '     ❌ NEGATIVE SIGNALS — existing market solution (REJECT as COTS):\n' +
+    '       ✗ Scope verbs are SUPPLY-CENTRIC: "procurement of <X> licenses/subscriptions", "supply", "acquisition", "renewal of licenses", "purchase of <X> software"\n' +
+    '       ✗ Scope verbs are EXISTING-SOLUTION operation: "implementation and configuration of <X>", "deployment of <X>", "installation of <X>", "migration to <X>", "upgrade of <X>", "modernisation of <X> environment", "maintenance of <X> system", "support and operation of <X>"\n' +
+    '       ✗ Scope verbs are MODIFICATION-OF-EXISTING: "customisation of <X>", "extending <X> functionality", "configuration of <X> workflows", "developing additional modules within <X>", "report-authoring in <X>", "data-modeling in <X>", "developing on the existing <X> platform"\n' +
+    '       ✗ "Expert consulting for <X> environment / platform / system" — the work is admin / config / authoring inside a vendor product\n' +
+    '       ✗ "Maintain and develop the existing <X>" — extending vendor product, not building new\n' +
+    '       ✗ "Integration with existing <X> system" as the PRIMARY scope (when integration IS the project, not just a sub-task of new build)\n' +
+    '       ✗ Title or description names a specific product or product category as the THING being bought ("HTA software", "ERP solution", "case management system" as catalog purchases)\n' +
+    '       ✗ Requirements list VENDOR PARTNER STATUS as mandatory: "Platinum / Gold / Premier / Crest / Summit Partner with <Vendor>", "Certified <Vendor> Partner", "Authorized Reseller of <Vendor>"\n' +
+    '       ✗ Requirements list VENDOR-SPECIFIC CERTIFICATIONS: certification codes like "ACP-XXX", "MS-XXX / AZ-XXX / MB-XXX / PL-XXX / DP-XXX", "SAP C_XXX", "AWS Certified ...", "Cisco CCNA/CCNP", "Salesforce Certified Administrator/Developer", "Oracle OCP", "RHCE", or any "<Brand> Certified" credential as REQUIRED for bidders\n' +
+    '       ✗ Required roles are PRODUCT-ADMIN, not engineering: "<Brand> Administrator", "<Brand> Consultant", "<Brand> Specialist", "BI Developer (Power BI / Tableau)", "Solution Architect (SAP / Salesforce)", "Atlassian Admin", "SharePoint Administrator", "Salesforce Configurator"\n' +
+    '       ✗ Multi-lot tender where EVERY lot is scoped to the same named product family (Lot 1 = X licenses, Lot 2 = X expert services for X) — license-supply vs partner-services split within the SAME product\n' +
     '\n' +
-    ' 🧠 DECISION ALGORITHM (apply in order):\n' +
-    ' 1. Does the description name a specific software product, brand, system, environment, or platform as the THING BEING BOUGHT or as the WORKING CONTEXT? If yes, go to step 2; otherwise → likely not COTS.\n' +
-    ' 2. Are the scope verbs supply-centric / operation-centric / modification-of-existing (from NEGATIVE SIGNALS)? If yes → COTS. If verbs are construction-centric (build / develop new / design from scratch) → not COTS.\n' +
-    ' 3. Do qualification requirements demand Vendor Partner Status or vendor-specific certifications (not generic ISO certifications)? If yes → COTS (regardless of scope wording).\n' +
-    ' 4. Multi-lot edge case: if ALL lots reference the same named product family, → COTS, not framework_no_it_lots.\n' +
-    ' 5. When in doubt and the tender clearly involves an existing market product the buyer expects to receive or operate, prefer COTS over accepting.\n' +
+    '     🧠 DECISION ALGORITHM (apply in order):\n' +
+    '       1. Does the description name a specific software product, brand, system, environment, or platform as the THING BEING BOUGHT or as the WORKING CONTEXT? If yes, go to step 2; otherwise → likely not COTS.\n' +
+    '       2. Are the scope verbs supply-centric / operation-centric / modification-of-existing (from NEGATIVE SIGNALS)? If yes → COTS. If verbs are construction-centric (build / develop new / design from scratch) → not COTS.\n' +
+    '       3. Do qualification requirements demand Vendor Partner Status or vendor-specific certifications (not generic ISO certifications)? If yes → COTS (regardless of scope wording).\n' +
+    '       4. Multi-lot edge case: if ALL lots reference the same named product family, → COTS, not framework_no_it_lots.\n' +
+    '       5. When in doubt and the tender clearly involves an existing market product the buyer expects to receive or operate, prefer COTS over accepting.\n' +
     '\n' +
-    ' CONCRETE EXAMPLES (apply same algorithm to similar wording):\n' +
-    ' Example 1 — "Procurement of Atlassian software Cloud licenses and expert services" with requirement "Atlassian Platinum or Gold Solution Partner" + "ACP certifications": NEGATIVE supply verb + vendor partner status → COTS.\n' +
-    ' Example 2 — "MSBI expert consulting services to maintain and develop their on-premise BI environment, including design and implementation of new reporting solutions, integration with source systems, data modeling": MSBI is Microsoft BI product, "maintain and develop existing environment" + "reporting solutions in MSBI" + "data modeling" = work inside the vendor product → COTS.\n' +
-    ' Example 3 — "Care Needs Assessment (HTA) Software for Wellbeing Area ... must facilitate care needs assessment ... integrate with the Lifecare patient information system": named product category + integration with existing system → COTS.\n' +
-    ' Example 4 — "Custom development of mission-critical infrastructure integration management platform including system architecture, software development, DevOps, database design, security, UI, testing, documentation": construction verbs + generic engineering roles + bespoke architecture → NOT COTS (accept).\n' +
-    ' Example 5 — "Maintenance and development services for EMDE information system, including consultation, bug fixes, application improvements" with team roles "Backend Developer", "Frontend Developer", "Architect", "QA": engineering roles + maintenance/development of buyer-owned custom system → NOT COTS (accept, this is custom-system evolution).\n' +
-    ' Set rejectReason="cots_implementation_or_licenses" whenever the decision algorithm lands on COTS.\n' +
-    ' • Existing Software Purchase (vertical-domain / named product): Tender procures an EXISTING software product/system — either by brand name OR by referring to a specific vertical-domain solution that buyers shop for as a market product, rather than commissioning a build. Hallmarks: (a) the title/description names a SPECIFIC software category as the thing being procured ("HTA software", "EHR system", "LMS platform", "ERP solution", "CRM system", "DMS solution", "case management system" as a market category), (b) scope is "supply + implementation + integration with existing buyer systems (eg, Lifecare PIS, X-Road, SAP)", (c) text uses language like "the software must support X feature", "the solution shall replace current Y" — implying the buyer expects to RECEIVE a working product, not pay for its development. INCLUDES: healthcare HTA/EHR/PACS software, legal practice management systems, library management systems, school information systems, accounting/HR ERP suites, document management platforms, CRM/CMS/LMS solutions sold as products. Pavyzdys: "Care Needs Assessment (HTA) Software for Wellbeing Area ... must facilitate care needs assessment ... integrate with the Lifecare patient information system" → set rejectReason="existing_software_purchase". DIFFERENCE from "cots_implementation_or_licenses": COTS targets named global enterprise platforms; existing_software_purchase targets vertical/niche domain products including those that may have multiple vendor implementations. DIFFERENCE from "saas_provision_or_creation": SaaS is subscription-style; this is product-purchase style. WHEN IN DOUBT — if the tender is a one-off PROCUREMENT of an already-existing solution category (not a build-from-scratch project), reject as existing_software_purchase.\n' +
-    ' • Helpdesk/Support Only: Primary scope is L1/L2 helpdesk, end-user support, client management, or continuous maintenance of systems we did not build. Set rejectReason="helpdesk_support_only".\n' +
-    ' • PM / Admin Consulting Only: Tender procures PURE project management, PMO, technical office (oficina técnica), or administrative consulting — NO custom software development. We are software engineers, not PM consultants. Hallmarks:\n' +
-    ' • FR: "Assistance à maîtrise d'œuvre" (AMOE), "Assistance à maîtrise d'ouvrage" (AMOA / AMO), "Pilotage de projet", "Conseil en gestion de projet"\n' +
-    ' • ES: "Oficina técnica de apoyo", "Consultoría especializada", "Asistencia técnica" (without dev scope), "Servicios de gestión de proyectos"\n' +
-    ' • EN: "PMO services", "Project Management Office", "Project management consulting", "Technical office support", "Program management services"\n' +
-    ' • DE: "Project management consulting", "Project control", "PMO services"\n' +
-    ' • LT: "Projekto vadovavimas", "Techninė pagalba" (kai nėra dev), "Pirkimo procedūrų administravimas"\n' +
-    ' Role signal: required team consists ONLY of Project Manager / PMO Lead / Coordinator / Scrum Master / Business Analyst — NO Developer / Architect / DevOps / QA / UI-UX. Required references describe "managed N projects" not "built N systems".\n' +
-    ' POSITIVE (do NOT reject): scope includes BOTH project management AND custom dev (full SDLC team requested with PM + Architects + Developers + QA). Pure PM-assistance for client\'s internal IT department, with no actual code being written by the contractor, is the rejectable pattern. Set rejectReason="pm_admin_consulting_only".\n' +
-    ' • Training/Workshops: Scope is purely delivering educational courses, IT training, or workshops without software development. Set rejectReason="training_workshops_only".\n' +
-    ' • Non-IT / Construction / Repair / Renovation: Tender procures PHYSICAL building works — construction, renovation, modernization, repair, refurbishment of buildings or infrastructure. We are a software development company and CANNOT execute construction. Hallmarks (any one is sufficient):\n' +
-    ' • LT: "statybos rangos darbai", "remonto darbai", "atnaujinimo (modernizavimo) statybos", "stogo remontas/atnaujinimas", "fasadų šiltinimas", "sienų šiltinimas", "betonavimo darbai", "mūro darbai", "metalo konstrukcijų montavimo darbai", "įėjimo aikštelių ir laiptelių remontas", "atestuotas statybos vadovas", "SSVA arba SPSC įmonės atestatas", "ypatingų gyvenamosios paskirties pastatų", "aukštalipio sertifikatas", "pramoninis alpinizmas"\n' +
-    ' • EN: "construction works", "renovation works", "building modernization", "modernization construction", "roofing works", "roof repair", "facade insulation", "wall insulation", "concrete works", "masonry", "asphalt paving", "earthworks"\n' +
-    ' • DE: "Construction work", "Refurbishment", "Renovation", "Modernization", "Facade insulation", "Roof renovation", "Concrete work", "Masonry work"\n' +
-    ' • FR: "Travaux de construction", "Rénovation", "Travaux de modernisation", "Travaux de réhabilitation", "Maçonnerie", "Couverture-étanchéité"\n' +
-    ' • ES: "Obras de construcción", "Renovación", "Modernización", "Reforma", "Rehabilitación", "Albañilería"\n' +
-    ' • IT: "Lavori di costruzione", "Ristrutturazione", "Riqualificazione edilizia"\n' +
-    ' ALSO covers: physical engineering services, civil engineering, road construction, physical security guards, janitorial / cleaning services, landscaping, asbestos removal, demolition. Set rejectReason="non_it_construction".\n' +
-    ' • On-Site Physical Work Required (non-construction): Tender requires PHYSICAL on-site presence as a CORE deliverable that we cannot fulfill remotely from Lithuania — even if the work is not pure construction. Examples:\n' +
-    ' • Field engineering / on-site equipment installation (eg installing servers/switches in client racks)\n' +
-    ' • Daily on-site IT support requiring physical presence at client premises\n' +
-    ' • Physical audits as primary scope (visiting buildings/factories to inspect)\n' +
-    ' • Equipment delivery + on-site setup\n' +
-    ' • Catering, food service, vending machines, mail handling, courier services\n' +
-    ' • Driver services, transportation, vehicle delivery\n' +
-    ' • In-person event support, AV/staging crew\n' +
-    ' Hallmark wording: "Rangovas privalo apsilankyti darbų atlikimo vietoje" (LT), "On-site presence required", "Service to be delivered at buyer\'s premises", "Daily attendance required at [address]", "On-site service", "Sur site". DO NOT trigger this for: brief kick-off / handover meetings, hybrid teams with occasional client visits, generic clauses about "site visits if needed". Trigger ONLY when scope is fundamentally on-site work. Set rejectReason="onsite_physical_work".\n' +
-    ' • Surveys/Research: Conducting public surveys, sociological polling, non-IT market research. Set rejectReason="surveys_market_research".\n' +
-    ' • Pre-Tender Market Consultation: Buyer is gathering market INFORMATION from suppliers BEFORE issuing an actual tender — NOT inviting offers/bids. We don't participate in pre-procurement consultations. Hallmarks: (a) title/description explicitly labels the notice as a market consultation/research/sourcing exercise (NOT a tender for services); (b) "noticeType" is "Prior Information Notice" with consultation purpose; (c) no real submission of offers requested — only feedback, expressions of interest, or capability info. Look for these multilingual phrases:\n' +
-    ' • DE: "market research", "market research procedure", "market consultation", "announcement of a market consultation", "preliminary market research"\n' +
-    ' • EN: "Market consultation", "Market research" (when buyer is consulting suppliers), "Pre-tender consultation", "Pre-procurement consultation", "Request for Information (RFI)" (in pre-procurement context, not actual RFP), "Prior Information Notice with consultation"\n' +
-    ' • LT: "Rinkos konsultacija", "Rinkos tyrimas" (pirkimo kontekste — perkanti organizacija renka info iš tiekėjų)\n' +
-    ' • FR: "Consultation préalable", "Sourcing public", "Consultation du marché", "Avis de pré-information avec consultation"\n' +
-    ' • ES: "Consulta preliminar de mercado", "Consulta al mercado", "Sondeo de mercado"\n' +
-    ' • IT: "Consultazione preliminare di mercato", "Indagine di mercato"\n' +
-    ' • NL: "Marktconsultatie", "Marktverkenning"\n' +
-    ' • Scandinavian: "Markedsdialog", "Marknadsundersökning" (in pre-procurement context)\n' +
-    ' Set rejectReason="pre_tender_market_consultation". DIFFERENCE from "surveys_market_research": the latter is buyer asking US TO CONDUCT surveys as a paid service; this category is buyer asking us to PROVIDE market info before issuing a real tender — no paid work, just consultation.\n' +
-    ' • GIS / Geo-specific: Geographic Information Systems (GIS), geological mapping, spatial data systems requiring specific local geographical knowledge/access. Set rejectReason="gis_geospatial".\n' +
-    ' • Physical/Infrastructure: Hardware delivery, cabling, network/telecom infra. Set rejectReason="hardware_network_infra".\n' +
-    ' • Foreign Local Presence Required: Tender REQUIRES all contractor personnel/data to be physically located in a SPECIFIC country other than Lithuania. We are a Lithuanian company that delivers remotely from Lithuania — cannot satisfy national-sovereignty / data-residency requirements. Hallmarks (any one is sufficient):\n' +
-    ' • Mandatory wording: "All personnel must be located in [country]", "All work must be executed exclusively on [country] territory", "Personnel must reside in [country]", "Mainland and overseas territories" (DROM-COM, Outre-mer, etc.)\n' +
-    ' • Data residency tied to ONE country: "No data processing, storage, consultation or manipulation from outside [country]", "Datacenters exclusively in [country]", "Cloud providers must have datacenters exclusively in [country]"\n' +
-    ' • National sovereign-cloud certifications REQUIRED alongside residency: SecNumCloud (FR), BSI C5 + national hosting (DE), ENS Alta with national-cloud requirement (ES), AgID Qualifications (IT) — but ONLY when combined with explicit national-territory residency requirement\n' +
-    ' • Bidder must have local office / branch / fiscal presence in the country: "siège ou établissement secondaire en France", "branch in Germany", "sede o sucursal en España"\n' +
-    ' COUNTRIES that trigger this category: any country other than Lithuania, EU-wide remote delivery is normally allowed for EU purchases, so trigger ONLY when the tender EXPLICITLY mandates physical / data presence in a specific named country. Do NOT trigger when (a) the buyer simply lists their own country in the tender notice metadata, (b) language requirement is mentioned but not residency, (c) "GDPR compliance" or generic ISO certifications are required (those are EU-wide). Set rejectReason="requires_foreign_local_presence".\n' +
-    ' • 24/7 Operational Support Required: Tender MANDATES round-the-clock (24/7, 24x7, 24h) operational support, on-call duty, after-hours response SLA (eg, 1h response any time), live ops coverage, NOC services, or shift-based monitoring as a CORE deliverable. We are a development company without 24/7 ops capacity. Look for phrases like "24/7 support", "døgnvakt", "24-timers vakt", "24 Hours", "support 24h/7j", "operativ støtte døgnet Rundt", "24/7 SLA", "1-hour response time at all hours", "around-the-clock", "support 24/7", "supporto 24 ore", "monitoraggio continuativo". DO NOT trigger this category for normal business-hours support, best-effort response, or maintenance windows. Set rejectReason="requires_24_7_support".\n' +
-    ' • Cybersecurity-Only Services (SOC/MDR/SIEM/Pentest/Audit): Tender procures cybersecurity OPERATIONAL or AUDIT services as the CORE deliverable — not custom software development. We are a custom-software development company, NOT a cybersecurity operations / red-team / audit firm.\n' +
-    ' ❌ NEGATIVE SIGNALS — pure cybersecurity (REJECT):\n' +
-    ' ✗ Scope verbs: "SOC services", "Security Operations Center", "Managed Detection and Response (MDR)", "Managed EDR (M-EDR)", "Managed "ISMS audit", "Digital Surveillance services", "threat intelligence services"\n' +
-    ' ✗ Lithuanian phrases: "Saugumo operacijų centras", "SOC paslaugos", "SIEM administravimas", "kibernetinių grėsmių žvalgyba", "kibernetinių incidentų atakos grandinės sudarymas", "pažangi saugumo analitika", "informacijos saugumo auditas"\n' +
-    ' ✗ Required role titles WITHOUT broader development context: "SOC Manager", "SOC Analyst (L1/L2/L3)", "SIEM Administrator", "Security Architect", "Incident Response Lead/Analyst", "Threat Intelligence Analyst", "Penetration Tester", "Red Team Operator", "Security Auditor"\n' +
-    ' ✗ Required certifications dominant: CISSP, CISM, CEH (Certified Ethical Hacker), OSCP (OffSec Certified Professional), OSCE, CompTIA Security+ / CASP+, ISACA CRISC, ISACA CISA, CTIA (Certified Threat Intelligence Analyst), GIAC GCIH/GCIA/GREM, CHFI\n' +
-    ' ✗ Title or description names the deliverable as a security service category: "SOC services tender", "Cybersecurity Operations Procurement", "Managed Security Services", "Vulnerability Management Service"\n' +
-    ' ✅ POSITIVE SIGNALS — do NOT reject as cybersecurity-only (security is a sub-component of broader custom software work):\n' +
-    ' ✓ Tender is a CUSTOM SOFTWARE BUILD that mentions security testing / OWASP / DPIA / GDPR as one work-stream among many (architecture + UI + backend + db + security testing)\n' +
-    ' ✓ Generic ISO 27001 certification required for the bidding company, but the SCOPE is custom development\n' +
-    ' ✓ "Security by design" or "secure SDLC" mentioned as a methodology requirement on a development project\n' +
-    ' ✓ Penetration testing required as a single deliverable WITHIN a broader system development contract\n' +
-    ' 🧠 DECISION RULE: if the scopeOfAgreement is dominated by security OPERATIONS (monitoring/detection/response/audit/pentest) and there is no custom software DEVELOPMENT being commissioned, set rejectReason="cybersecurity_only". For multi-lot tenders where security is one lot among many, only reject if EVERY lot is pure security.\n' +
-    ' • Mixed Lots Required Together: lotStructure=="all-required" AND the umbrella scope covers non-IT work (construction, physical security, cleaning, logistics, food service, training-only, etc.) that we cannot perform alongside the IT portion. Set rejectReason="mixed_lots_all_required".\n' +
-    ' • Multi-lot Framework Without IT Lots: lotStructure=="partial" but NONE of the available lots is custom software development (eg all lots are management consulting, legal advisory, HR, surveys, hardware supply). Set rejectReason="framework_no_it_lots".\n' +
-    ' AMBIGUOUS PROCUREMENT: If it says "system implementation" but implies configuring an off-the-shelf product → REJECT. ACCEPT (empty rejectReason) ONLY if it is custom software development, web/mobile app dev from scratch, bespoke architecture, or maintenance/evolution of custom systems. For partial-bid multi-lot tenders, ACCEPT (empty rejectReason) when AT LEAST ONE lot is custom software development — itLotsScope must list those lot(s).\n' +
+    '     CONCRETE EXAMPLES (apply same algorithm to similar wording):\n' +
+    '       Example 1 — "Procurement of Atlassian software Cloud licenses and expert services" with requirement "Atlassian Platinum or Gold Solution Partner" + "ACP certifications": NEGATIVE supply verb + vendor partner status → COTS.\n' +
+    '       Example 2 — "MSBI expert consulting services to maintain and develop their on-premise BI environment, including design and implementation of new reporting solutions, integration with source systems, data modeling": MSBI is Microsoft BI product, "maintain and develop existing environment" + "reporting solutions in MSBI" + "data modeling" = work inside the vendor product → COTS.\n' +
+    '       Example 3 — "Care Needs Assessment (HTA) Software for Wellbeing Area ... must facilitate care needs assessment ... integrate with the Lifecare patient information system": named product category + integration with existing system → COTS.\n' +
+    '       Example 4 — "Custom development of mission-critical infrastructure integration management platform including system architecture, software development, DevOps, database design, security, UI, testing, documentation": construction verbs + generic engineering roles + bespoke architecture → NOT COTS (accept).\n' +
+    '       Example 5 — "Maintenance and development services for EMDE information system, including consultation, bug fixes, application improvements" with team roles "Backend Developer", "Frontend Developer", "Architect", "QA": engineering roles + maintenance/development of buyer-owned custom system → NOT COTS (accept, this is custom-system evolution).\n' +
+    '     Set rejectReason="cots_implementation_or_licenses" whenever the decision algorithm lands on COTS.\n' +
+    '   • Existing Software Purchase (vertical-domain / named product): Tender procures an EXISTING software product/system — either by brand name OR by referring to a specific vertical-domain solution that buyers shop for as a market product, rather than commissioning a build. Hallmarks: (a) the title/description names a SPECIFIC software category as the thing being procured ("HTA software", "EHR system", "LMS platform", "ERP solution", "CRM system", "DMS solution", "case management system" as a market category), (b) scope is "supply + implementation + integration with existing buyer systems (e.g., Lifecare PIS, X-Road, SAP)", (c) text uses language like "the software must support X feature", "the solution shall replace current Y" — implying the buyer expects to RECEIVE a working product, not pay for its development. INCLUDES: healthcare HTA/EHR/PACS software, legal practice management systems, library management systems, school information systems, accounting/HR ERP suites, document management platforms, CRM/CMS/LMS solutions sold as products. Pavyzdys: "Care Needs Assessment (HTA) Software for Wellbeing Area ... must facilitate care needs assessment ... integrate with the Lifecare patient information system" → set rejectReason="existing_software_purchase". DIFFERENCE from "cots_implementation_or_licenses": COTS targets named global enterprise platforms; existing_software_purchase targets vertical/niche domain products including those that may have multiple vendor implementations. DIFFERENCE from "saas_provision_or_creation": SaaS is subscription-style; this is product-purchase style. WHEN IN DOUBT — if the tender is a one-off PROCUREMENT of an already-existing solution category (not a build-from-scratch project), reject as existing_software_purchase.\n' +
+    '   • Helpdesk/Support Only: Primary scope is L1/L2 helpdesk, end-user support, client management, or continuous maintenance of systems we did not build. Set rejectReason="helpdesk_support_only".\n' +
+    '   • PM / Admin Consulting Only: Tender procures PURE project management, PMO, technical office (oficina técnica), or administrative consulting — NO custom software development. We are software engineers, not PM consultants. Hallmarks:\n' +
+    '       • FR: "Assistance à maîtrise d\'œuvre" (AMOE), "Assistance à maîtrise d\'ouvrage" (AMOA / AMO), "Pilotage de projet", "Conseil en gestion de projet"\n' +
+    '       • ES: "Oficina técnica de apoyo", "Consultoría especializada", "Asistencia técnica" (without dev scope), "Servicios de gestión de proyectos"\n' +
+    '       • EN: "PMO services", "Project Management Office", "Project management consulting", "Technical office support", "Programme management services"\n' +
+    '       • DE: "Projektmanagement-Beratung", "Projektsteuerung", "PMO-Dienstleistungen"\n' +
+    '       • LT: "Projekto vadovavimas", "Techninė pagalba" (kai nėra dev), "Pirkimo procedūrų administravimas"\n' +
+    '     Role signal: required team consists ONLY of Project Manager / PMO Lead / Coordinator / Scrum Master / Business Analyst — NO Developer / Architect / DevOps / QA / UI-UX. Required references describe "managed N projects" not "built N systems".\n' +
+    '     POSITIVE (do NOT reject): scope includes BOTH project management AND custom dev (full SDLC team requested with PM + Architects + Developers + QA). Pure PM-assistance for client\'s internal IT department, with no actual code being written by the contractor, is the rejectable pattern. Set rejectReason="pm_admin_consulting_only".\n' +
+    '   • Training/Workshops: Scope is purely delivering educational courses, IT training, or workshops without software development. Set rejectReason="training_workshops_only".\n' +
+    '   • Non-IT / Construction / Repair / Renovation: Tender procures PHYSICAL building works — construction, renovation, modernization, repair, refurbishment of buildings or infrastructure. We are a software development firm and CANNOT execute construction. Hallmarks (any one is sufficient):\n' +
+    '       • LT: "statybos rangos darbai", "remonto darbai", "atnaujinimo (modernizavimo) statybos", "stogo remontas/atnaujinimas", "fasadų šiltinimas", "sienų šiltinimas", "betonavimo darbai", "mūro darbai", "metalo konstrukcijų montavimo darbai", "įėjimo aikštelių ir laiptelių remontas", "atestuotas statybos vadovas", "SSVA arba SPSC įmonės atestatas", "ypatingų gyvenamosios paskirties pastatų", "aukštalipio sertifikatas", "pramoninis alpinizmas"\n' +
+    '       • EN: "construction works", "renovation works", "building modernization", "modernization construction", "roofing works", "roof repair", "facade insulation", "wall insulation", "concrete works", "masonry", "asphalt paving", "earthworks"\n' +
+    '       • DE: "Bauarbeiten", "Sanierung", "Renovierung", "Modernisierung", "Fassadendämmung", "Dachsanierung", "Betonarbeiten", "Maurerarbeiten"\n' +
+    '       • FR: "Travaux de construction", "Rénovation", "Travaux de modernisation", "Travaux de réhabilitation", "Maçonnerie", "Couverture-étanchéité"\n' +
+    '       • ES: "Obras de construcción", "Renovación", "Modernización", "Reforma", "Rehabilitación", "Albañilería"\n' +
+    '       • IT: "Lavori di costruzione", "Ristrutturazione", "Riqualificazione edilizia"\n' +
+    '     ALSO covers: physical engineering services, civil engineering, road construction, physical security guards, janitorial / cleaning services, landscaping, asbestos removal, demolition. Set rejectReason="non_it_construction".\n' +
+    '   • On-Site Physical Work Required (non-construction): Tender requires PHYSICAL on-site presence as a CORE deliverable that we cannot fulfill remotely from Lithuania — even if the work is not pure construction. Examples:\n' +
+    '       • Field engineering / on-site equipment installation (e.g. installing servers/switches in client racks)\n' +
+    '       • Daily on-site IT support requiring physical presence at client premises\n' +
+    '       • Physical audits as primary scope (visiting buildings/factories to inspect)\n' +
+    '       • Equipment delivery + on-site setup\n' +
+    '       • Catering, food service, vending machines, mail handling, courier services\n' +
+    '       • Driver services, transportation, vehicle delivery\n' +
+    '       • In-person event support, AV/staging crew\n' +
+    '     Hallmark wording: "Rangovas privalo apsilankyti darbų atlikimo vietoje" (LT), "On-site presence required", "Service to be delivered at buyer\'s premises", "Daily attendance required at [address]", "Vor-Ort-Service", "Sur site". DO NOT trigger this for: brief kick-off / handover meetings, hybrid teams with occasional client visits, generic clauses about "site visits if needed". Trigger ONLY when scope is fundamentally on-site work. Set rejectReason="onsite_physical_work".\n' +
+    '   • Surveys/Research: Conducting public surveys, sociological polling, non-IT market research. Set rejectReason="surveys_market_research".\n' +
+    '   • Pre-Tender Market Consultation: Buyer is gathering market INFORMATION from suppliers BEFORE issuing an actual tender — NOT inviting offers/bids. We don\'t participate in pre-procurement consultations. Hallmarks: (a) title/description explicitly labels the notice as a market consultation/research/sourcing exercise (NOT a tender for services); (b) "noticeType" is "Prior Information Notice" with consultation purpose; (c) no real submission of offers requested — only feedback, expressions of interest, or capability info. Look for these multilingual phrases:\n' +
+    '       • DE: "Markterkundung", "Markterkundungsverfahren", "Marktkonsultation", "Bekanntmachung einer Marktkonsultation", "vorgeschaltete Markterkundung"\n' +
+    '       • EN: "Market consultation", "Market research" (when buyer is consulting suppliers), "Pre-tender consultation", "Pre-procurement consultation", "Request for Information (RFI)" (in pre-procurement context, not actual RFP), "Prior Information Notice with consultation"\n' +
+    '       • LT: "Rinkos konsultacija", "Rinkos tyrimas" (pirkimo kontekste — perkanti organizacija renka info iš tiekėjų)\n' +
+    '       • FR: "Consultation préalable", "Sourcing public", "Consultation du marché", "Avis de pré-information avec consultation"\n' +
+    '       • ES: "Consulta preliminar de mercado", "Consulta al mercado", "Sondeo de mercado"\n' +
+    '       • IT: "Consultazione preliminare di mercato", "Indagine di mercato"\n' +
+    '       • NL: "Marktconsultatie", "Marktverkenning"\n' +
+    '       • Scandinavian: "Markedsdialog", "Marknadsundersökning" (in pre-procurement context)\n' +
+    '     Set rejectReason="pre_tender_market_consultation". DIFFERENCE from "surveys_market_research": the latter is buyer asking US TO CONDUCT surveys as a paid service; this category is buyer asking us to PROVIDE market info before issuing a real tender — no paid work, just consultation.\n' +
+    '   • GIS / Geo-specific: Geographic Information Systems (GIS), geological mapping, spatial data systems requiring specific local geographical knowledge/access. Set rejectReason="gis_geospatial".\n' +
+    '   • Physical/Infrastructure: Hardware delivery, cabling, network/telecom infra. Set rejectReason="hardware_network_infra".\n' +
+    '   • Foreign Local Presence Required: Tender REQUIRES all contractor personnel/data to be physically located in a SPECIFIC country other than Lithuania. We are a Lithuanian company that delivers remotely from Lithuania — cannot satisfy national-sovereignty / data-residency requirements. Hallmarks (any one is sufficient):\n' +
+    '       • Mandatory wording: "All personnel must be located in [country]", "All work must be executed exclusively on [country] territory", "Personnel must reside in [country]", "Mainland and overseas territories" (DROM-COM, Outre-mer, etc.)\n' +
+    '       • Data residency tied to ONE country: "No data processing, storage, consultation or manipulation from outside [country]", "Datacenters exclusively in [country]", "Cloud providers must have datacenters exclusively in [country]"\n' +
+    '       • National sovereign-cloud certifications REQUIRED alongside residency: SecNumCloud (FR), BSI C5 + national hosting (DE), ENS Alta with national-cloud requirement (ES), AgID Qualifications (IT) — but ONLY when combined with explicit national-territory residency requirement\n' +
+    '       • Bidder must have local office / branch / fiscal presence in the country: "siège ou établissement secondaire en France", "Niederlassung in Deutschland", "sede o sucursal en España"\n' +
+    '     COUNTRIES that trigger this category: any country other than Lithuania, EU-wide remote delivery is normally allowed for EU procurements, so trigger ONLY when the tender EXPLICITLY mandates physical / data presence in a specific named country. Do NOT trigger when (a) the buyer simply lists their own country in the tender notice metadata, (b) language requirement is mentioned but not residency, (c) "GDPR compliance" or generic ISO certifications are required (those are EU-wide). Set rejectReason="requires_foreign_local_presence".\n' +
+    '   • 24/7 Operational Support Required: Tender MANDATES round-the-clock (24/7, 24x7, 24h) operational support, on-call duty, after-hours response SLA (e.g., 1h response any time), live ops coverage, NOC services, or shift-based monitoring as a CORE deliverable. We are a development firm without 24/7 ops capacity. Look for phrases like "24/7 support", "døgnvakt", "24-timers vakt", "24 Stunden", "support 24h/7j", "operativ støtte døgnet rundt", "24/7 SLA", "1-hour response time at all hours", "around-the-clock", "soporte 24/7", "supporto 24 ore", "monitoraggio continuativo". DO NOT trigger this category for normal business-hours support, best-effort response, or maintenance windows. Set rejectReason="requires_24_7_support".\n' +
+    '   • Cybersecurity-Only Services (SOC/MDR/SIEM/Pentest/Audit): Tender procures cybersecurity OPERATIONAL or AUDIT services as the CORE deliverable — not custom software development. We are a custom-software development firm, NOT a cybersecurity operations / red-team / audit firm.\n' +
+    '     ❌ NEGATIVE SIGNALS — pure cybersecurity (REJECT):\n' +
+    '       ✗ Scope verbs: "SOC services", "Security Operations Center", "Managed Detection and Response (MDR)", "Managed EDR (M-EDR)", "Managed XDR", "SIEM operations / administration", "NDR (Network Detection and Response)", "continuous monitoring of cyber threats", "threat hunting", "incident response services", "vulnerability assessment / management", "penetration testing", "Red Team exercises", "security audit", "ISMS audit", "Digital Surveillance services", "threat intelligence services"\n' +
+    '       ✗ Lithuanian phrases: "Saugumo operacijų centras", "SOC paslaugos", "SIEM administravimas", "kibernetinių grėsmių žvalgyba", "kibernetinių incidentų atakos grandinės sudarymas", "pažangi saugumo analitika", "informacijos saugumo auditas"\n' +
+    '       ✗ Required role titles WITHOUT broader development context: "SOC Manager", "SOC Analyst (L1/L2/L3)", "SIEM Administrator", "Security Architect", "Incident Response Lead/Analyst", "Threat Intelligence Analyst", "Penetration Tester", "Red Team Operator", "Security Auditor"\n' +
+    '       ✗ Required certifications dominant: CISSP, CISM, CEH (Certified Ethical Hacker), OSCP (OffSec Certified Professional), OSCE, CompTIA Security+ / CASP+, ISACA CRISC, ISACA CISA, CTIA (Certified Threat Intelligence Analyst), GIAC GCIH/GCIA/GREM, CHFI\n' +
+    '       ✗ Title or description names the deliverable as a security service category: "SOC services tender", "Cybersecurity Operations Procurement", "Managed Security Services", "Vulnerability Management Service"\n' +
+    '     ✅ POSITIVE SIGNALS — do NOT reject as cybersecurity-only (security is a sub-component of broader custom software work):\n' +
+    '       ✓ Tender is a CUSTOM SOFTWARE BUILD that mentions security testing / OWASP / DPIA / GDPR as one work-stream among many (architecture + UI + backend + db + security testing)\n' +
+    '       ✓ Generic ISO 27001 certification required for the bidding company, but the SCOPE is custom development\n' +
+    '       ✓ "Security by design" or "secure SDLC" mentioned as a methodology requirement on a development project\n' +
+    '       ✓ Penetration testing required as a single deliverable WITHIN a broader system development contract\n' +
+    '     🧠 DECISION RULE: if the scopeOfAgreement is dominated by security OPERATIONS (monitoring/detection/response/audit/pentest) and there is no custom software DEVELOPMENT being commissioned, set rejectReason="cybersecurity_only". For multi-lot tenders where security is one lot among many, only reject if EVERY lot is pure security.\n' +
+    '   • Mixed Lots Required Together: lotStructure=="all-required" AND the umbrella scope covers non-IT work (construction, physical security, cleaning, logistics, food service, training-only, etc.) that we cannot perform alongside the IT portion. Set rejectReason="mixed_lots_all_required".\n' +
+    '   • Multi-lot Framework Without IT Lots: lotStructure=="partial" but NONE of the available lots is custom software development (e.g. all lots are management consulting, legal advisory, HR, surveys, hardware supply). Set rejectReason="framework_no_it_lots".\n' +
+    '   AMBIGUOUS PROCUREMENT: If it says "system implementation" but implies configuring an off-the-shelf product → REJECT. ACCEPT (empty rejectReason) ONLY if it is custom software development, web/mobile app dev from scratch, bespoke architecture, or maintenance/evolution of custom systems. For partial-bid multi-lot tenders, ACCEPT (empty rejectReason) when AT LEAST ONE lot is custom software development — itLotsScope must list those lot(s).\n' +
     '- rejectCategory: short machine-readable category matching the rejectReason. Empty string if not rejected.\n' +
     (meta.outputLanguage === 'lt'
-      ? 'Write the following field values ​​in LITHUANIAN (original language, do not translate): requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement, itLotsScope. Write rejectReason and rejectCategory in English (machine-readable). Use exact numbers from the source.'
-      : 'Write all field values ​​in English. Use exact numbers from the source.') +
+      ? 'Write the following field values in LITHUANIAN (original language, do not translate): requirementsForSupplier, qualificationRequirements, offerWeighingCriteria, scopeOfAgreement, itLotsScope. Write rejectReason and rejectCategory in English (machine-readable). Use exact numbers from the source.'
+      : 'Write all field values in English. Use exact numbers from the source.') +
     // 2026-06-04 (Task #171) — historical benchmark injection. When AI
     // estimates budget, anchor it on prior tenders with stated budgets
     // (loaded from Sheet1 at boot). Same country + similar scope/duration
-    // = closest analogue.
+    // = closest analog.
     (_BUDGET_BENCHMARKS.promptSnippet
-      ? `\n\n${_BUDGET_BENCHMARKS.promptSnippet}\n\nWhen estimating budget, FIRST scan the benchmarks above for a similar country + scope + duration. Anchor your estimate within ±50% of the closest analog. Cite the matching benchmark briefly in estimationReasoning (eg "anchor: NL 28mo CMS dev €13M").`
+      ? `\n\n${_BUDGET_BENCHMARKS.promptSnippet}\n\nWhen estimating budget, FIRST scan the benchmarks above for a similar country + scope + duration. Anchor your estimate within ±50% of the closest analog. Cite the matching benchmark briefly in estimationReasoning (e.g. "anchor: NL 28mo CMS dev €13M").`
       : '');
   const metaLine = [
     meta.title ? `Title: ${meta.title}` : '',
@@ -1196,10 +1196,10 @@ async function extractFieldsWithAI(text, meta = {}) {
     // estimated."). The previous JSON.parse(cleaned) blew up on any
     // trailing non-whitespace and we lost the entire extraction (real-
     // world: "Unexpected non-whitespace character after JSON at
-    // position 637" on a tendered tender, dropped its requirements
+    // position 637" on a tenderned tender, dropped its requirements
     // /qualifications). Strategy: walk through the cleaned string
     // tracking string-state and brace depth, slice from the first `{`
-    // up to the matching `}`, and parse just that substring. If
+    // up to the matching `}`, and parse just that substring. Falls
     // back to whole-string parse if no balanced block is found.
     const stripped = out
       .replace(/^```(?:json)?\s*/i, '')
@@ -1235,24 +1235,24 @@ async function extractFieldsWithAI(text, meta = {}) {
     } catch (parseErr) {
       // Last-resort recovery: if Claude truncated the JSON mid-string
       // (max-tokens hit), try a heuristic: append `"}` and retry.
-      // Only triggers when the error mentions an undermined string.
+      // Only triggers when the error mentions an unterminated string.
       const msg = String(parseErr.message || '');
-      if (/Underminated string/i.test(msg)) {
+      if (/Unterminated string/i.test(msg)) {
         try { parsed = JSON.parse(candidateJson + '"}'); }
         catch (_) { throw parseErr; }
       } else {
         throw parseErr;
       }
     }
-    // Normalize lotStructure to one of the three values ​​(defensive: AI
-    // sometimes returns capitalized/synonyms like "Partial" or "all required").
+    // Normalise lotStructure to one of the three values (defensive: AI
+    // sometimes returns capitalised/synonyms like "Partial" or "all required").
     const rawLot = (parsed.lotStructure || '').toString().toLowerCase().trim();
     let lotStructure = 'single';
     if (/^partial$/.test(rawLot) || /partial[-\s_]bid/.test(rawLot) || /^per[-\s]?lot$/.test(rawLot)) lotStructure = 'partial';
     else if (/^all[-\s_]?required$/.test(rawLot) || /all[\s_]?lots?[\s_]?required/.test(rawLot) || /full[-\s_]?bundle/.test(rawLot)) lotStructure = 'all-required';
     // 2026-06-08 (Task #181) — KRITINIS FIX: trūkstami laukai grąžinime.
-    // Anksčiau scraper.js never need ai.budgetSource, ai.requirementsSourceFile,
-    // ai.qualificationsSourceFile į post-AI logicą → L/M stulpeliuose niekada
+    // Anksčiau scraper.js niekad neperdaviu ai.budgetSource, ai.requirementsSourceFile,
+    // ai.qualificationsSourceFile į post-AI logiką → L/M stulpeliuose niekada
     // nebuvo HYPERLINK'o, J fall-back'ino į "Mercell tender notice". 100%
     // tenderių run 117 turėjo reqSrc="" qualSrc="" dėl ŠITO bug'o.
     const aiObj = {
@@ -1274,13 +1274,13 @@ async function extractFieldsWithAI(text, meta = {}) {
       rejectCategory: (parsed.rejectCategory || '').toString().trim(),
     };
     // 2026-06-08 (Task #181) — Variant C diag: log raw AI JSON snippet kai
-    // source file laukai tušti nors text laukas non-placeholder. Padeda
+    // source-file laukai tušti nors text laukas non-placeholder. Padeda
     // patikrinti ar (a) AI grąžina laukus tuščius (b) ar visai praleidžia.
     const reqHasText = aiObj.requirementsForSupplier && !/^\(no explicit/i.test(aiObj.requirementsForSupplier);
     const qualHasText = aiObj.qualificationRequirements && !/^\(no explicit/i.test(aiObj.qualificationRequirements);
     if ((reqHasText && !aiObj.requirementsSourceFile) || (qualHasText && !aiObj.qualificationsSourceFile)) {
       const snippet = candidateJson.slice(0, 400).replace(/\s+/g, ' ');
-      console.log(` 🐞 AI source-file gap: reqText=${reqHasText} reqSrc="${aiObj.requirementsSourceFile.slice(0, 60)}" | qualText=${qualHasText} qualSrc="${aiObj.qualificationsSourceFile.slice(0, 60)}" | rawJSON snippet: ${snippet}`);
+      console.log(`    🐞 AI source-file gap: reqText=${reqHasText} reqSrc="${aiObj.requirementsSourceFile.slice(0, 60)}" | qualText=${qualHasText} qualSrc="${aiObj.qualificationsSourceFile.slice(0, 60)}" | rawJSON snippet: ${snippet}`);
     }
     return aiObj;
   } catch (e) {
@@ -1290,12 +1290,12 @@ async function extractFieldsWithAI(text, meta = {}) {
     // practice still leaves the tender with no extracted fields. The per-
     // tender loop checks this flag and defers row-write so we re-try next run.
     _lastAiExtractionFailure = String(e && e.message || 'unknown').slice(0, 200);
-    console.log(` ⚠️ AI extract failed: ${e.message.slice(0, 160)}`);
+    console.log(`    ⚠️ AI extract failed: ${e.message.slice(0, 160)}`);
     return {};
   }
 }
 
-// --- Pagalbinės funkcijos ------------------------------------------------
+// --- Pagalbinės funkcijos ----------------------------------------------
 
 async function clickButtonContainsText(page, text) {
   return await page.evaluate((t) => {
@@ -1314,18 +1314,18 @@ async function clickButtonContainsText(page, text) {
 // or not an Element" error. This happens when the element exists in the
 // DOM (waitForSelector succeeded) but Puppeteer's clickable-point check
 // fails — typical causes:
-// - The element is animating in (opacity/transform transition)
-// - A modal/overlay/cookie banner is covering it
-// - The element is off-screen (needs scroll)
-// - The element is hidden by parent display:none / visibility:hidden
+//   - The element is animating in (opacity/transform transition)
+//   - A modal/overlay/cookie banner is covering it
+//   - The element is off-screen (needs scroll)
+//   - The element is hidden by parent display:none / visibility:hidden
 //
 // Strategy:
-// 1. Wait for selector to exist (caller may have done this already, no-op if so)
-// 2. Try scroll into view + native page.click()
-// 3. If native click throws, fall back to el.click() via page.evaluate()
-// — DOM click() bypasses Puppeteer's clickability heuristic and works
-// on elements that are technically in the DOM tree even if not yet
-// visually interactive
+//   1. Wait for selector to exist (caller may have done this already, no-op if so)
+//   2. Try scroll into view + native page.click()
+//   3. If native click throws, fall back to el.click() via page.evaluate()
+//      — DOM click() bypasses Puppeteer's clickability heuristic and works
+//      on elements that are technically in the DOM tree even if not yet
+//      visually interactive
 //
 // Returns true on any successful click, false on hard failure.
 // =====================================================================
@@ -1335,7 +1335,7 @@ async function clickRobust(page, selector, opts = {}) {
   try {
     await page.waitForSelector(selector, { timeout });
   } catch (e) {
-    console.log(` ⚠️ clickRobust: selector "${selector}" not found within ${timeout}ms`);
+    console.log(`    ⚠️  clickRobust: selector "${selector}" not found within ${timeout}ms`);
     return false;
   }
   // Try scroll + native click first
@@ -1351,7 +1351,7 @@ async function clickRobust(page, selector, opts = {}) {
     return true;
   } catch (e1) {
     const msg = (e1 && e1.message || '').slice(0, 80);
-    console.log(` ⚠️ clickRobust: native click failed (${msg}) — falling back to DOM click`);
+    console.log(`    ⚠️  clickRobust: native click failed (${msg}) — falling back to DOM click`);
   }
   // Fallback — DOM .click() via page.evaluate (bypasses clickable-point check)
   await new Promise((r) => setTimeout(r, retryDelay));
@@ -1379,11 +1379,11 @@ async function clickRobust(page, selector, opts = {}) {
       return true;
     }, selector).catch(() => false);
     if (clicked) {
-      console.log(` ✓ clickRobust: DOM click fallback succeeded for "${selector}"`);
+      console.log(`    ✓ clickRobust: DOM click fallback succeeded for "${selector}"`);
       return true;
     }
   } catch (e2) {
-    console.log(` ⚠️ clickRobust: DOM click fallback also failed: ${(e2.message || '').slice(0, 80)}`);
+    console.log(`    ⚠️  clickRobust: DOM click fallback also failed: ${(e2.message || '').slice(0, 80)}`);
   }
   return false;
 }
@@ -1416,7 +1416,7 @@ async function clickSpanContainsText(page, text) {
   }, text).catch((e) => ({ ok: false, reason: 'evaluate error: ' + (e.message || '') }));
 
   if (!tagged.ok) {
-    console.log(` ⚠️ clickSpanContainsText("${text}"): ${tagged.reason}`);
+    console.log(`    ⚠️  clickSpanContainsText("${text}"): ${tagged.reason}`);
     return false;
   }
   try {
@@ -1442,10 +1442,10 @@ async function clickSpanContainsText(page, text) {
       } catch (_) { return false; }
     }).catch(() => false);
     if (ok) {
-      console.log(` ✓ clickSpanContainsText("${text}"): mouse-event fallback succeeded`);
+      console.log(`    ✓ clickSpanContainsText("${text}"): mouse-event fallback succeeded`);
       return true;
     }
-    console.log(` ⚠️ clickSpanContainsText("${text}"): all click strategies failed (${(e1.message || '').slice(0, 80)})`);
+    console.log(`    ⚠️  clickSpanContainsText("${text}"): all click strategies failed (${(e1.message || '').slice(0, 80)})`);
     return false;
   }
 }
@@ -1466,7 +1466,7 @@ async function checkTreeNodeByName(page, name) {
         const s = getComputedStyle(cur);
         const canScroll =
           (s.overflowY === 'auto' || s.overflowY === 'scroll' ||
-           s.overflow === 'auto' || s.overflow === 'scroll') &&
+           s.overflow  === 'auto' || s.overflow  === 'scroll') &&
           cur.scrollHeight > cur.clientHeight + 1;
         if (canScroll) return cur;
         cur = cur.parentElement;
@@ -1526,11 +1526,11 @@ async function checkTreeNodeByName(page, name) {
 async function checkCheckboxInAccordion(page, accordionRegex, labelText) {
   // 1. Išplėsti accordion'ą + LAUKTI kol all labels suhidruoja
   // 2026-06-04 (Task #174) — naujoje Mercell Explore UI accordion'as
-  // cards re-renderina'i po čekboksų click'o ir tik vieną label'į rodo
+  // kartais re-renderina'i po čekboksų click'o ir tik vieną label'į rodo
   // pirmus 0.7-1.5s. Padidinau wait'ą + retry'us:
-  // • Re-open jei collapsed
-  // • Poll iki 4s laukiant ar label'is, kurio ieškome, jau renderintas
-  // • Click "Show more" if you have an accordion
+  //   • Re-open jei collapsed
+  //   • Poll iki 4s laukiant ar label'is, kurio ieškome, jau renderintas
+  //   • Click "Show more" jei toks egzistuoja accordion'e
   const openAccordion = async () => {
     return await page.evaluate((pat) => {
       const regex = new RegExp(pat, 'i');
@@ -1550,7 +1550,7 @@ async function checkCheckboxInAccordion(page, accordionRegex, labelText) {
   await new Promise(r => setTimeout(r, 700));
 
   // Poll iki ~4s kol mūsų label'is appears arba label count stabilizuojasi >1.
-  // Jei collapsed (po re-render), bandom dar cardą open'inti.
+  // Jei collapsed (po re-render), bandom dar kartą open'inti.
   const startedAt = Date.now();
   while (Date.now() - startedAt < 4000) {
     const status = await page.evaluate((pat, text) => {
@@ -1640,7 +1640,7 @@ async function checkCheckboxInAccordion(page, accordionRegex, labelText) {
       return {
         boxHighlight: box?.classList.contains('p-highlight') === true,
         inputChecked: input?.checked === true,
-        ariaChecked: box?.getAttribute('aria-checked') || zero,
+        ariaChecked: box?.getAttribute('aria-checked') || null,
       };
     }, accordionRegex, labelText);
 
@@ -1652,16 +1652,16 @@ async function checkCheckboxInAccordion(page, accordionRegex, labelText) {
   for (const mode of ['label', 'box', 'input']) {
     const r = await tryClick(mode);
     if (r.ok) {
-      console.log(` ✓ ${labelText} (mode=${mode})`, JSON.stringify(r.state));
+      console.log(`  ✓ ${labelText} (mode=${mode})`, JSON.stringify(r.state));
       return true;
     }
     if (r.avail) {
-      console.log(` ✗ ${labelText}: ${r.reason}. Available labels:`, r.avail);
+      console.log(`  ✗ ${labelText}: ${r.reason}. Available labels:`, r.avail);
       return false; // label'io nėra — nėra ko bandyti
     }
-    console.log(` ... ${labelText} mode=${mode} not verified, trying next`, JSON.stringify(r.state || {}));
+    console.log(`  ... ${labelText} mode=${mode} not verified, trying next`, JSON.stringify(r.state || {}));
   }
-  console.log(` ✗ ${labelText}: all click modes failed`);
+  console.log(`  ✗ ${labelText}: all click modes failed`);
   return false;
 }
 
@@ -1678,7 +1678,7 @@ async function goToNextPage(page) {
   const urlBefore = page.url();
   const firstTenderBefore = await page.evaluate(() => {
     const first = document.querySelector('[data-testid="tender-name"] a, a[href*="/tender/"]');
-    return first?.getAttribute('href') || zero;
+    return first?.getAttribute('href') || null;
   });
 
   const paginationInfo = await page.evaluate(() => {
@@ -1700,14 +1700,14 @@ async function goToNextPage(page) {
     return { found: true, disabled, currentPage, allPages };
   });
 
-  console.log(' Pagination:', JSON.stringify(paginationInfo));
+  console.log('  Pagination:', JSON.stringify(paginationInfo));
 
   if (!paginationInfo.found) {
-    console.log('No pagination button - assuming single page');
+    console.log('  No pagination button - assuming single page');
     return false;
   }
   if (paginationInfo.disabled) {
-    console.log('Next button disabled - last page reached');
+    console.log('  Next button disabled - last page reached');
     return false;
   }
 
@@ -1725,7 +1725,7 @@ async function goToNextPage(page) {
   });
 
   if (!clicked) {
-    console.log('Click failed');
+    console.log('  Click failed');
     return false;
   }
 
@@ -1733,7 +1733,7 @@ async function goToNextPage(page) {
     await page.waitForFunction(
       ({ urlBefore, firstTenderBefore }) => {
         const urlChanged = location.href !== urlBefore;
-        const firstNow = document.querySelector('[data-testid="tender-name"] a, a[href*="/tender/"]')?.getAttribute('href') || zero;
+        const firstNow = document.querySelector('[data-testid="tender-name"] a, a[href*="/tender/"]')?.getAttribute('href') || null;
         const firstChanged = firstNow && firstNow !== firstTenderBefore;
         return urlChanged || firstChanged;
       },
@@ -1741,7 +1741,7 @@ async function goToNextPage(page) {
       { urlBefore, firstTenderBefore }
     );
   } catch (e) {
-    console.log(' WARN: Neither URL nor first tender changed within 20s');
+    console.log('  WARN: Neither URL nor first tender changed within 20s');
     return false;
   }
 
@@ -1752,15 +1752,15 @@ async function goToNextPage(page) {
   await new Promise(r => setTimeout(r, 2000));
 
   const urlAfter = page.url();
-  console.log(` ✓ Moved to page (URL change: ${urlBefore !== urlAfter})`);
+  console.log(`  ✓ Moved to page (URL change: ${urlBefore !== urlAfter})`);
   return true;
 }
 
-// --- PORTAL LOGIN HELPER -------------------------------------------------
+// --- PORTAL LOGIN HELPER -----------------------------------------------
 //
 // Generic best-effort login for portals that proxy the Mercell "Go to
-// source" link (UK MyTenders, Cloudia/tarjouspalvelu.fi, e-avrop, GERMAN
-(See EVERGABE, Vergabeportal AT, contrataciondelestado.es, etc.). Look up
+// source" link (UK MyTenders, Cloudia/tarjouspalvelu.fi, e-avrop, DEUTSCHE
+// EVERGABE, Vergabeportal AT, contrataciondelestado.es, etc.). Looks up
 // creds via getPortalCreds() — host stripping + suffix matching are done
 // there. Opens a fresh page, follows whatever redirect the portal does
 // for an unauthenticated visitor, fills the most common form patterns,
@@ -1786,19 +1786,19 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     const dedicatedLoginUrl = getDedicatedLoginUrl(hostLabel, sourceUrl);
     const loginNavTarget = dedicatedLoginUrl || sourceUrl;
     if (dedicatedLoginUrl) {
-      console.log(` ↪️ using dedicated login URL: ${dedicatedLoginUrl}`);
+      console.log(`    ↪️  using dedicated login URL: ${dedicatedLoginUrl}`);
     }
     try {
       await page.goto(loginNavTarget, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e) {
-      console.log(` ❌ login goto failed for ${hostLabel}: ${(e.message || '').slice(0, 120)}`);
+      console.log(`    ❌ login goto failed for ${hostLabel}: ${(e.message || '').slice(0, 120)}`);
     }
     // Allow client-side redirects / SPA login forms to settle.
     await new Promise((r) => setTimeout(r, 1500));
 
     // SPA RENDER POLL — Cloudia (login.cloudia.net) and a handful of
     // other login pages are JS-rendered: the password input doesn't
-    // exists in the initial HTML and only appears after React/Angular
+    // exist in the initial HTML and only appears after React/Angular
     // mounts. The 1.5s settle above isn't enough; the pre-check below
     // misses the form, the trigger scorer doesn't find a Login button
     // either, and we fail with "no password field". Poll up to 6s
@@ -1820,7 +1820,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
           // authenticated body → handler still tried to re-login, mismatching
           // post-auth nav buttons. Also added "atsijungti" / "Mano paskyra"
           // / "Mano profilis" Lithuanian variants.
-          const RX_LOGGED = /\b(?:log\s*out|log\s*off|logout|logga\s*ut|sign\s*out|d[eé]connexion|sign out|cerrar\s*sesi[oó]n|kirjaudu\s*ulos|wyloguj|atsijungti|atsijungimas|my\s*pages| my\s*account|min(?:a)?\s*(?:profil|sidor|side)|my\s*account|mon\s*compte|mitt\s*account|mano\s*(?:paskyra|profilis|pirkim|puslapis)|pirkim[uų]\s*valdymas)\b/i;
+          const RX_LOGGED = /\b(?:log\s*out|log\s*off|logout|logga\s*ut|sign\s*out|d[eé]connexion|abmelden|cerrar\s*sesi[oó]n|kirjaudu\s*ulos|wyloguj|atsijungti|atsijungimas|my\s*pages|my\s*account|min(?:a)?\s*(?:profil|sidor|side)|mein\s*konto|mon\s*compte|mitt\s*konto|mano\s*(?:paskyra|profilis|pirkim|puslapis)|pirkim[uų]\s*valdymas)\b/i;
           return RX_LOGGED.test(((document.body && document.body.innerText) || '').slice(0, 4000));
         } catch (_) { return false; }
       }, { timeout: 6000, polling: 250 }).catch(() => null);
@@ -1846,7 +1846,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         // (CVPP authenticated user nav). Without these, viesiejipirkimai.lt
         // post-first-login navigations failed to detect already-authenticated
         // state and re-triggered login, hitting "no password field" errors.
-        const RX_LOGGED = /\b(?:log\s*out|log\s*off|logout|logga\s*ut|logg\s*ut|cerrar\s*sesi[oó]n|d[eé]connexion|logout|uitloggen|kirjaudu\s*ulos|wyloguj|atsijungti|atsijungimas|sign\s*out|min(?:a) ?\s*(?:profil|sidor|side)|my\s*account|mon\s*compte|my\s*account|my\s*pages|mitt\s*account|moja\s*strona|mano\s*(?:paskyra|profilis|pirkim|puslapis)|pirkim[uų]\s*valdymas)\b/i;
+        const RX_LOGGED = /\b(?:log\s*out|log\s*off|logout|logga\s*ut|logg\s*ut|cerrar\s*sesi[oó]n|d[eé]connexion|abmelden|uitloggen|kirjaudu\s*ulos|wyloguj|atsijungti|atsijungimas|sign\s*out|min(?:a)?\s*(?:profil|sidor|side)|mein\s*konto|mon\s*compte|my\s*account|my\s*pages|mitt\s*konto|moja\s*strona|mano\s*(?:paskyra|profilis|pirkim|puslapis)|pirkim[uų]\s*valdymas)\b/i;
         const text = (document.body && document.body.innerText || '').slice(0, 4000);
         const hasMarker = RX_LOGGED.test(text);
         // visible password input present? (mirrors findVisible logic)
@@ -1862,21 +1862,21 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         return { hasMarker, hasVisiblePass };
       }).catch(() => ({ hasMarker: false, hasVisiblePass: false }));
       if (sessionState.hasMarker && !sessionState.hasVisiblePass) {
-        console.log(` ✅ already authenticated on ${hostLabel} (logged-in marker present, no password form) — skipping login flow`);
+        console.log(`    ✅ already authenticated on ${hostLabel} (logged-in marker present, no password form) — skipping login flow`);
         // SSO BOUNCE — when we used a dedicated-login URL on a different
-        // host than the actual source (eg login.cloudia.net for
+        // host than the actual source (e.g. login.cloudia.net for
         // tarjouspalvelu.fi), the dedicated host's session cookie does
         // NOT propagate to the source host without a redirect chain that
         // origin-side identity provider would have triggered if the user
         // had logged in via the source. Navigate the SAME page to
         // sourceUrl now — the source will redirect to cloudia (which is
-        // already authenticated) and back, setting the source host
+        // already authenticated) and back, setting the source-host
         // cookies along the way. Without this, the caller's retry on
         // the original tender page still hits the auth wall.
         // 2026-05-12 fix for tarjouspalvelu.fi ZIP fetch.
         if (dedicatedLoginUrl && sourceUrl) {
           try {
-            console.log(` ↪️ SSO bounce-back: navigating to ${sourceUrl.slice(0, 80)} to propagate session`);
+            console.log(`    ↪️  SSO bounce-back: navigating to ${sourceUrl.slice(0, 80)} to propagate session`);
             await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => null);
             try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
             await new Promise((r) => setTimeout(r, 1200));
@@ -1884,7 +1884,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
             // fire the SSO check; the tarjouspalvelu tender page shows
             // its auth wall until user clicks the "Log in" button which
             // redirects to cloudia (where session is set) and back with
-            // an auth token. Click that trigger now. User confirmed
+            // an auth token. Click that trigger now. User-confirmed
             // 2026-05-12 DOM: <button id="continue">Log in</button>.
             const triggerInfo = await page.evaluate(() => {
               const RX_TRIG = /^\s*(log\s*in|login|logga\s*in|kirjaudu(?:\s*sis[äa][äa]n)?|logg\s*inn|prisijungti|connexion|anmelden|iniciar\s*sesi[óo]n)\s*$/i;
@@ -1914,7 +1914,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
               // User-confirmed DOM 2026-05-13 on tarjouspalvelu.fi tender
               // pages: <button id="continue" class="button--positive
               // hidden-content hidden-content--show">Log in</button>.
-              // The `hidden-content` base class CSS hides the element by
+              // The `hidden-content` base class CSS-hides the element by
               // default; the `--show` modifier overrides at runtime. Our
               // offsetParent check sees the BASE state and rejects the
               // button. Skip the visibility check when matching by id
@@ -1938,7 +1938,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
               }
               // Text fallback — exclude anchors to non-auth pages.
               const RX_SKIP_HREF = /\/(?:privacy|terms|help|support|cookies?|policy|gdpr)\b/i;
-              for (const el of document.querySelectorAll('button, a, [r ole="button"]')) {
+              for (const el of document.querySelectorAll('button, a, [role="button"]')) {
                 if (!findVisible(el)) continue;
                 const t = (el.textContent || '').trim();
                 if (t.length === 0 || t.length > 30) continue;
@@ -1959,23 +1959,23 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
             // Log all candidates so we can debug element selection.
             if (triggerInfo.candidates && triggerInfo.candidates.length > 1) {
               console.log(
-                ` ↪️ SSO trigger candidates (${triggerInfo.candidates.length}): ` +
+                `    ↪️  SSO trigger candidates (${triggerInfo.candidates.length}): ` +
                 triggerInfo.candidates.slice(0, 5).map((c) =>
                   `[${c.tag}#${c.id || '_'}.${(c.cls.split(/\s+/)[0] || '_').slice(0, 20)} "${c.text}"${c.visible ? '' : ' HIDDEN'}]`
                 ).join(' ')
               );
             }
             if (triggerInfo.clicked) {
-              console.log(` ↪️ SSO trigger clicked (${triggerInfo.clicked}) — waiting for redirect chain`);
+              console.log(`    ↪️  SSO trigger clicked (${triggerInfo.clicked}) — waiting for redirect chain`);
               try { await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 12000 }); } catch (_) {}
               try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 6000 }); } catch (_) {}
               await new Promise((r) => setTimeout(r, 1500));
               // Post-click verification: did the page transition to an
-              // authenticated state? bodyLen jump from ~1k to >5k is a strong
+              // authed state? bodyLen jump from ~1k to >5k is a strong
               // signal SSO completed. Log password-field presence too.
               try {
                 const postState = await page.evaluate(() => {
-                  const RX_LOGGED = /\b(?:log\s*out|kirjaudu\s*ulos|logga\s*ut|sign\s*out|d[eé]connexion|sign out|cerrar\s*sesi[oó]n)\b/i;
+                  const RX_LOGGED = /\b(?:log\s*out|kirjaudu\s*ulos|logga\s*ut|sign\s*out|d[eé]connexion|abmelden|cerrar\s*sesi[oó]n)\b/i;
                   const body = (document.body && document.body.innerText || '');
                   return {
                     url: location.href.slice(0, 120),
@@ -1986,13 +1986,13 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
                 }).catch(() => null);
                 if (postState) {
                   console.log(
-                    ` ↪️ post-SSO state: url=${postState.url.slice(-60)}, bodyLen=${postState.bodyLen}, ` +
+                    `    ↪️  post-SSO state: url=${postState.url.slice(-60)}, bodyLen=${postState.bodyLen}, ` +
                     `loggedMarker=${postState.hasLoggedMarker}, passwordField=${postState.hasPasswordField}`
                   );
                 }
               } catch (_) {}
             } else {
-              console.log(` ↪️ no SSO trigger found on bounce-back page (already passed-through or auto-redirected)`);
+              console.log(`    ↪️  no SSO trigger found on bounce-back page (already passed-through or auto-redirected)`);
             }
           } catch (_) {}
         }
@@ -2017,17 +2017,17 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     // proceeds to fill the form with our credentials.
     //
     // User-confirmed 2026-05-16 modal form structure:
-    // <input name="usernameFormGroup:usernameTextField"
-    // data-evid="login_user_name" placeholder="user name">
-    // <input name="passwordFormGroup:passwordTextField"
-    // data-evid="login_password" type="password">
-    // <button name="submitButton" data-evid="login_submit_button">
+    //   <input name="usernameFormGroup:usernameTextField"
+    //          data-evid="login_user_name" placeholder="user name">
+    //   <input name="passwordFormGroup:passwordTextField"
+    //          data-evid="login_password" type="password">
+    //   <button name="submitButton" data-evid="login_submit_button">
     //
     // PORTAL_CREDS_JSON must include an entry keyed
     // "evergabe-online.de" (user added 2026-05-16).
     if (hostLabel && /(^|\.)evergabe-online\.de$/i.test(hostLabel)) {
       const ergClick = await page.evaluate(() => {
-        // Prefer the specific AJAX link (most stable signal); case
+        // Prefer the specific AJAX link (most stable signal); fall
         // back to a strict "Register"-text match if the href pattern
         // changes.
         const byHref = document.querySelector('a[href*="openLoginModalAjaxLink"]');
@@ -2040,8 +2040,8 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         link.click();
         return true;
       }).catch(() => false);
-      if (erclick) {
-        console.log(` ↪️ evergabe-online.de: clicked "Register" trigger to open login modal (per-host override — generic scorer would reject this text)`);
+      if (ergClick) {
+        console.log(`    ↪️  evergabe-online.de: clicked "Register" trigger to open login modal (per-host override — generic scorer would reject this text)`);
         // Wait for Wicket AJAX to render the modal form. The form's
         // username/password inputs use Wicket-namespaced names that
         // are stable across page versions.
@@ -2051,7 +2051,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         ).catch(() => null);
         await new Promise((r) => setTimeout(r, 700));
       } else {
-        console.log(` ⚠️ evergabe-online.de: per-host pre-trigger could not find "Register" link or openLoginModalAjaxLink anchor`);
+        console.log(`    ⚠️  evergabe-online.de: per-host pre-trigger could not find "Register" link or openLoginModalAjaxLink anchor`);
       }
     }
 
@@ -2059,7 +2059,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     // TendSign / Cloudia variants) land on a page whose login form is
     // either inside a popup that opens after a "Logga in" / "Login" /
     // "Connexion" / "Identification entreprise" click, or whose form
-    // exists in the DOM but is initially aria-hidden. The popup trigger
+    // exists in the DOM but is initially aria-hidden. The popup-trigger
     // button is normally the SMALL header item, not the form's own
     // submit button (whose text is also some variant of "Log in"). We
     // ALWAYS attempt this click — even when a password field appears
@@ -2074,7 +2074,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       // PRE-CHECK: if a visible password input already exists somewhere
       // on the page, we're already on a login form — clicking ANY
       // "Login" trigger now would navigate AWAY (header link to a
-      // marketing/info subdomain, popup opener that already opened the
+      // marketing/info subdomain, popup-opener that already opened the
       // form we see, etc.). 2026-05-11 log showed e-avrop /login.aspx
       // had the form visible AND a header `Header1_LoginControl1_blogLink`
       // that, when clicked, redirected to info.e-avrop.com (marketing).
@@ -2092,26 +2092,26 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       // on both sides so we don't pick up "Author" / "Authority" / nav
       // headings. Covers EN/SV/FR/DE/ES/PT/FI/NO/SI/SK/CZ/HU/RO/EL/LV/
       // LT/Cyrillic synonyms.
-      const RX_TEXT = /\b(login|log[-\s]?in|logga[-\s]?in|logon|sign[-\s]?in|signin|auth|login|connexion|se[-\s]?connecter|identification|s'identifier|iniciar[-\s]?sesi[oó]n|acceder|entrar|kirjaudu|logg[-\s ]?inn|prijava|prihl[aá]senie|p[rř]ihl[aá]sit|bejelentkez[eé]s|conectare|είσοδος|pieslēgties|pr isijungti|ulogi[ts]e|вход|mon[-\s]?compte|espace[-\s]?(entreprise|personnel|fournisseur))\b/i;
+      const RX_TEXT = /\b(login|log[-\s]?in|logga[-\s]?in|logon|sign[-\s]?in|signin|auth|anmelden|connexion|se[-\s]?connecter|identification|s'identifier|iniciar[-\s]?sesi[oó]n|acceder|entrar|kirjaudu|logg[-\s]?inn|prijava|prihl[aá]senie|p[rř]ihl[aá]sit|bejelentkez[eé]s|conectare|είσοδος|pieslēgties|prisijungti|ulogi[ts]e|вход|mon[-\s]?compte|espace[-\s]?(entreprise|personnel|fournisseur))\b/i;
       // PERMISSIVE regex for ASP.NET / framework-generated identifiers
       // where "login" / "auth" appear as camelCase tokens INSIDE a single
-      // underscore-joined id (eg `Header1_LoginControl1_blogLink` on
+      // underscore-joined id (e.g. `Header1_LoginControl1_blogLink` on
       // e-avrop, where `_` is a word char and `\b` never matches inside).
       // Drops boundary requirements but uses distinct enough tokens so
       // false-positives are unlikely: "login" doesn't substring inside
       // "logout"/"logo"/"logical"; "signin" is one word; "connexion" is
       // distinctively French. We keep "auth" but exclude "author"/
       // "authority" via negative lookahead.
-      const RX_ATTR = /(login|signin|sign-in|logon|auth(?!or)|connexion|connect-entreprise|entreprise-auth|identification|s-identifier|iniciar-session|kirjaudu|loggainn|prisijungti)/i;
+      const RX_ATTR = /(login|signin|sign-in|logon|auth(?!or)|connexion|connect-entreprise|entreprise-auth|identification|s-identifier|iniciar-sesion|kirjaudu|loggainn|prisijungti)/i;
       // Skip-list for common navigation buttons whose attributes
-      // sometimes accidentally match (eg a help link containing
+      // sometimes accidentally match (e.g. a help link containing
       // "auth-help" in its href). We apply this when the visible
       // text clearly indicates the element is NOT a login trigger.
       // CRITICAL: includes "register"/"sign up" because portals
       // (publicprocurement.be) commonly group a "Login" container
       // and a "Register" sibling under the same parent with
       // login-related ids/classes — without this guard we'd click
-      // Register and end up on the wrong page. So covers EN/FR/
+      // Register and end up on the wrong page. Also covers EN/FR/
       // DE/NL/ES/SE/FI register synonyms.
       const SKIP_TEXT = /\b(aller\s*au|skip\s*to|menu|contenu|content|contact|accueil|home|search|recherche|lancer|toggle\s*navigation|kontakt|footer|impressum|datenschutz|register|sign[\s-]?up|create\s*account|s'enregistrer|s'inscrire|inscription|registrieren|neu\s*registrieren|konto\s*erstellen|registreren|nieuw\s*account|aanmelden\s*als\s*nieuw|crear\s*cuenta|registrar(?:se)?|registrera(?:\s*dig)?|rekister[öo]ity[ää]?|forgot\s*password|mot\s*de\s*passe\s*oublié|passwort\s*vergessen)\b/i;
       const candidates = Array.from(document.querySelectorAll(
@@ -2119,7 +2119,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       ));
       // Skip elements that are inside a form already showing a VISIBLE
       // password field — those are the form's own submit button, not a
-      // popup opening trigger. CRITICAL: we must check visibility, not
+      // popup-opening trigger. CRITICAL: we must check visibility, not
       // just existence + aria-hidden, because some pages (e-avrop's
       // /login.aspx) render a hidden password input via display:none
       // for password-manager autofill hints. Without the visibility
@@ -2177,11 +2177,11 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       // "Mon compte", "Log off". Those sometimes carry login-ish
       // attributes (legacy class names, container ids) and score on
       // the attribute branch — clicking them takes us to an account
-      // page where no password form exists. The early return check
+      // page where no password form exists. The early-return check
       // above usually catches this state, but in case it doesn't fire
       // (subset of markers present, body too short, etc.), this guard
-      // rejects per element. 2026-05-11 e-avrop tenders #2/#6 fixed.
-      const RX_LOGGED_IN_NAV = /^\s*(?:log\s*off|log\s*out|logout|logga\s*ut|sign\s*out|d[eé]connexion|sign out|cerrar\s*sesi[oó]n|kirjaudu\s*ulos|wyloguj|at sijungti|min(?:a)?\s*(?:profil|sidor|side)|my\s*pages|my\s*account|mon\s*compte|my\s*account|mitt\s*account|moja\s*strona)\s*$/i;
+      // rejects per-element. 2026-05-11 e-avrop tenders #2/#6 fix.
+      const RX_LOGGED_IN_NAV = /^\s*(?:log\s*off|log\s*out|logout|logga\s*ut|sign\s*out|d[eé]connexion|abmelden|cerrar\s*sesi[oó]n|kirjaudu\s*ulos|wyloguj|atsijungti|min(?:a)?\s*(?:profil|sidor|side)|my\s*pages|my\s*account|mon\s*compte|mein\s*konto|mitt\s*konto|moja\s*strona)\s*$/i;
       const scoreEl = (el) => {
         if (!el || el.offsetParent === null) return -1;
         if (insideOpenForm(el)) return -1;
@@ -2264,7 +2264,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     }).catch(() => ({ clicked: null, sample: [] }));
     if (clickInfo.clicked) {
       const conf = clickInfo.confidence === 3 ? 'text' : 'attr';
-      console.log(` ↪️ clicked login trigger "${clickInfo.clicked}" on ${hostLabel} (match=${conf})`);
+      console.log(`    ↪️  clicked login trigger "${clickInfo.clicked}" on ${hostLabel} (match=${conf})`);
       // Nav-aware settle — if the click triggered a real navigation
       // (typical for ASP.NET LoginControl links that navigate to a
       // separate /secure/login page), wait for it to finish before
@@ -2299,23 +2299,23 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
             try { target = new URL(href, currentUrl).toString(); } catch (_) {}
           }
           if (/^https?:\/\//i.test(target) && target !== currentUrl) {
-            console.log(` ↪️ click stayed on same URL — following href directly: ${target.slice(0, 80)}`);
+            console.log(`    ↪️  click stayed on same URL — following href directly: ${target.slice(0, 80)}`);
             try {
               await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 10000 });
               await new Promise((r) => setTimeout(r, 1500));
             } catch (e) {
-              console.log(` ⚠️ href-fallback nav failed: ${(e.message || '').slice(0, 80)}`);
+              console.log(`    ⚠️  href-fallback nav failed: ${(e.message || '').slice(0, 80)}`);
             }
           }
         }
       } catch (_) { /* best-effort */ }
     } else if (clickInfo.passwordAlreadyVisible) {
       // Form is already on the page — direct fill path will handle it.
-      console.log(` ↪️ password field already visible on ${hostLabel} — skipping popup-trigger click`);
+      console.log(`    ↪️  password field already visible on ${hostLabel} — skipping popup-trigger click`);
     } else if (clickInfo.sample && clickInfo.sample.length) {
-      // Only log when we couldn't find a match — helps diagnose silently
+      // Only log when we couldn't find a match — helps diagnose silent
       // failures like "no password field" without indicating a click.
-      console.log(` ⚠️ no login-trigger button matched on ${hostLabel}; visible buttons: ${JSON.stringify(clickInfo.sample.slice(0, 8))}`);
+      console.log(`    ⚠️  no login-trigger button matched on ${hostLabel}; visible buttons: ${JSON.stringify(clickInfo.sample.slice(0, 8))}`);
     }
 
     const sels = await page.evaluate(() => {
@@ -2351,7 +2351,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     // also produced by newsletter signup, search bars, and "request
     // demo" forms — which is exactly what bit us on e-avrop.com (the
     // detected userSel turned out to be a search/newsletter field,
-    // and submitting it sent us to info.e-avrop.com). To distinguish
+    // and submitting it sent us to info.e-avrop.com). To distinguish,
     // require that the userSel's parent form ALSO has a password
     // input somewhere (visible OR hidden via display:none — that's
     // the autofill hint pattern real login forms use, but newsletter
@@ -2369,18 +2369,18 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       }, sels.userSel).catch(() => false);
     }
     if (sels.userSel && !sels.passSel && creds.username && !userInLoginForm) {
-      console.log(` ⚠️ userSel is NOT inside a form containing a password input — skipping multi-step (likely a search/newsletter field, would mis-submit credentials)`);
+      console.log(`    ⚠️  userSel is NOT inside a form containing a password input — skipping multi-step (likely a search/newsletter field, would mis-submit credentials)`);
     }
     if (sels.userSel && !sels.passSel && creds.username && userInLoginForm) {
-      console.log(` ↪️ multi-step login detected (username field present, password hidden, form has password input) — typing username + advancing`);
+      console.log(`    ↪️  multi-step login detected (username field present, password hidden, form has password input) — typing username + advancing`);
       try { await page.click(sels.userSel, { clickCount: 3 }); } catch (_) {}
       try { await page.type(sels.userSel, String(creds.username), { delay: 25 }); }
-      catch (e) { console.log(` ⚠️ multi-step username type failed: ${(e.message || '').slice(0, 80)}`); }
+      catch (e) { console.log(`    ⚠️ multi-step username type failed: ${(e.message || '').slice(0, 80)}`); }
       // Click the submit button that's PART OF THE SAME FORM as the
       // username field — that's almost always the right one. Pure
       // text-match ("Next") works in ~half of multi-step pages but
       // fails on ASP.NET pages where the button text is something
-      // unrelated like "Logga in" / "Lähetä". Form scope match is
+      // unrelated like "Logga in" / "Lähetä". Form-scope match is
       // more reliable. Real-world failure (e-avrop run on 2026-05-09):
       // generic "first button" fallback clicked a contact/info form's
       // submit and we were redirected to info.e-avrop.com instead of
@@ -2431,7 +2431,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         return null;
       }, sels.userSel).catch(() => null);
       if (advanced) {
-        console.log(` ↪️ advanced multi-step (${advanced})`);
+        console.log(`    ↪️  advanced multi-step (${advanced})`);
         // Long settle window — Microsoft / AspNet round-trips take 2-4s
         await new Promise((r) => setTimeout(r, 4000));
       } else {
@@ -2459,34 +2459,34 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         sels.passSel = sels2.passSel;
         if (sels2.currentHost) sels.currentHost = sels2.currentHost;
         sels.userSel = null; // already typed
-        console.log(` ✓ password field appeared after multi-step advance`);
+        console.log(`    ✓ password field appeared after multi-step advance`);
       }
     }
 
     if (!sels.passSel) {
-      console.log(` ❌ no password field on ${hostLabel} (post-redirect: ${sels.currentHost})`);
+      console.log(`    ❌ no password field on ${hostLabel} (post-redirect: ${sels.currentHost})`);
       return false;
     }
     if (sels.currentHost && sels.currentHost !== hostLabel) {
-      console.log(` ↪️ login form is on ${sels.currentHost} (redirected from ${hostLabel})`);
+      console.log(`    ↪️  login form is on ${sels.currentHost} (redirected from ${hostLabel})`);
     }
 
     if (sels.userSel && creds.username) {
       try { await page.click(sels.userSel, { clickCount: 3 }); } catch (_) {}
       try { await page.type(sels.userSel, String(creds.username), { delay: 25 }); }
-      catch (e) { console.log(` ⚠️ username type failed: ${(e.message || '').slice(0, 80)}`); }
+      catch (e) { console.log(`    ⚠️ username type failed: ${(e.message || '').slice(0, 80)}`); }
     }
     try { await page.click(sels.passSel, { clickCount: 3 }); } catch (_) {}
     try { await page.type(sels.passSel, String(creds.password), { delay: 25 }); }
     catch (e) {
-      console.log(` ❌ password type failed on ${hostLabel}: ${(e.message || '').slice(0, 120)}`);
+      console.log(`    ❌ password type failed on ${hostLabel}: ${(e.message || '').slice(0, 120)}`);
       return false;
     }
 
     const submitSel = await page.evaluate((passSelStr) => {
       // Tier 0: FORM-SCOPED — when the password input lives inside a
       // <form>, prefer the submit element inside THAT form over any
-      // global match. This prevents picking a stray search/contact form
+      // global match. This prevents picking a stray search/contact-form
       // <input type="submit"> elsewhere on the page (kommersannons.se's
       // /<tenant>/Account/Login.aspx renders header search + footer
       // contact alongside the actual login form, so a global
@@ -2535,7 +2535,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         'button[type="submit"]:not([disabled])',
         'input[type="submit"]:not([disabled])',
         // Vaadin / Cloudia SSO: <button type="button" id="continue">Log in</button>
-        // (user-confirmed DOM 2026-05-12). Vaadin uses non-form layouts like this
+        // (user-confirmed DOM 2026-05-12). Vaadin uses non-form layouts so
         // Tier 2 form-scoped search misses; match by stable id directly.
         'button#continue:not([disabled])',
         'button[id="continue"]:not([disabled])',
@@ -2557,11 +2557,11 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
         } catch (_) {}
       }
       // Tier 2: ASP.NET LoginControl variants that render the submit as
-      // to <a href="javascript:__doPostBack('...$LoginButton','')">Login</a>
+      // an <a href="javascript:__doPostBack('...$LoginButton','')">Login</a>
       // — semantic selectors above miss those entirely. 2026-05-11 log
       // showed kommersannons.se /<tenant>/Default.aspx in this state:
       // password field filled, but clicking nothing because the "Login"
-      // element was on anchor. We now look INSIDE the form that owns
+      // element was an anchor. We now look INSIDE the form that owns
       // the password input for any visible <a>/<button>/[role="button"]
       // whose text matches login vocabulary, and click that.
       const TXT_SUBMIT = /^\s*(login|log[\s-]?in|logga[\s-]?in|sign[\s-]?in|signin|connexion|se[\s-]?connecter|anmelden|kirjaudu|iniciar\s*sesi[oó]n|acceder|entrar|prisijungti|logg[\s-]?inn|prijava)\s*$/i;
@@ -2588,8 +2588,8 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
           // Helper: when the element is an <a href="javascript:...">
           // (ASP.NET LoginControl's typical render for its submit
           // button — `<a href="javascript:__doPostBack('...$LoginButton','')">`),
-          // .click() doesn't always fire the JS handler reliably
-          // Puppeteer. Evaluate the javascript: payload directly like this
+          // .click() doesn't always fire the JS handler reliably in
+          // Puppeteer. Evaluate the javascript: payload directly so
           // the postback fires deterministically.
           const fireClick = (el) => {
             try {
@@ -2630,10 +2630,10 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       return null;
     }, sels.passSel).catch(() => null);
     if (!submitSel) {
-      console.log(` ↪️ no submit element matched on ${hostLabel} — falling back to Enter key`);
+      console.log(`    ↪️  no submit element matched on ${hostLabel} — falling back to Enter key`);
       try { await page.keyboard.press('Enter'); } catch (_) {}
     } else {
-      console.log(` ↪️ clicked submit (${submitSel}) on ${hostLabel}`);
+      console.log(`    ↪️  clicked submit (${submitSel}) on ${hostLabel}`);
     }
 
     // Wait for either navigation or a settled network. Don't throw if
@@ -2654,10 +2654,10 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
       } catch (_) { return false; }
     }).catch(() => false);
     if (stillLogin) {
-      console.log(` ❌ login submission did not clear password field on ${hostLabel}`);
+      console.log(`    ❌ login submission did not clear password field on ${hostLabel}`);
       return false;
     }
-    console.log(` ✅ login OK on ${hostLabel} (submit=${submitSel || 'Enter'})`);
+    console.log(`    ✅ login OK on ${hostLabel} (submit=${submitSel || 'Enter'})`);
     // SSO BOUNCE-BACK — see comment in the already-authenticated branch
     // above. When dedicatedLoginUrl is on a different host than the
     // source (cloudia.net vs tarjouspalvelu.fi), the auth-provider's
@@ -2666,7 +2666,7 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
     // chain so the caller's retry sees authenticated content.
     if (dedicatedLoginUrl && sourceUrl) {
       try {
-        console.log(` ↪️ SSO bounce-back: navigating to ${sourceUrl.slice(0, 80)} to propagate session`);
+        console.log(`    ↪️  SSO bounce-back: navigating to ${sourceUrl.slice(0, 80)} to propagate session`);
         await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => null);
         try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
         await new Promise((r) => setTimeout(r, 1200));
@@ -2698,29 +2698,29 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
           return null;
         }).catch(() => null);
         if (triggerSel) {
-          console.log(` ↪️ SSO trigger clicked (${triggerSel}) — waiting for redirect chain`);
+          console.log(`    ↪️  SSO trigger clicked (${triggerSel}) — waiting for redirect chain`);
           try { await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 12000 }); } catch (_) {}
           try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 6000 }); } catch (_) {}
           await new Promise((r) => setTimeout(r, 1500));
         } else {
-          console.log(` ↪️ no SSO trigger found on bounce-back page (already passed-through or auto-redirected)`);
+          console.log(`    ↪️  no SSO trigger found on bounce-back page (already passed-through or auto-redirected)`);
         }
       } catch (_) {}
     }
     return true;
   } catch (e) {
-    console.log(` ❌ login error on ${hostLabel}: ${(e.message || String(e)).slice(0, 200)}`);
+    console.log(`    ❌ login error on ${hostLabel}: ${(e.message || String(e)).slice(0, 200)}`);
     return false;
-  finally {
+  } finally {
     try { await page.close(); } catch (_) {}
   }
 }
 
-// --- ŠALTINIO PUSLAPIO NUSKAITYMAS --------------------------------------
+// --- ŠALTINIO PUSLAPIO NUSKAITYMAS -------------------------------------
 //
 // Atidaro naują tabą, nueina į šaltinio URL, nuskaito kelis laukus pagal
 // daugiakalbius raktažodžius (EN/SV/NO/DA/FI/DE/FR/NL/ES/PT/IT) ir grąžina
-// objectą. Netrikdo pagrindinio `page` konteksto.
+// objektą. Netrikdo pagrindinio `page` konteksto.
 // =====================================================================
 
 // =====================================================================
@@ -2728,12 +2728,12 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
 // ---------------------------------------------------------------------
 // Mercell's "Go to source" target for marches-publics.gouv.fr is almost
 // always the bare root URL ("https://www.marches-publics.gouv.fr/") or
-// the advanced-search index — NOT the actual tender detail page. Anus
+// the advanced-search index — NOT the actual tender detail page. After
 // we successfully login (via attemptPortalLogin), we still can't read
 // the tender content because we don't know its real URL.
 //
 // This helper takes the `fileReferenceNumber` field that Mercell DOES
-// give us (eg "B26-01823-MP", "A2026-018"), opens the logged-in
+// give us (e.g. "B26-01823-MP", "A2026-018"), opens the logged-in
 // advanced-search page, fills the reference field, submits, and parses
 // the result list looking for an anchor whose row text contains the
 // reference. Returns that anchor's URL (resolved to absolute) or null
@@ -2741,8 +2741,8 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
 //
 // The browser context is shared with the post-login session, so the
 // cookies set by attemptPortalLogin authenticate this navigation.
-// Best effort + heavy diagnostic logging so we can iterate on selectors
-// across portal-platform versions without re-deploying blindly.
+// Best-effort + heavy diagnostic logging so we can iterate on selectors
+// across portal-platform versions without re-deploying blind.
 // =====================================================================
 async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel) {
   if (!referenceNumber || typeof referenceNumber !== 'string') return null;
@@ -2767,8 +2767,8 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
   //
   // So we skip the form entirely and navigate directly to the URL.
   // Confirmed 2026-05-18 with user manual inspection: search URL
-  // ?page=Entreprise.EntrepriseAdvancedSearch&searchAnnCons
-  // &keyWord=Shom_26AC07&categorie=0&localizations=
+  //   ?page=Entreprise.EntrepriseAdvancedSearch&searchAnnCons
+  //   &keyWord=Shom_26AC07&categorie=0&localisations=
   // returns "Number of results: 1" with the right row, including the
   // RC download button (a[href*="EntrepriseDownloadReglement"]) and a
   // detail link.
@@ -2781,20 +2781,20 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
     ? hostLabel : 'www.marches-publics.gouv.fr';
   const searchUrl =
     `https://${host}/?page=Entreprise.EntrepriseAdvancedSearch` +
-    `&searchAnnCons&keyWord=${encodeURIComponent(ref)}&categorie=0&localizations=`;
+    `&searchAnnCons&keyWord=${encodeURIComponent(ref)}&categorie=0&localisations=`;
   let page = null;
   try {
     page = await browser.newPage();
     page.setDefaultNavigationTimeout(15000);
-    console.log(` 🔎 marches-publics keyWord search: ...${searchUrl.slice(-120)}`);
+    console.log(`    🔎 marches-publics keyWord search: ...${searchUrl.slice(-120)}`);
     await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
     // marches-publics is ASP.NET, takes 2-3s to render result lists
     await new Promise((r) => setTimeout(r, 2500));
 
     // 2026-05-18 — REWRITE #2 (broader matcher).
     //
-    // First used attempt row-scoped match (find a <tr>/.ligne/.consultation
-    // containing the reference text, then anchor in that scope). test log
+    // First attempt used row-scoped match (find a <tr>/.ligne/.consultation
+    // containing the reference text, then anchor in that scope). Test log
     // showed all 7 marches-publics search runs returned a valid result
     // ("Nombre de résultats : 1" in body) but row-scoped matcher found
     // rows=3 with EMPTY innerText. The new layout uses div-grid cards, not
@@ -2802,13 +2802,13 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
     // anchors, not inside the same <tr>.
     //
     // New strategy:
-    // 1. Read "Nombre de résultats : N" from body text — that's the
-    // authoritative indicator of how many tenders matched.
-    // 2. If N == 0 (or "Aucun résultat"), bail with no-results.
-    // 3. If N >= 1, search the ENTIRE page (not row-scoped) for the
-    // first detail link / RC link. Since this is a keyword search
-    // that returned 1 hit, the only such anchor on the page is the
-    // one we want.
+    //   1. Read "Nombre de résultats : N" from body text — that's the
+    //      authoritative indicator of how many tenders matched.
+    //   2. If N == 0 (or "Aucun résultat"), bail with no-results.
+    //   3. If N >= 1, search the ENTIRE page (not row-scoped) for the
+    //      first detail link / RC link. Since this is a keyWord search
+    //      that returned 1 hit, the only such anchor on the page is the
+    //      one we want.
     const found = await page.evaluate(() => {
       const bodyTxt = (document.body && document.body.innerText) || '';
       // The portal uses both "Nombre de résultats" (FR) and "Number of
@@ -2838,13 +2838,13 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
       const anyDownloadLink =
         document.querySelector('a[href*="EntrepriseDownload"]') ||
         document.querySelector('a[href*="EntrepriseTelecharger"]');
-      // Even broader: any anchor whose href has fileReference/orgAcronyms
+      // Even broader: any anchor whose href has fileReference/orgAcronyme
       // parameters (marches-publics tender-scoped URL pattern).
       const tenderScopedLink = (() => {
         const all = Array.from(document.querySelectorAll('a[href]'));
         return all.find((a) => {
           const h = a.href || '';
-          return /orgAcronyms=|EntrepriseAffichConsultation|EntrepriseAffichSommaire/i.test(h);
+          return /orgAcronyme=|EntrepriseAffichConsultation|EntrepriseAffichSommaire/i.test(h);
         });
       })();
       // Capture a snippet of body around "Nombre de résultats" for diagnostics
@@ -2863,47 +2863,47 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
         otherDownloadHref: anyDownloadLink ? anyDownloadLink.href : null,
         tenderScopedHref: tenderScopedLink ? tenderScopedLink.href : null,
         bodySnip,
-        enterpriseAnchors,
+        entrepriseAnchors,
       };
     }).catch(() => null);
 
     if (!found) {
-      console.log(` ⚠️ marches-publics keyWord: page evaluate failed for "${ref}"`);
+      console.log(`    ⚠️  marches-publics keyWord: page evaluate failed for "${ref}"`);
       return null;
     }
     if (found.noResults || found.resultCount === 0) {
-      console.log(` ⚠️ marches-publics keyWord: 0 results for "${ref}" (count=${found.resultCount})`);
+      console.log(`    ⚠️  marches-publics keyWord: 0 results for "${ref}" (count=${found.resultCount})`);
       return null;
     }
-    console.log(` ✅ marches-publics keyWord: ${found.resultCount} result(s) for "${ref}"`);
-    if (found.detailHref) console.log(` detail: ${found.detailHref.slice(0, 110)}`);
-    if (found.rcHref) console.log(` RC: ${found.rcHref.slice(0, 110)}`);
-    if (found.dceHref) console.log(` DCE: ${found.dceHref.slice(0, 110)}`);
+    console.log(`    ✅ marches-publics keyWord: ${found.resultCount} result(s) for "${ref}"`);
+    if (found.detailHref) console.log(`       detail: ${found.detailHref.slice(0, 110)}`);
+    if (found.rcHref)     console.log(`       RC:     ${found.rcHref.slice(0, 110)}`);
+    if (found.dceHref)    console.log(`       DCE:    ${found.dceHref.slice(0, 110)}`);
 
-    // Prefer the detail page — richer (description + all docs). case
+    // Prefer the detail page — richer (description + all docs). Fall
     // back to RC PDF (parsed by generic source-fetch via pdf-parse
     // magic-byte detection) or DCE ZIP (parsed via adm-zip recurse).
     const tenderUrl =
       found.detailHref ||
       found.rcHref ||
       found.dceHref ||
-      found.otherDownloadHref || // EntrepriseDownloadAvis (notice PDF)
-      found.tenderScopedHref; // tender-scoped page (orgAcronyms=...)
+      found.otherDownloadHref ||      // EntrepriseDownloadAvis (notice PDF)
+      found.tenderScopedHref;         // tender-scoped page (orgAcronyme=...)
     if (!tenderUrl) {
-      console.log(` ⚠️ marches-publics keyWord: ${found.resultCount} result(s) but no detail/RC/DCE anchor found`);
-      console.log(` body[0..400]: ${found.bodySnip}`);
+      console.log(`    ⚠️  marches-publics keyWord: ${found.resultCount} result(s) but no detail/RC/DCE anchor found`);
+      console.log(`       body[0..400]: ${found.bodySnip}`);
       // Diagnostic: dump all Entreprise* anchors so we can refine
-      // selectors on edge cases (eg tenders with no RC published yet).
+      // selectors on edge cases (e.g. tenders with no RC published yet).
       if (found.entrepriseAnchors && found.entrepriseAnchors.length) {
-        console.log(` Entreprise* anchors (${found.entrepriseAnchors.length}):`);
-        for (const h of found.entrepriseAnchors) console.log(` ${h}`);
+        console.log(`       Entreprise* anchors (${found.entrepriseAnchors.length}):`);
+        for (const h of found.entrepriseAnchors) console.log(`         ${h}`);
       } else {
-        console.log(` (no Entreprise* anchors anywhere on page)`);
+        console.log(`       (no Entreprise* anchors anywhere on page)`);
       }
       return null;
     }
 
-    // 2026-05-19 — DOWNLOAD URL SHORT CIRCUIT.
+    // 2026-05-19 — DOWNLOAD-URL SHORT-CIRCUIT.
     //
     // marches-publics result rows on the keyWord page expose ONLY
     // `EntrepriseDownloadReglement` (RC PDF) and `EntrepriseTelechargerDce`
@@ -2914,9 +2914,9 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
     // net::ERR_ABORTED. Result: source dead, RC content lost.
     //
     // Empirical confirmation 2026-05-19 (FR test run, 5/6 tenders):
-    // ✅ Keyword found: 1 result
-    // ❌ source nav warn: net::ERR_ABORTED at .../EntrepriseDownloadReglement
-    // ❌ source dead — Chrome error page — skipping
+    //   ✅ keyWord found 1 result
+    //   ❌ source nav warn: net::ERR_ABORTED at .../EntrepriseDownloadReglement
+    //   ❌ source dead — Chrome error page — skipping
     //
     // Fix: when the deep-link URL is a download endpoint, fetch the
     // bytes via in-page fetch (cookies inherited = authenticated),
@@ -2925,7 +2925,7 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
     // can use directly without a second navigation.
     const isDownloadUrl = /EntrepriseDownloadReglement|EntrepriseTelechargerDce|EntrepriseDownloadAvis|EntrepriseDownload(?!.*Search)|EntrepriseTelecharger(?!.*Search)/i.test(tenderUrl);
     if (isDownloadUrl) {
-      console.log(` 📥 marches-publics: detected download URL — fetching binary directly`);
+      console.log(`    📥 marches-publics: detected download URL — fetching binary directly`);
       let pdfParseLib = null;
       let AdmZipLib = null;
       let mammothLib = null;
@@ -2950,11 +2950,11 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
       }, tenderUrl).catch(() => ({ ok: false, error: 'evaluate-failed' }));
 
       if (!fetchResult || !fetchResult.ok) {
-        console.log(` ⚠️ marches-publics: download fetch failed (status=${fetchResult?.status || '?'}, err=${fetchResult?.error || '?'})`);
+        console.log(`    ⚠️  marches-publics: download fetch failed (status=${fetchResult?.status || '?'}, err=${fetchResult?.error || '?'})`);
         return null;
       }
       const buf = Buffer.from(fetchResult.bytes);
-      console.log(` 📥 marches-publics: downloaded ${buf.length}B (ct=${fetchResult.ct}, cd=${(fetchResult.cd || '').slice(0, 80)})`);
+      console.log(`    📥 marches-publics: downloaded ${buf.length}B (ct=${fetchResult.ct}, cd=${(fetchResult.cd || '').slice(0, 80)})`);
 
       // Magic-byte sniff.
       const isPdf = buf.length > 4 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
@@ -2965,7 +2965,7 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
         if (isPdf && pdfParseLib) {
           const parsed = await pdfParseLib(buf);
           extractedText = (parsed && parsed.text ? parsed.text : '').trim();
-          console.log(` 📄 marches-publics: parsed RC PDF → ${extractedText.length}ch`);
+          console.log(`    📄 marches-publics: parsed RC PDF → ${extractedText.length}ch`);
           _collectDriveFile('RC.pdf', buf);
         } else if (isZip && AdmZipLib) {
           // DCE ZIP — recurse into PDFs/DOCXs inside.
@@ -3001,19 +3001,19 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
             if (parts.join('').length > 100000) break;
           }
           extractedText = parts.join('\n\n');
-          console.log(` 📦 marches-publics: parsed DCE ZIP (${z.getEntries().length} entries) → ${extractedText.length}ch`);
+          console.log(`    📦 marches-publics: parsed DCE ZIP (${z.getEntries().length} entries) → ${extractedText.length}ch`);
           _collectDriveFile('DCE.zip', buf);
         } else {
-          console.log(` ⚠️ marches-publics: download is neither PDF nor ZIP (first 4 bytes: ${Array.from(buf.slice(0, 4)).map(b => b.toString(16)).join(' ')})`);
+          console.log(`    ⚠️  marches-publics: download is neither PDF nor ZIP (first 4 bytes: ${Array.from(buf.slice(0, 4)).map(b => b.toString(16)).join(' ')})`);
           return null;
         }
       } catch (e) {
-        console.log(` ⚠️ marches-publics: parse error: ${(e.message || '').slice(0, 100)}`);
+        console.log(`    ⚠️  marches-publics: parse error: ${(e.message || '').slice(0, 100)}`);
         return null;
       }
 
       if (!extractedText || extractedText.length < 100) {
-        console.log(` ⚠️ marches-publics: extracted text too short (${extractedText.length}ch) — skipping`);
+        console.log(`    ⚠️  marches-publics: extracted text too short (${extractedText.length}ch) — skipping`);
         return null;
       }
 
@@ -3022,8 +3022,8 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
       // this directly without a second fetchSourcePageDetails roundtrip.
       const tagged = `--- (marches-publics ${isPdf ? 'RC PDF' : 'DCE ZIP'}) ---\n${extractedText.slice(0, 50000)}`;
       return {
-        __direct: true, // sentinel for caller
-        URL: tenderUrl,
+        __direct: true,                            // sentinel for caller
+        url: tenderUrl,
         sourceHost: 'www.marches-publics.gouv.fr',
         sourceFilesText: tagged,
         bodyTextPreview: extractedText.slice(0, 5000),
@@ -3034,9 +3034,9 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
 
     return tenderUrl;
   } catch (e) {
-    console.log(` ⚠️ marches-publics search error: ${(e.message || String(e)).slice(0, 120)}`);
+    console.log(`    ⚠️  marches-publics search error: ${(e.message || String(e)).slice(0, 120)}`);
     return null;
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -3048,7 +3048,7 @@ async function resolveMarchesPublicsDeepLink(browser, referenceNumber, hostLabel
 // hosted) shows tender info on `rwlentrance_s.asp` but hides the actual
 // procurement documents behind a separate `publicpurchase_docs.asp`
 // page. The documents themselves are downloaded via a JavaScript call:
-// <a onclick="DownloadPublicDocument('11603409','sDoc_11603409','322375');">
+//   <a onclick="DownloadPublicDocument('11603409','sDoc_11603409','322375');">
 // There's no static href — the JS function builds a download URL at
 // runtime. We reverse-engineer this by trying multiple URL patterns
 // observed across CTM deployments and saving the first response that
@@ -3082,18 +3082,18 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
 
     // Step 1 — load the entrance page and collect ALL unique LIDs.
     //
-    // Multi-lot framework agreements (eg kritikomsorgsdirektatet
+    // Multi-lot framework agreements (e.g. kriminalomsorgsdirektoratet
     // 2026/831 "Consulting" — has lots 2A strategic, 2B architecture,
     // 2C security, etc.) expose the procurement documents per-LOT, not at
     // the entrance level. The entrance page lists category links with
     // distinct LIDs; the actual Konkurransegrunnlag lives in each lot's
-    // own publicpurchase_docs.asp?LID=<lot_id> page. Earlier behavior
+    // own publicpurchase_docs.asp?LID=<lot_id> page. Earlier behaviour
     // grabbed only the first LID encountered → AI was fed generic
     // top-level text and qualifications came back empty/generic.
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
     } catch (e) {
-      console.log(` 🇳🇴 eu-supply: entrance nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇳🇴 eu-supply: entrance nav warn: ${(e.message || '').slice(0, 80)}`);
     }
     await new Promise((r) => setTimeout(r, 1500));
     const lidsWithLabels = await page.evaluate(() => {
@@ -3131,7 +3131,7 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
     }).catch(() => []);
 
     if (!lidsWithLabels.length) {
-      console.log(` 🇳🇴 eu-supply: PID=${pid} but no LID found on entrance page`);
+      console.log(`    🇳🇴 eu-supply: PID=${pid} but no LID found on entrance page`);
       return [];
     }
     // Cap lots — 5 is plenty for any realistic multi-lot framework, keeps
@@ -3139,29 +3139,29 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
     const MAX_LOTS = 5;
     const allLots = lidsWithLabels.slice(0, MAX_LOTS);
     if (lidsWithLabels.length > 1) {
-      console.log(` 🇳🇴 eu-supply: PID=${pid} — detected ${lidsWithLabels.length} lot(s) (using first ${allLots.length})`);
+      console.log(`    🇳🇴 eu-supply: PID=${pid} — detected ${lidsWithLabels.length} lot(s) (using first ${allLots.length})`);
       for (const lot of allLots) {
-        console.log(` lot LID=${lot.lid} "${(lot.label || '(no label)').slice(0, 70)}"`);
+        console.log(`       lot LID=${lot.lid} "${(lot.label || '(no label)').slice(0, 70)}"`);
       }
     } else {
-      console.log(` 🇳🇴 eu-supply: PID=${pid}, LID=${allLots[0].lid} — navigating to docs page`);
+      console.log(`    🇳🇴 eu-supply: PID=${pid}, LID=${allLots[0].lid} — navigating to docs page`);
     }
 
-    // Step 1.5 — Accept the RFT invitation. eu supply gates RFT documents
+    // Step 1.5 — Accept the RFT invitation. eu-supply gates RFT documents
     // behind an explicit "Accept" click (/app/rfq/invitation.asp?AC=AT&PID=X).
     // Required even for logged-in users with a registered company. Without
     // this, lot docs pages return "0 doc(s)" because the user hasn't yet
-    // joined the purchase (confirmed via UI 2026-06-04: "Click 'Accept'
-    // to get access to the RFT information"). One-time via PID per session.
+    // joined the procurement (confirmed via UI 2026-06-04: "Click 'Accept'
+    // to get access to the RFT information"). One-time per PID per session.
     // 2026-06-04: idempotent — re-accepting an already-accepted invitation
     // just lands on the docs page, no error.
     try {
       const acceptUrl = `https://${entranceHost}/app/rfq/invitation.asp?AC=AT&PID=${pid}&B=`;
       await page.goto(acceptUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
       await new Promise((r) => setTimeout(r, 1500));
-      console.log(` 🇳🇴 eu-supply: accepted RFT invitation for PID=${pid} (URL: ${acceptUrl.slice(-80)})`);
+      console.log(`    🇳🇴 eu-supply: accepted RFT invitation for PID=${pid} (URL: ${acceptUrl.slice(-80)})`);
     } catch (e) {
-      console.log(` 🇳🇴 eu-supply: accept-invitation nav warn: ${(e.message || '').slice(0, 80)} — proceeding anyway`);
+      console.log(`    🇳🇴 eu-supply: accept-invitation nav warn: ${(e.message || '').slice(0, 80)} — proceeding anyway`);
     }
 
     // Step 2 — for each lot LID, navigate to its docs page and collect docs.
@@ -3180,7 +3180,7 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
       try {
         await page.goto(docsUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
       } catch (e) {
-        console.log(` 🇳🇴 eu-supply: docs page nav warn (LID=${lot.lid}): ${(e.message || '').slice(0, 80)}`);
+        console.log(`    🇳🇴 eu-supply: docs page nav warn (LID=${lot.lid}): ${(e.message || '').slice(0, 80)}`);
         continue;
       }
       await new Promise((r) => setTimeout(r, 1200));
@@ -3231,27 +3231,27 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
         found.push(d);
         lotNew++;
       }
-      console.log(` 🇳🇴 eu-supply: lot LID=${lot.lid} → ${lotDocs.length} doc(s) (${lotNew} new after dedup)`);
-      // 2026-06-04 — empty lot diag. Some buyers publish the RFQ shell
+      console.log(`    🇳🇴 eu-supply: lot LID=${lot.lid} → ${lotDocs.length} doc(s) (${lotNew} new after dedup)`);
+      // 2026-06-04 — empty-lot diag. Some buyers publish the RFQ shell
       // first and attach files only after Q&A or pre-bid clarification.
-      // Detect "No documents attached" / empty list explicitly so
+      // Detect "No documents attached" / empty list explicitly so the
       // log makes it clear this is buyer-side gap, not handler failure.
       if (lotDocs.length === 0) {
         const emptyHint = await page.evaluate(() => {
           const body = (document.body?.innerText || '').toLowerCase();
-          if (/no documents (?:attached|available)|ingen documenter|inga document/i.test(body)) {
+          if (/no documents (?:attached|available)|ingen dokumenter|inga dokument/i.test(body)) {
             return 'buyer has not attached docs to this RFQ (yet)';
           }
           return null;
         }).catch(() => null);
         if (emptyHint) {
-          console.log(` ℹ️ eu-supply: ${emptyHint}`);
+          console.log(`    ℹ️  eu-supply: ${emptyHint}`);
         }
       }
     }
 
     if (!found.length) {
-      console.log(` 🇳🇴 eu-supply: no DownloadPublicDocument calls found across ${allLots.length} lot(s)`);
+      console.log(`    🇳🇴 eu-supply: no DownloadPublicDocument calls found across ${allLots.length} lot(s)`);
       return [];
     }
 
@@ -3268,7 +3268,7 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
     ];
     const NEG_KW = [
       'espd', 'gdpr', 'nda', 'cv', 'logo', 'databehandleravtale',
-      'systemdocumentasjon', 'egenerkl', 'sanksjonslov', 'forpliktelseserkl',
+      'systemdokumentasjon', 'egenerkl', 'sanksjonslov', 'forpliktelseserkl',
     ];
     const scoreDoc = (n) => {
       const s = String(n || '').toLowerCase();
@@ -3279,36 +3279,36 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
       return v;
     };
     found.sort((a, b) => scoreDoc(b.name) - scoreDoc(a.name));
-    console.log(` 🇳🇴 eu-supply: ${found.length} unique doc(s) across ${allLots.length} lot(s); top: ${found.slice(0, 5).map(d => `"${(d.name || '(unnamed)').slice(0, 50)}"(${scoreDoc(d.name)})`).join(', ')}`);
+    console.log(`    🇳🇴 eu-supply: ${found.length} unique doc(s) across ${allLots.length} lot(s); top: ${found.slice(0, 5).map(d => `"${(d.name || '(unnamed)').slice(0, 50)}"(${scoreDoc(d.name)})`).join(', ')}`);
 
     // Step 4 — build the real download URL using the JS function's own
     // formula. The JS source (revealed by diagnostic in earlier run) is:
-    // var strURL = strDownloadPublicDocumentURL
-    // + '?FMT=5&AT=' + strArchiveType
-    // + '&LID=' + strLotID
-    // + '&DVID=' + strFileID;
+    //   var strURL = strDownloadPublicDocumentURL
+    //              + '?FMT=5&AT=' + strArchiveType
+    //              + '&LID=' + strLotID
+    //              + '&DVID=' + strFileID;
     // Two key facts the earlier guess-and-fetch approach missed:
-    // • The query param is `DVID` (not `DID`) — server rejected our
-    // `DID=...` requests and returned a generic HTML error page.
-    // • The base path comes from the global `strDownloadPublicDocumentURL`
-    // which we now read at runtime. Across CTM deployments it tends
-    // to be `/app/rfq/downloadpublicdocument.asp` but we don't have
-    // to hard-code it.
+    //   • The query param is `DVID` (not `DID`) — server rejected our
+    //     `DID=...` requests and returned a generic HTML error page.
+    //   • The base path comes from the global `strDownloadPublicDocumentURL`
+    //     which we now read at runtime. Across CTM deployments it tends
+    //     to be `/app/rfq/downloadpublicdocument.asp` but we don't have
+    //     to hard-code it.
     // Response interception (the previous attempt) failed because the
     // function falls through to `window.open(strURL)` when ActiveX
     // FileMgr isn't loaded — that opens a popup whose responses aren't
     // visible on this page's response stream.
-    // Format-aware parsers. eu supply tenders mix PDF + DOCX + XLSX + ZIP
-    // (eg Statsbygg SSA-F suites ship "Avtaletekst.docx",
+    // Format-aware parsers. eu-supply tenders mix PDF + DOCX + XLSX + ZIP
+    // freely (e.g. Statsbygg SSA-F suites ship "Avtaletekst.docx",
     // "Bilag.docx", "Sikkerhetskrav.xlsx" alongside the PDF Konkurranse-
     // grunnlag). Without DOCX support the actual qualification doc was
     // silently dropped. All four libs are optional; missing one only
     // disables that one format.
     let pdfParseLib = null, mammothLib = null, XLSXLib = null, AdmZipLib = null;
     try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-    try { mammothLib = require('mammoth'); } catch (_) {}
-    try { XLSXLib = require('xlsx'); } catch (_) {}
-    try { AdmZipLib = require('adm-zip'); } catch (_) {}
+    try { mammothLib  = require('mammoth');   } catch (_) {}
+    try { XLSXLib     = require('xlsx');      } catch (_) {}
+    try { AdmZipLib   = require('adm-zip');   } catch (_) {}
     const texts = [];
     // Bumped from 6 — multi-lot frameworks routinely have 5×3 = 15 useful
     // docs across lots. Per-lot we cap implicitly via aggregate.
@@ -3347,10 +3347,10 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
     }).catch(() => ({ basePath: null, archiveType: '', fmt: '5', rawFnSnippet: null }));
 
     if (ctmGlobals.rawFnSnippet) {
-      console.log(` 🇳🇴 eu-supply: DownloadPublicDocument source: ${ctmGlobals.rawFnSnippet.replace(/\s+/g, ' ').slice(0, 260)}`);
+      console.log(`    🇳🇴 eu-supply: DownloadPublicDocument source: ${ctmGlobals.rawFnSnippet.replace(/\s+/g, ' ').slice(0, 260)}`);
     }
     if (!ctmGlobals.basePath) {
-      console.log(` ⚠️ eu-supply: strDownloadPublicDocumentURL global not found — cannot build download URL`);
+      console.log(`    ⚠️  eu-supply: strDownloadPublicDocumentURL global not found — cannot build download URL`);
       return [];
     }
     // Resolve to absolute URL — basePath may be relative ("/app/rfq/...")
@@ -3360,7 +3360,7 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
       const u = new URL(downloadEndpoint, page.url());
       downloadEndpoint = u.toString();
     } catch (_) {}
-    console.log(` 🇳🇴 eu-supply: download endpoint resolved to ${downloadEndpoint.slice(0, 100)} (AT="${ctmGlobals.archiveType}")`);
+    console.log(`    🇳🇴 eu-supply: download endpoint resolved to ${downloadEndpoint.slice(0, 100)} (AT="${ctmGlobals.archiveType}")`);
 
     for (const doc of found.slice(0, MAX_DOCS)) {
       const eLid = doc.lid || lid;
@@ -3378,11 +3378,11 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
           if (!r.ok) return { ok: false, status: r.status, ct, cd };
           const buf = await r.arrayBuffer();
           return {
-            OK: true,
+            ok: true,
             status: r.status,
             ct,
-            CD,
-            URL: r.url,
+            cd,
+            url: r.url,
             data: Array.from(new Uint8Array(buf)),
           };
         } catch (e) { return { ok: false, error: String(e) }; }
@@ -3405,17 +3405,17 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
       if (!bytes) {
         const status = result?.status || '?';
         const ct = (result?.ct || '').slice(0, 40);
-        console.log(` ⚠️ eu-supply: download failed for "${labelName}" (id=${doc.docId}, status=${status}, ct=${ct})`);
+        console.log(`    ⚠️  eu-supply: download failed for "${labelName}" (id=${doc.docId}, status=${status}, ct=${ct})`);
         continue;
       }
 
-      // Format dispatch by magic bytes + filename hints. eu supply hides the
+      // Format dispatch by magic bytes + filename hints. eu-supply hides the
       // real extension behind the JS download wrapper, so we sniff the
       // payload's first 4 bytes:
-      // %PDF (25 50 44 46) → pdf parse
-      // PK\x03\x04 (50 4B 03 04) → ZIP/OOXML — try mammoth (DOCX) first,
-      // then XLSX, then adm-zip recursion
-      // D0 CF 11 E0 → legacy MS Office CFB — unsupported, skip
+      //   %PDF (25 50 44 46) → pdf-parse
+      //   PK\x03\x04 (50 4B 03 04) → ZIP/OOXML — try mammoth (DOCX) first,
+      //     then XLSX, then adm-zip recursion
+      //   D0 CF 11 E0 → legacy MS Office CFB — unsupported, skip
       const b = bytes;
       const isPdf = b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46;
       const isZip = b[0] === 0x50 && b[1] === 0x4B && b[2] === 0x03 && b[3] === 0x04;
@@ -3487,32 +3487,32 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
           // return raw HTML when ActiveX FileMgr is missing).
           const asString = bytes.toString('utf8', 0, Math.min(bytes.length, 200));
           if (/<html|<body|<!DOCTYPE/i.test(asString)) {
-            console.log(` ⚠️ eu-supply: "${labelName}" returned HTML page (likely auth wall) — skipping`);
+            console.log(`    ⚠️  eu-supply: "${labelName}" returned HTML page (likely auth wall) — skipping`);
             continue;
           }
         }
       } catch (e) {
-        console.log(` ⚠️ eu-supply: parse error for "${labelName}": ${(e.message || '').slice(0, 80)}`);
+        console.log(`    ⚠️  eu-supply: parse error for "${labelName}": ${(e.message || '').slice(0, 80)}`);
       }
 
       if (text && text.length > 100) {
         const clipped = text.slice(0, 80000);
         const lotTag = doc._lotLabel ? ` [lot ${doc._lotLid}]` : '';
         texts.push(`--- (eu-supply ${format}${lotTag}) ${labelName} ---\n${clipped}`);
-        console.log(` 🇳🇴 eu-supply: parsed ${format} "${labelName}" (${bytes.length}B → ${clipped.length}ch from ${(capturedUrl || '').slice(0, 80)})`);
+        console.log(`    🇳🇴 eu-supply: parsed ${format} "${labelName}" (${bytes.length}B → ${clipped.length}ch from ${(capturedUrl || '').slice(0, 80)})`);
         _collectDriveFile(labelName, Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes));
       } else if (format === 'unknown') {
         const magic = Array.from(bytes.slice(0, 4)).map(x => x.toString(16).padStart(2, '0')).join(' ');
-        console.log(` ⚠️ eu-supply: unknown format for "${labelName}" (magic=${magic}, ${bytes.length}B) — skipping`);
+        console.log(`    ⚠️  eu-supply: unknown format for "${labelName}" (magic=${magic}, ${bytes.length}B) — skipping`);
       } else {
-        console.log(` ⚠️ eu-supply: ${format} "${labelName}" extracted text too short (${text.length}ch)`);
+        console.log(`    ⚠️  eu-supply: ${format} "${labelName}" extracted text too short (${text.length}ch)`);
       }
     }
     return texts;
   } catch (e) {
-    console.log(` ⚠️ eu-supply handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  eu-supply handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -3525,37 +3525,37 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
 // point to old-dc-import-notices-prod.s3.eu... — the S3 bucket returns
 // 403 for our session. TenderNed itself hosts the SAME documents on
 // its own domain with public download. We open the announcement page,
-// scrape in-page anchors that point to tendered.nl document download
+// scrape in-page anchors that point to tenderned.nl document download
 // endpoints, fetch each PDF/DOCX directly, and parse text. Returns a
 // list of text snippets (one per parsed doc) that the caller merges
 // into result.sourceFilesText.
 //
 // Priority terms (Dutch / EU procurement):
-// Selectieleidraad — selection guide (top-priority qualifications)
-// Selectiecriterium — selection criterion (most direct match)
-// Programma van Eisen — requirements program (technical reqs)
-// UEA / ESPD — Uniform European Procurement Document
-// Aanbestedingsleidraad — procurement guide (often contains both reqs and quals)
+//   Selectieleidraad      — selection guide (top-priority qualifications)
+//   Selectiecriterium     — selection criterion (most direct match)
+//   Programma van Eisen   — requirements programme (technical reqs)
+//   UEA / ESPD            — Uniform European Procurement Document
+//   Aanbestedingsleidraad — procurement guide (often contains both reqs and quals)
 // =====================================================================
 
 // =====================================================================
 // fetchArtifikDocuments
 // ---------------------------------------------------------------------
 // app.artifik.no/procurements/<id> — Norwegian React SPA tender platform
-// (used by municipalities like Gjøvik Kommune). The purchasing page
-// loads structured data via JSON API calls (eg /api/procurements/<id>/
-// award criteria, /qualification criteria, /documents). The generic
+// (used by municipalities like Gjøvik Kommune). The procurement page
+// loads structured data via JSON API calls (e.g. /api/procurements/<id>/
+// award-criteria, /qualification-criteria, /documents). The generic
 // source-page handler only captures the rendered body text — but key
-// sections (Tildelingskriterier, Kvalifikasjonskrav, Documenter) live in
+// sections (Tildelingskriterier, Kvalifikasjonskrav, Dokumenter) live in
 // TAB panels that aren't expanded by default.
 //
 // Strategy:
-// 1) Navigate to the purchasing URL, wait for SPA hydration (~4s)
-// 2) Intercept all JSON responses from app.artifik.no/api/* — these
-// carry the structured tender data
-// 3) Click through every plausible tab/section label across NO/EN
-// 4) After each click wait briefly, then capture additional API calls
-// 5) Concatenate captured JSON + final rendered body
+//   1) Navigate to the procurement URL, wait for SPA hydration (~4s)
+//   2) Intercept all JSON responses from app.artifik.no/api/* — these
+//      carry the structured tender data
+//   3) Click through every plausible tab/section label across NO/EN
+//   4) After each click wait briefly, then capture additional API calls
+//   5) Concatenate captured JSON + final rendered body
 //
 // Returns array of text snippets to merge into sourceFilesText.
 // =====================================================================
@@ -3565,26 +3565,26 @@ async function fetchEuSupplyDocuments(browser, sourceUrl) {
 // viesiejipirkimai.lt — CVPP (Centrinė viešųjų pirkimų informacinė
 // sistema, Lithuanian central public procurement portal). Two URL modes:
 //
-// /epps/cft/prepareViewCfTWS.do?resourceId=X — anonymous summary
-// Body shows tender title + buyer info, but documents are hidden
-// behind a "Rodyti pirkimo meniu" toggle that expands a tab nav.
+//   /epps/cft/prepareViewCfTWS.do?resourceId=X — anonymous summary
+//       Body shows tender title + buyer info, but documents are hidden
+//       behind a "Rodyti pirkimo meniu" toggle that expands a tab nav.
 //
-// /epps/cft/viewTenders.do?resourceId=X — authenticated full view
-// Requires login. Post login navigation back to this URL often
-// returns dashboard chrome rather than tender detail — we need
-// to click "Documentai" / "Pirkimo documentai" in the side menu
-// to reach the actual file list.
+//   /epps/cft/viewTenders.do?resourceId=X — authenticated full view
+//       Requires login. Post-login navigation back to this URL often
+//       returns dashboard chrome rather than tender detail — we need
+//       to click "Dokumentai" / "Pirkimo dokumentai" in the side menu
+//       to reach the actual file list.
 //
 // Strategy: navigate, scroll, try clicking "Rodyti pirkimo meniu" if
-// present, then click any "Documentai" / "Documents" / "Pirkimo
-// documentai" tab/link, then harvest file anchors. Falls back to
+// present, then click any "Dokumentai" / "Documents" / "Pirkimo
+// dokumentai" tab/link, then harvest file anchors. Falls back to
 // diagnostic dump (top 20 anchor texts) when nothing matches — so we
 // can refine selectors over multiple runs.
 // =====================================================================
 // 2026-06-02 (Task #143) — module-level collector for Drive upload.
 // fetchSourcePageDetails resets this at the start of each tender; handlers
-// push {filename, buf} after each successful parse. After the source page
-// pipeline finishes, the centralized upload step drains the collector,
+// push {filename, buf} after each successful parse. After the source-page
+// pipeline finishes, the centralised upload step drains the collector,
 // uploads each buffer to the tender's Drive folder, and stores the
 // resulting filename→link map on details.driveFiles for Q/J column use.
 // Sequential per-tender processing means a single module-level array is
@@ -3667,14 +3667,14 @@ const _collectDriveFile = (filename, buf) => {
 // Run 72 symptom: all 9 tenders had pdfText=0ch in AI inputs despite
 // PLACSP appending 41981ch into src.sourceFilesText.
 // Fix: main() writes config to this module-level mailbox after Drive
-// set up; fetchTenderDetails reads it (null when Drive is disabled).
+// setup; fetchTenderDetails reads it (null when Drive is disabled).
 let _DRIVE_CTX = null;
 
 // 2026-06-03 (Task #147) — auth-needed signal from source-page handlers.
 // Some handlers (notably tendsign) extract real anonymous content (PDFs,
 // DOCX) successfully but find that SPECIFIC priority docs (XLSB Vedlegg
 // with personnel/CV requirements) are gated behind login and come back
-// as HTML responses (ct=text/html). Without this signal, the FORCE LOGIN
+// as HTML responses (ct=text/html). Without this signal, the FORCE-LOGIN
 // guard (Task #42) saw the 26K+ ch of anonymous content and skipped
 // login, leaving the qualification-bearing XLSB files unparsed.
 //
@@ -3686,7 +3686,7 @@ let _SOURCE_HANDLER_NEEDS_AUTH = false;
 
 // 2026-06-04 (Task #171) — historical budget benchmarks from Sheet1.
 // At scraper boot we read past tenders with stated budgets and build a
-// compact table the AI ​​can use as few-shot reference when estimating
+// compact table the AI can use as few-shot reference when estimating
 // budgets for new tenders without a stated value. Rebuilt once per run.
 // Format: array of {country, duration, scopeKeyword, budgetEur} objects,
 // plus a pre-rendered Markdown snippet for direct prompt injection.
@@ -3710,22 +3710,22 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
     try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
 
     await page.goto(sourceUrl, { waitUntil: 'networkidle2', timeout: 25000 }).catch((e) => {
-      console.log(` 🇱🇹 viesiejipirkimai: nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇱🇹 viesiejipirkimai: nav warn: ${(e.message || '').slice(0, 80)}`);
     });
     await new Promise((r) => setTimeout(r, 2500));
 
     // STEP 1 — open the "Rodyti pirkimo meniu" Bootstrap dropdown.
     //
     // User-confirmed DOM (2026-05-25):
-    // <button id="dropdownMenuButton" type="button"
-    // class="btn btn-danger btn-sm dropdown-toggle"
-    // data-toggle="dropdown"
-    // aria-haspopup="true" aria-expanded="false">
-    // <i class="fa fa-list"></i><span>Rodyti pirkimo meniu</span>
-    // </button>
+    //   <button id="dropdownMenuButton" type="button"
+    //           class="btn btn-danger btn-sm dropdown-toggle"
+    //           data-toggle="dropdown"
+    //           aria-haspopup="true" aria-expanded="false">
+    //     <i class="fa fa-list"></i><span>Rodyti pirkimo meniu</span>
+    //   </button>
     //
     // After click → dropdown unfolds with item list; one item is
-    // "Pirkimo documentai" which navigates to the document-listing page.
+    // "Pirkimo dokumentai" which navigates to the document-listing page.
     const menuOpened = await page.evaluate(() => {
       const btn = document.getElementById('dropdownMenuButton');
       if (!btn) return null;
@@ -3736,10 +3736,10 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
       } catch (_) { return null; }
     }).catch(() => null);
     if (menuOpened) {
-      console.log(` 🇱🇹 viesiejipirkimai: opened #dropdownMenuButton (aria-expanded=${menuOpened})`);
+      console.log(`    🇱🇹 viesiejipirkimai: opened #dropdownMenuButton (aria-expanded=${menuOpened})`);
       await new Promise((r) => setTimeout(r, 1000));
     } else {
-      // Fallback — search by visible text. Bootstrap may have been re-rendered
+      // Fallback — search by visible text. Bootstrap may have re-rendered
       // the button without the canonical ID.
       const fb = await page.evaluate(() => {
         const cands = Array.from(document.querySelectorAll('button, a'));
@@ -3753,18 +3753,18 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         return null;
       }).catch(() => null);
       if (fb) {
-        console.log(` 🇱🇹 viesiejipirkimai: opened dropdown via text fallback "${fb}"`);
+        console.log(`    🇱🇹 viesiejipirkimai: opened dropdown via text fallback "${fb}"`);
         await new Promise((r) => setTimeout(r, 1000));
       }
     }
 
-    // STEP 2 — click "Pirkimo documentai" from the now-open dropdown.
+    // STEP 2 — click "Pirkimo dokumentai" from the now-open dropdown.
     // This NAVIGATES to a new page (the document-listing route), so we
     // wait for either navigation OR DOM update afterward.
     const dropdownClicked = await page.evaluate(() => {
       // Look in dropdown menus (Bootstrap renders a .dropdown-menu sibling
       // when toggled), or anywhere if the dropdown class detection fails.
-      const RE = /^\s*pirkimo\s+documentai\s*$/i;
+      const RE = /^\s*pirkimo\s+dokumentai\s*$/i;
       const dropdowns = Array.from(document.querySelectorAll(
         '.dropdown-menu, [role="menu"], .show, ul[aria-labelledby="dropdownMenuButton"]'
       ));
@@ -3789,7 +3789,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
       return null;
     }).catch(() => null);
     if (dropdownClicked) {
-      console.log(` 🇱🇹 viesiejipirkimai: clicked "Pirkimo documentai" (${dropdownClicked})`);
+      console.log(`    🇱🇹 viesiejipirkimai: clicked "Pirkimo dokumentai" (${dropdownClicked})`);
       await Promise.race([
         page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => null),
         new Promise((r) => setTimeout(r, 3500)),
@@ -3799,10 +3799,10 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
 
     // STEP 3 — on the new document-listing page, ensure the DOCUMENTS tab
     // is active. User-confirmed DOM:
-    // <a class="nav-link active" data-toggle="tab" role="tab"
-    // aria-controls="contact"
-    // onclick="selectTab('DOCUMENTS')"
-    // href="javascript:void(0)">Pirkimo documentai</a>
+    //   <a class="nav-link active" data-toggle="tab" role="tab"
+    //      aria-controls="contact"
+    //      onclick="selectTab('DOCUMENTS')"
+    //      href="javascript:void(0)">Pirkimo dokumentai</a>
     // The tab is typically already active when we land here, but clicking
     // it explicitly forces the DOCUMENTS content to render.
     const docTabClicked = await page.evaluate(() => {
@@ -3823,14 +3823,14 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
       for (const el of cands) {
         if (el.offsetParent === null) continue;
         const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-        if (/^\s*pirkimo\s+documentai\s*$/i.test(t)) {
+        if (/^\s*pirkimo\s+dokumentai\s*$/i.test(t)) {
           try { el.scrollIntoView({ block: 'center' }); el.click(); return `text:${t.slice(0, 60)}`; } catch (_) {}
         }
       }
       return null;
     }).catch(() => null);
     if (docTabClicked) {
-      console.log(` 🇱🇹 viesiejipirkimai: activated DOCUMENTS tab (${docTabClicked})`);
+      console.log(`    🇱🇹 viesiejipirkimai: activated DOCUMENTS tab (${docTabClicked})`);
       await new Promise((r) => setTimeout(r, 2500));
     }
 
@@ -3847,7 +3847,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
     await new Promise((r) => setTimeout(r, 1000));
 
     // STEP 4 — harvest document anchors. CVPP's confirmed pattern is:
-    // <a href="#" onclick="addUser('8021340')">filename.docx</a>
+    //   <a href="#" onclick="addUser('8021340')">filename.docx</a>
     // The visible text IS the filename. The numeric arg to addUser() is
     // the document ID. The actual download URL must be inferred (CVPP
     // typically uses /epps/cft/getDocument.do?id=X&resourceId=Y or
@@ -3863,9 +3863,9 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
       // appears on the public/unauthenticated docs view and bypasses
       // the addUser confirmation popup → direct download with no
       // login required. We MUCH prefer the anonymous path (cheaper,
-      (more reliable).
+      // more reliable).
       const RX_ONCLICK_FN = /^\s*(?:return\s+)?(addUser|viewCD|downloadDocument|getDocument|viewDocument|showDocument|displayDocument|getFile|downloadFile|downloadDocForAnonymous|viewCDForAnonymous)\s*\(\s*['"]?(\d{3,15})['"]?\s*[,)]/i;
-      // Bulk ZIP button. Log 33: downloadZip() (post login). Log 34:
+      // Bulk ZIP button. Log 33: downloadZip() (post-login). Log 34:
       // downloadForAnonymousUser() (anonymous — no login needed).
       const RX_BULK_FN = /^\s*(?:return\s+)?(downloadZip|downloadAllDocuments|downloadAll|getAllDocuments|downloadForAnonymousUser|downloadForAnonymous|downloadAllForAnonymous)\s*\(/i;
       const out = [];
@@ -3891,8 +3891,8 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
 
       // PASS 2 — button-based items (Type B: viewCD('id') + downloadZip()).
       // CVPP confirmed log 33:
-      // <button onclick="viewCD('8009073')"></button> — individual file
-      // <button onclick="downloadZip()">ATSISIŲSTI ZIP</button> — bulk ZIP
+      //   <button onclick="viewCD('8009073')"></button>  — individual file
+      //   <button onclick="downloadZip()">ATSISIŲSTI ZIP</button> — bulk ZIP
       // We prefer the BULK button when present (one click → all files at once).
       const buttons = Array.from(document.querySelectorAll('button[onclick], input[onclick]'));
       let foundBulk = false;
@@ -3918,7 +3918,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         if (seen.has(key)) continue;
         seen.add(key);
         // For viewCD-style buttons, the FILENAME comes from the table row's
-        // "Documentas" cell — climb up to <tr> and look there.
+        // "Dokumentas" cell — climb up to <tr> and look there.
         let filename = text;
         try {
           const tr = b.closest('tr');
@@ -3937,7 +3937,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
 
     const bulkCount = harvested.filter((h) => h.kind === 'bulk').length;
     const itemCount = harvested.length - bulkCount;
-    console.log(` 🇱🇹 viesiejipirkimai: ${harvested.length} item(s) detected (${bulkCount} bulk-ZIP, ${itemCount} individual) for resourceId=${resourceId}`);
+    console.log(`    🇱🇹 viesiejipirkimai: ${harvested.length} item(s) detected (${bulkCount} bulk-ZIP, ${itemCount} individual) for resourceId=${resourceId}`);
 
     if (harvested.length === 0) {
       // No anchors via the addUser pattern — run the full diagnostic.
@@ -3950,13 +3950,13 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
 
     // Click each detected doc, capture the resulting download. CVPP's
     // addUser() may:
-    // (a) call window.open(URL) → opens a new TAB which streams the
-    // file. We capture via browser.on('targetcreated').
-    // (b) trigger an XHR fetch on the current page → page.on('response').
-    // (c) submit a hidden form with target=_blank → also a new tab.
+    //   (a) call window.open(URL) → opens a new TAB which streams the
+    //       file. We capture via browser.on('targetcreated').
+    //   (b) trigger an XHR fetch on the current page → page.on('response').
+    //   (c) submit a hidden form with target=_blank → also a new tab.
     // We listen to BOTH paths simultaneously. Plus we capture ALL /epps/
     // requests (not just binary) so the diagnostic dump shows what
-    // addUser ACTUALLY does when no binary response materializes.
+    // addUser ACTUALLY does when no binary response materialises.
 
     const captured = new Map(); // docId -> { buf, url, contentType }
     const allEppsRequests = []; // diagnostic: every /epps/ request fired
@@ -4078,28 +4078,28 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
     };
     browser.on('targetcreated', targetCreatedHandler);
 
-    // Sample popup. CVPP confirmed flow (2026-05-26 log 30):
-    // addUser(id) → window.open(prepareAssociateUser.do?documentId=X&...)
-    // prepareAssociateUser.do is the "SUSIETI SU PIRKIMU" (associate
-    // with purchase) confirmation page — NOT a direct download.
-    // The user must click "Susieti / Sutinku / Patvirtinti" button,
-    // which POSTs to a register endpoint AND THEN streams the file.
+    // Probe popup. CVPP confirmed flow (2026-05-26 log 30):
+    //   addUser(id) → window.open(prepareAssociateUser.do?documentId=X&...)
+    //   prepareAssociateUser.do is the "SUSIETI SU PIRKIMU" (associate
+    //   with procurement) confirmation page — NOT a direct download.
+    //   The user must click "Susieti / Sutinku / Patvirtinti" button,
+    //   which POSTs to a register endpoint AND THEN streams the file.
     //
     // So our flow is:
-    // 1. Wait for popup to settle
-    // 2. Click the confirm button INSIDE the popup
-    // 3. Wait for binary response that follows
-    // 4. (Optional) probe for any direct anchor/form action that
-    // might bypass the confirmation
+    //   1. Wait for popup to settle
+    //   2. Click the confirm button INSIDE the popup
+    //   3. Wait for binary response that follows
+    //   4. (Optional) probe for any direct anchor/form action that
+    //      might bypass the confirmation
     const probePopupForDownload = async (pp) => {
       try {
         await pp.waitForNetworkIdle({ idleTime: 1500, timeout: 8000 }).catch(() => null);
         await new Promise((r) => setTimeout(r, 1500));
 
         // PRIMARY PATH — CVPP confirmed flow (log 31 diagnostic):
-        // Popup body: "Asociacijos tipas: 1. Susieti visus naudotojus
-        // 2. Susieti tik save PASIRINKTI"
-        // Button: <button onclick="addUser()">PASIRINKTI</button>
+        //   Popup body: "Asociacijos tipas: 1. Susieti visus naudotojus
+        //                                   2. Susieti tik save  PASIRINKTI"
+        //   Button: <button onclick="addUser()">PASIRINKTI</button>
         // Must select the "tik save" radio FIRST (option 2) → safer
         // default that registers ONLY our user, not whole organization.
         // Then click PASIRINKTI.
@@ -4165,11 +4165,11 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         }).catch(() => null);
 
         if (confirmClicked) {
-          console.log(` popup: clicked confirm button "${confirmClicked}" — waiting for download`);
+          console.log(`       popup: clicked confirm button "${confirmClicked}" — waiting for download`);
           // After confirm click, server may either:
-          // (a) Stream binary directly in the popup
-          // (b) Redirect to a download URL (new request fires)
-          // (c) Close popup and stream in main page
+          //  (a) Stream binary directly in the popup
+          //  (b) Redirect to a download URL (new request fires)
+          //  (c) Close popup and stream in main page
           // Wait briefly for navigation/network.
           await Promise.race([
             pp.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 6000 }).catch(() => null),
@@ -4241,12 +4241,12 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         if (fnSource) {
           // Log just the body (skip the "function name() {" wrapper for brevity)
           const bodyOnly = fnSource.replace(/\s+/g, ' ').slice(0, 400);
-          console.log(` 🇱🇹 viesiejipirkimai: ${d.fnName}() source: ${bodyOnly}`);
+          console.log(`    🇱🇹 viesiejipirkimai: ${d.fnName}() source: ${bodyOnly}`);
           // Try to extract a /epps/ URL pattern from the function body
           const urlMatch = fnSource.match(/['"]([^'"\s<>]*\/epps\/[^'"\s<>]+)['"]/i);
           if (urlMatch) {
             const candidateUrl = new URL(urlMatch[1], 'https://viesiejipirkimai.lt').toString();
-            console.log(` 🇱🇹 viesiejipirkimai: extracted candidate URL: ${candidateUrl.slice(-100)}`);
+            console.log(`    🇱🇹 viesiejipirkimai: extracted candidate URL: ${candidateUrl.slice(-100)}`);
             // Direct fetch using page cookies — bypasses any window.open
             // / CDP download timing issues.
             const directResult = await page.evaluate(async (url) => {
@@ -4265,7 +4265,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
               const isPdf = buf[0] === 0x25 && buf[1] === 0x50;
               if (isZip || isPdf) {
                 captured.set('bulk', { url: directResult.url, ct: directResult.ct, buf, ts: Date.now() });
-                console.log(` 🇱🇹 viesiejipirkimai: ✓ direct fetch SUCCESS ${buf.length}B (${isZip ? 'ZIP' : 'PDF'}) from ${directResult.url.slice(-80)}`);
+                console.log(`    🇱🇹 viesiejipirkimai: ✓ direct fetch SUCCESS ${buf.length}B (${isZip ? 'ZIP' : 'PDF'}) from ${directResult.url.slice(-80)}`);
                 d.url = directResult.url;
                 d._capturedBuf = buf;
                 d._capturedCt = directResult.ct;
@@ -4273,14 +4273,14 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
                 continue;
               } else {
                 const magic = Array.from(buf.slice(0, 4)).map(x => x.toString(16).padStart(2, '0')).join(' ');
-                console.log(` ⚠️ viesiejipirkimai: direct fetch returned non-binary (magic=${magic}, ${buf.length}B, ct=${directResult.ct.slice(0, 60)})`);
+                console.log(`    ⚠️  viesiejipirkimai: direct fetch returned non-binary (magic=${magic}, ${buf.length}B, ct=${directResult.ct.slice(0, 60)})`);
               }
             } else {
-              console.log(` ⚠️ viesiejipirkimai: direct fetch failed (status=${directResult?.status || directResult?.error || '?'})`);
+              console.log(`    ⚠️  viesiejipirkimai: direct fetch failed (status=${directResult?.status || directResult?.error || '?'})`);
             }
           }
         } else {
-          console.log(` ℹ️ viesiejipirkimai: couldn't read ${d.fnName}() source — falling back to button click`);
+          console.log(`    ℹ️  viesiejipirkimai: couldn't read ${d.fnName}() source — falling back to button click`);
         }
 
         // 2026-05-28 regression fix (Task #112) —
@@ -4290,7 +4290,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         // headless Chrome (log 52: 14/14 timeouts). By forcing the main
         // tab to load the URL, CDP's Browser.setDownloadBehavior
         // intercepts the attachment response and writes the ZIP to disk
-        // reliable. If the server instead serves a confirmation HTML page
+        // reliably. If the server instead serves a confirmation HTML page
         // (Content-Type: text/html), the page renders normally and we
         // search it for the real download anchor below.
         let bulkClicked = false;
@@ -4298,9 +4298,9 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           ? new URL((fnSource.match(/['"]([^'"\s<>]*\/epps\/[^'"\s<>]+)['"]/i) || [])[1], 'https://viesiejipirkimai.lt').toString()
           : null;
         if (candidateUrlForBulk) {
-          console.log(` 🇱🇹 viesiejipirkimai: navigating main tab to bulk URL (bypassing window.open popup)`);
+          console.log(`    🇱🇹 viesiejipirkimai: navigating main tab to bulk URL (bypassing window.open popup)`);
           // page.goto can throw net::ERR_ABORTED when the server returns
-          // Content-Disposition:attachment (download interrupts nav). That's it
+          // Content-Disposition:attachment (download interrupts nav). That's
           // EXACTLY what we want — the file lands on disk while goto errors.
           // Swallow the error and let the disk-watch loop below pick up the
           // ZIP. If goto resolves cleanly, the response was HTML and we'll
@@ -4312,9 +4312,9 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
             // Expected for attachment responses — treat as success signal.
             const msg = String(e.message || '');
             if (/ERR_ABORTED|net::ERR_FAILED|Navigation timeout/i.test(msg)) {
-              console.log(` 🇱🇹 viesiejipirkimai: goto interrupted (likely attachment download — checking disk)`);
+              console.log(`    🇱🇹 viesiejipirkimai: goto interrupted (likely attachment download — checking disk)`);
             } else {
-              console.log(` ⚠️ viesiejipirkimai: goto error: ${msg.slice(0, 100)}`);
+              console.log(`    ⚠️  viesiejipirkimai: goto error: ${msg.slice(0, 100)}`);
             }
           }
           bulkClicked = true;
@@ -4346,14 +4346,14 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         }, d.fnName).catch(() => false);
         if (buttonClicked) {
           bulkClicked = true;
-          console.log(` 🇱🇹 viesiejipirkimai: clicked bulk button (window.open patched → main-tab nav)`);
+          console.log(`    🇱🇹 viesiejipirkimai: clicked bulk button (window.open patched → main-tab nav)`);
         }
 
         if (!bulkClicked) {
-          console.log(` ⚠️ viesiejipirkimai: failed to trigger bulk download for "${d.filename}"`);
+          console.log(`    ⚠️  viesiejipirkimai: failed to trigger bulk download for "${d.filename}"`);
           continue;
         }
-        console.log(` 🇱🇹 viesiejipirkimai: clicked bulk ZIP button "${d.filename}" — waiting for download`);
+        console.log(`    🇱🇹 viesiejipirkimai: clicked bulk ZIP button "${d.filename}" — waiting for download`);
 
         // Wait up to 30s for ZIP — CVPP ZIPs can be multi-MB.
         const watchDeadline = Date.now() + 30000;
@@ -4378,7 +4378,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           try {
             const buf = fs.readFileSync(newFile.path);
             captured.set('bulk', { url: `file://${newFile.path}`, ct: 'application/zip', buf, ts: Date.now() });
-            console.log(` 🇱🇹 viesiejipirkimai: ✓ captured bulk ZIP ${buf.length}B: "${newFile.name}"`);
+            console.log(`    🇱🇹 viesiejipirkimai: ✓ captured bulk ZIP ${buf.length}B: "${newFile.name}"`);
             try { fs.unlinkSync(newFile.path); } catch (_) {}
             // Update the doc entry so downstream parser knows it's a ZIP
             d.url = `file://${newFile.path}`;
@@ -4387,15 +4387,15 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
             d.filename = newFile.name;
             continue;
           } catch (e) {
-            console.log(` ⚠️ viesiejipirkimai: failed to read bulk ZIP "${newFile.name}": ${e.message}`);
+            console.log(`    ⚠️  viesiejipirkimai: failed to read bulk ZIP "${newFile.name}": ${e.message}`);
           }
         } else {
-          console.log(` ⚠️ viesiejipirkimai: bulk ZIP click didn't produce a download within 30s`);
+          console.log(`    ⚠️  viesiejipirkimai: bulk ZIP click didn't produce a download within 30s`);
           // POST-FAILURE DIAGNOSTIC + RETRY — if our goto landed us on an
           // HTML confirmation page (prepareAnonymousDownload.do can render
           // a "click to download" intermediate page), inspect it for a
           // download anchor / form and try one more click. Cheap and
-          // gives us a concrete next-step hint even if that fails.
+          // gives us a concrete next-step hint when even that fails.
           try {
             const here = page.url();
             const snap = await page.evaluate(() => {
@@ -4418,12 +4418,12 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
               };
             }).catch(() => null);
             if (snap) {
-              console.log(` 🇱🇹 viesiejipirkimai: diag at ${here.slice(-80)}`);
-              console.log(` title: "${snap.title}"`);
-              console.log(` body: "${snap.bodyPreview}"`);
-              if (snap.docAnchorHref) console.log(` found doc anchor: "${snap.docAnchorText}" → ${snap.docAnchorHref}`);
-              if (snap.formAction) console.log(` form action: ${snap.formAction}`);
-              if (snap.dlBtnText) console.log(` download btn: "${snap.dlBtnText}"`);
+              console.log(`    🇱🇹 viesiejipirkimai: diag at ${here.slice(-80)}`);
+              console.log(`       title: "${snap.title}"`);
+              console.log(`       body: "${snap.bodyPreview}"`);
+              if (snap.docAnchorHref) console.log(`       found doc anchor: "${snap.docAnchorText}" → ${snap.docAnchorHref}`);
+              if (snap.formAction) console.log(`       form action: ${snap.formAction}`);
+              if (snap.dlBtnText) console.log(`       download btn: "${snap.dlBtnText}"`);
               // If we spotted a doc anchor on the confirmation page, click
               // it once and watch disk again (shorter window — 15s).
               if (snap.docAnchorHref || snap.dlBtnText) {
@@ -4444,14 +4444,14 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
                   return null;
                 }).catch(() => null);
                 if (fnSrc) {
-                  console.log(` 🇱🇹 viesiejipirkimai: download() source: ${fnSrc.replace(/\s+/g, ' ').slice(0, 400)}`);
+                  console.log(`    🇱🇹 viesiejipirkimai: download() source: ${fnSrc.replace(/\s+/g, ' ').slice(0, 400)}`);
                   // Try to extract a /epps/ URL straight from the function
                   // body — bypasses the popup entirely. Then page.goto it;
                   // CDP's download manager will catch the attachment.
-                  const fnUrl = (fnSrc.match(/['"]([^'"\s< >]*\/epps\/[^'"\s<>]+)['"]/i) || [])[1];
+                  const fnUrl = (fnSrc.match(/['"]([^'"\s<>]*\/epps\/[^'"\s<>]+)['"]/i) || [])[1];
                   if (fnUrl) {
                     const absDl = new URL(fnUrl, 'https://viesiejipirkimai.lt').toString();
-                    console.log(` 🇱🇹 viesiejipirkimai: extracted download() URL → ${absDl.slice(-100)}`);
+                    console.log(`    🇱🇹 viesiejipirkimai: extracted download() URL → ${absDl.slice(-100)}`);
                     let filesBeforeFn = [];
                     try { filesBeforeFn = fs.readdirSync(downloadDir); } catch (_) {}
                     try {
@@ -4459,7 +4459,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
                     } catch (e) {
                       const m = String(e.message || '');
                       if (/ERR_ABORTED|net::ERR_FAILED|Navigation/i.test(m)) {
-                        console.log(` 🇱🇹 viesiejipirkimai: goto interrupted (likely attachment — checking disk)`);
+                        console.log(`    🇱🇹 viesiejipirkimai: goto interrupted (likely attachment — checking disk)`);
                       }
                     }
                     const fnDeadline = Date.now() + 20000;
@@ -4480,7 +4480,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
                     if (fnFile) {
                       const buf = fs.readFileSync(fnFile.path);
                       captured.set('bulk', { url: `file://${fnFile.path}`, ct: 'application/zip', buf, ts: Date.now() });
-                      console.log(` 🇱🇹 viesiejipirkimai: ✓ captured bulk ZIP via download() URL ${buf.length}B: "${fnFile.name}"`);
+                      console.log(`    🇱🇹 viesiejipirkimai: ✓ captured bulk ZIP via download() URL ${buf.length}B: "${fnFile.name}"`);
                       try { fs.unlinkSync(fnFile.path); } catch (_) {}
                       d.url = `file://${fnFile.path}`;
                       d._capturedBuf = buf;
@@ -4488,7 +4488,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
                       d.filename = fnFile.name;
                       continue;
                     }
-                    console.log(` ⚠️ viesiejipirkimai: download() URL goto produced no file within 20s — falling through to button retry`);
+                    console.log(`    ⚠️  viesiejipirkimai: download() URL goto produced no file within 20s — falling through to button retry`);
                   }
                 }
                 const retryClicked = await page.evaluate(() => {
@@ -4520,7 +4520,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
                   return null;
                 }).catch(() => null);
                 if (retryClicked) {
-                  console.log(` 🇱🇹 viesiejipirkimai: retry-clicked ${retryClicked} on confirmation page — waiting 15s`);
+                  console.log(`    🇱🇹 viesiejipirkimai: retry-clicked ${retryClicked} on confirmation page — waiting 15s`);
                   const retryDeadline = Date.now() + 15000;
                   let retryFile = null;
                   while (Date.now() < retryDeadline) {
@@ -4539,7 +4539,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
                   if (retryFile) {
                     const buf = fs.readFileSync(retryFile.path);
                     captured.set('bulk', { url: `file://${retryFile.path}`, ct: 'application/zip', buf, ts: Date.now() });
-                    console.log(` 🇱🇹 viesiejipirkimai: ✓ captured bulk ZIP via retry ${buf.length}B: "${retryFile.name}"`);
+                    console.log(`    🇱🇹 viesiejipirkimai: ✓ captured bulk ZIP via retry ${buf.length}B: "${retryFile.name}"`);
                     try { fs.unlinkSync(retryFile.path); } catch (_) {}
                     d.url = `file://${retryFile.path}`;
                     d._capturedBuf = buf;
@@ -4561,7 +4561,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
       // for authenticated variants we still try popup → PASIRINKTI flow.
       const isAnonymousFn = /ForAnonymous$/i.test(d.fnName);
 
-      // Snapshot files before click — handles both anonymous directly
+      // Snapshot files before click — handles both anonymous direct
       // download AND authenticated post-PASIRINKTI download.
       let filesBefore = [];
       try { filesBefore = fs.readdirSync(downloadDir); } catch (_) {}
@@ -4579,11 +4579,11 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
       }, d.docId, d.fnName, d.kind).catch(() => false);
 
       if (!clicked) {
-        console.log(` ⚠️ viesiejipirkimai: failed to click doc id=${d.docId} "${d.filename}" (kind=${d.kind})`);
+        console.log(`    ⚠️  viesiejipirkimai: failed to click doc id=${d.docId} "${d.filename}" (kind=${d.kind})`);
         // 2026-06-02 (Task #141) — diagnostic when click selector misses.
         // Run 69 tenderis 7918455: harvest detected button-type docs
-        // (viewCD/Pirkimo_documentai.zip) but click matcher couldn't find
-        // them. Dump visible buttons + their onclick attrs to find patterns
+        // (viewCD/Pirkimo_dokumentai.zip) but click matcher couldn't find
+        // them. Dump visible buttons + their onclick attrs to find pattern
         // mismatch (data-* attrs, event listeners, alternate ID format).
         try {
           const diag = await page.evaluate((needleId) => {
@@ -4602,11 +4602,11 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
             return { matches, sample, totalButtons: buttons.length };
           }, String(d.docId)).catch(() => null);
           if (diag) {
-            console.log(` click-fail diag: totalButtons=${diag.totalButtons}, matches=${diag.matches.length}`);
-            for (const m of diag.matches.slice(0, 3)) console.log(` match: ${m}`);
+            console.log(`       click-fail diag: totalButtons=${diag.totalButtons}, matches=${diag.matches.length}`);
+            for (const m of diag.matches.slice(0, 3)) console.log(`         match: ${m}`);
             if (diag.matches.length === 0) {
-              console.log(` (no element with onclick containing "${d.docId}"; sample of visible clickables:)`);
-              for (const s of diag.sample.slice(0, 5)) console.log(` sample: ${s}`);
+              console.log(`         (no element with onclick containing "${d.docId}"; sample of visible clickables:)`);
+              for (const s of diag.sample.slice(0, 5)) console.log(`         sample: ${s}`);
             }
           }
         } catch (_) {}
@@ -4637,14 +4637,14 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           try {
             const buf = fs.readFileSync(newFile.path);
             captured.set(d.docId, { url: `file://${newFile.path}`, ct: '', buf, ts: Date.now() });
-            console.log(` 🇱🇹 viesiejipirkimai: ✓ captured ${buf.length}B from disk (anonymous): "${newFile.name}"`);
+            console.log(`    🇱🇹 viesiejipirkimai: ✓ captured ${buf.length}B from disk (anonymous): "${newFile.name}"`);
             try { fs.unlinkSync(newFile.path); } catch (_) {}
             continue;
           } catch (e) {
-            console.log(` ⚠️ viesiejipirkimai: failed to read anonymous download "${newFile.name}": ${e.message}`);
+            console.log(`    ⚠️  viesiejipirkimai: failed to read anonymous download "${newFile.name}": ${e.message}`);
           }
         } else {
-          console.log(` ⚠️ viesiejipirkimai: anonymous click id=${d.docId} didn't produce download within 10s`);
+          console.log(`    ⚠️  viesiejipirkimai: anonymous click id=${d.docId} didn't produce download within 10s`);
         }
         continue;
       }
@@ -4676,7 +4676,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         });
 
       if (matchedPopup) {
-        // Snapshot files BEFORE sample so we can detect new downloads.
+        // Snapshot files BEFORE probe so we can detect new downloads.
         let filesBefore = [];
         try { filesBefore = fs.readdirSync(downloadDir); } catch (_) {}
 
@@ -4708,22 +4708,22 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
             const buf = fs.readFileSync(newFile.path);
             captured.set(d.docId, {
               url: `file://${newFile.path}`,
-              ct: '', // we'll detect by magic bytes downstream
-              buf
+              ct: '',  // we'll detect by magic bytes downstream
+              buf,
               ts: Date.now(),
             });
-            console.log(` 🇱🇹 viesiejipirkimai: ✓ captured ${buf.length}B from disk: "${newFile.name}" (id=${d.docId})`);
+            console.log(`    🇱🇹 viesiejipirkimai: ✓ captured ${buf.length}B from disk: "${newFile.name}" (id=${d.docId})`);
             // Cleanup — delete the downloaded file
             try { fs.unlinkSync(newFile.path); } catch (_) {}
             // Skip the candidate-fetch loop below
             continue;
           } catch (e) {
-            console.log(` ⚠️ viesiejipirkimai: failed to read downloaded file "${newFile.name}": ${e.message}`);
+            console.log(`    ⚠️  viesiejipirkimai: failed to read downloaded file "${newFile.name}": ${e.message}`);
           }
         }
 
         if (dlCandidates.length) {
-          console.log(` 🇱🇹 viesiejipirkimai: popup probe found ${dlCandidates.length} download candidate(s) for id=${d.docId}`);
+          console.log(`    🇱🇹 viesiejipirkimai: popup probe found ${dlCandidates.length} download candidate(s) for id=${d.docId}`);
           // Try each candidate until one returns binary
           for (const dc of dlCandidates.slice(0, 5)) {
             const dlStart = Date.now();
@@ -4739,23 +4739,23 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
             if (fetchResult && fetchResult.ok && fetchResult.data && fetchResult.data.length > 500) {
               const buf = Buffer.from(fetchResult.data);
               const b0 = buf[0], b1 = buf[1], b2 = buf[2], b3 = buf[3];
-              const isBin = (b0 === 0x25 && b1 === 0x50) || //PDF
-                            (b0 === 0x50 && b1 === 0x4B) || // ZIP/DOCX
-                            (b0 === 0xD0 && b1 === 0xCF); // legacy Office
+              const isBin = (b0 === 0x25 && b1 === 0x50) ||  // PDF
+                            (b0 === 0x50 && b1 === 0x4B) ||  // ZIP/DOCX
+                            (b0 === 0xD0 && b1 === 0xCF);    // legacy Office
               if (isBin) {
                 captured.set(d.docId, {
-                  URL: fetchResult.url,
+                  url: fetchResult.url,
                   ct: fetchResult.ct,
-                  buf
+                  buf,
                   ts: Date.now(),
                 });
-                console.log(` 🇱🇹 viesiejipirkimai: ✓ fetched ${buf.length}B from popup → ${dc.url.slice(-80)}`);
+                console.log(`    🇱🇹 viesiejipirkimai: ✓ fetched ${buf.length}B from popup → ${dc.url.slice(-80)}`);
                 break;
               }
             }
           }
         } else {
-          console.log(` ⚠️ viesiejipirkimai: popup loaded for id=${d.docId} but no download URL found inside`);
+          console.log(`    ⚠️  viesiejipirkimai: popup loaded for id=${d.docId} but no download URL found inside`);
           // Diagnostic — dump popup state. Show more body + ALL buttons.
           try {
             const popupDiag = await matchedPopup.evaluate(() => {
@@ -4784,20 +4784,20 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
               return { url: location.href, body, anchors, buttons };
             }).catch(() => null);
             if (popupDiag) {
-              console.log(` popup URL: ${popupDiag.url.slice(-100)}`);
-              console.log(` popup body (first 800ch): ${popupDiag.body.slice(0, 800)}`);
+              console.log(`         popup URL: ${popupDiag.url.slice(-100)}`);
+              console.log(`         popup body (first 800ch): ${popupDiag.body.slice(0, 800)}`);
               if (popupDiag.buttons.length) {
-                console.log(` popup buttons (${popupDiag.buttons.length}):`);
+                console.log(`         popup buttons (${popupDiag.buttons.length}):`);
                 for (const b of popupDiag.buttons) {
                   const oc = b.onclick ? ` onclick="${b.onclick}"` : '';
-                  console.log(` <${b.tag}${b.type ? ' type=' + b.type : ''}${b.disabled ? ' DISABLED' : ''}> "${b.text}"${oc}`);
+                  console.log(`           <${b.tag}${b.type ? ' type=' + b.type : ''}${b.disabled ? ' DISABLED' : ''}> "${b.text}"${oc}`);
                 }
               }
               if (popupDiag.anchors.length) {
-                console.log(` popup anchors (${popupDiag.anchors.length}):`);
+                console.log(`         popup anchors (${popupDiag.anchors.length}):`);
                 for (const a of popupDiag.anchors) {
                   const oc = a.onclick ? ` onclick="${a.onclick}"` : '';
-                  console.log(` "${a.text}" → ${a.href}${oc}`);
+                  console.log(`           "${a.text}" → ${a.href}${oc}`);
                 }
               }
             }
@@ -4805,12 +4805,12 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         }
       }
 
-      // 2026-06-08 (Task #179) — DIRECT URL FALLBACK.
+      // 2026-06-08 (Task #179) — DIRECT-URL FALLBACK.
       // Kai popup'as neturi download URL viduje (eAssociateUser.do confirmation
       // page tik su Atšaukti/closeForm buttons), bandom tiesioginį
       // downloadContractDocument.do URL'ą. Log'e matėm, kad pagrindinio puslapio
       // anchor'as faktiškai turi:
-      // "OneDrive_xxx.zip" → /epps/cft/downloadContractDocument.do?documentId=<docId>&resourceId=<resId>
+      //   "OneDrive_xxx.zip" → /epps/cft/downloadContractDocument.do?documentId=<docId>&resourceId=<resId>
       // Fetch'inam su page kontekstu (session cookies), check'inam binary magic.
       if (!captured.has(d.docId) && resourceId && d.docId) {
         const directUrl = `https://viesiejipirkimai.lt/epps/cft/downloadContractDocument.do?documentId=${encodeURIComponent(d.docId)}&resourceId=${encodeURIComponent(resourceId)}`;
@@ -4827,35 +4827,35 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           if (directResult && directResult.ok && directResult.data && directResult.data.length > 500) {
             const buf = Buffer.from(directResult.data);
             const b0 = buf[0], b1 = buf[1];
-            const isBin = (b0 === 0x25 && b1 === 0x50) || //PDF
-                          (b0 === 0x50 && b1 === 0x4B) || // ZIP/DOCX/XLSX
-                          (b0 === 0xD0 && b1 === 0xCF); // legacy Office
+            const isBin = (b0 === 0x25 && b1 === 0x50) ||  // PDF
+                          (b0 === 0x50 && b1 === 0x4B) ||  // ZIP/DOCX/XLSX
+                          (b0 === 0xD0 && b1 === 0xCF);    // legacy Office
             if (isBin) {
               captured.set(d.docId, {
-                URL: directResult.url
+                url: directResult.url,
                 ct: directResult.ct,
-                buf
+                buf,
                 ts: Date.now(),
               });
-              console.log(` 🇱🇹 viesiejipirkimai: ✓ DIRECT URL fallback ${buf.length}B for id=${d.docId} (resourceId=${resourceId})`);
+              console.log(`    🇱🇹 viesiejipirkimai: ✓ DIRECT URL fallback ${buf.length}B for id=${d.docId} (resourceId=${resourceId})`);
             } else {
-              console.log(` ⚠️ viesiejipirkimai: direct URL returned non-binary (magic=${buf.slice(0, 4).toString('hex')}, ${buf.length}B, ct=${directResult.ct.slice(0, 60)})`);
+              console.log(`    ⚠️  viesiejipirkimai: direct URL returned non-binary (magic=${buf.slice(0, 4).toString('hex')}, ${buf.length}B, ct=${directResult.ct.slice(0, 60)})`);
             }
           } else {
             const reason = directResult?.error || `status=${directResult?.status || '?'}`;
-            console.log(` ⚠️ viesiejipirkimai: direct URL fetch failed (${reason}) for id=${d.docId}`);
+            console.log(`    ⚠️  viesiejipirkimai: direct URL fetch failed (${reason}) for id=${d.docId}`);
           }
         } catch (e) {
-          console.log(` ⚠️ viesiejipirkimai: direct URL fallback threw: ${(e.message || '').slice(0, 80)}`);
+          console.log(`    ⚠️  viesiejipirkimai: direct URL fallback threw: ${(e.message || '').slice(0, 80)}`);
         }
       }
 
       if (!captured.has(d.docId)) {
         const recentReqs = allEppsRequests.filter((r) => r.ts >= tStart);
         if (recentReqs.length) {
-          console.log(` ⚠️ viesiejipirkimai: clicked id=${d.docId} — no binary captured, ${recentReqs.length} /epps/ request(s) seen (popup found=${!!matchedPopup})`);
+          console.log(`    ⚠️  viesiejipirkimai: clicked id=${d.docId} — no binary captured, ${recentReqs.length} /epps/ request(s) seen (popup found=${!!matchedPopup})`);
         } else {
-          console.log(` ⚠️ viesiejipirkimai: clicked id=${d.docId} — NO /epps/ requests at all`);
+          console.log(`    ⚠️  viesiejipirkimai: clicked id=${d.docId} — NO /epps/ requests at all`);
         }
       }
     }
@@ -4867,7 +4867,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
     browser.off('targetcreated', targetCreatedHandler);
     page.removeAllListeners('response');
     try {
-      // Best effort: remove the temp download dir + any leftover files
+      // Best-effort: remove the temp download dir + any leftover files
       const remaining = fs.readdirSync(downloadDir);
       for (const f of remaining) {
         try { fs.unlinkSync(pathLib.join(downloadDir, f)); } catch (_) {}
@@ -4890,7 +4890,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
     Array.prototype.push.apply(allDocs, usable);
 
     if (!allDocs.length) {
-      // Enhanced diagnostic dump — show what's ACTUALLY on the page like this
+      // Enhanced diagnostic dump — show what's ACTUALLY on the page so
       // we can refine selectors. Captures: current URL, total anchor
       // count, top anchors, elements with onclick (likely doc triggers),
       // table rows, iframes.
@@ -4935,54 +4935,54 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         };
       }).catch(() => ({ anchors: [], onclicks: [], tableRows: [], iframes: [] }));
 
-      console.log(` ⚠️ viesiejipirkimai: 0 file anchors after click/dump (resourceId=${resourceId})`);
-      console.log(` current URL: ${(diag.url || '').slice(-100)}`);
-      console.log(` total: ${diag.totalAnchors} anchors, ${diag.totalOnclicks} onclick elements, ${diag.iframes?.length || 0} iframes, frames=${frames.length}`);
+      console.log(`    ⚠️  viesiejipirkimai: 0 file anchors after click/dump (resourceId=${resourceId})`);
+      console.log(`       current URL: ${(diag.url || '').slice(-100)}`);
+      console.log(`       total: ${diag.totalAnchors} anchors, ${diag.totalOnclicks} onclick elements, ${diag.iframes?.length || 0} iframes, frames=${frames.length}`);
       if (diag.iframes && diag.iframes.length) {
         for (const f of diag.iframes) {
-          console.log(` iframe[${f.id || '?'}] src="${(f.src || '').slice(0, 80)}"`);
+          console.log(`       iframe[${f.id || '?'}] src="${(f.src || '').slice(0, 80)}"`);
         }
       }
-      console.log(` top anchors (${diag.anchors.length}):`);
+      console.log(`       top anchors (${diag.anchors.length}):`);
       for (const a of diag.anchors.slice(0, 25)) {
         const oc = a.onclick ? ` onclick="${a.onclick.slice(0, 50)}"` : '';
-        console.log(` "${a.text}" → ${a.href}${oc}`);
+        console.log(`         "${a.text}" → ${a.href}${oc}`);
       }
       if (diag.onclicks && diag.onclicks.length) {
-        console.log(` non-anchor onclicks (${diag.onclicks.length}):`);
+        console.log(`       non-anchor onclicks (${diag.onclicks.length}):`);
         for (const o of diag.onclicks.slice(0, 15)) {
-          console.log(` <${o.tag}> "${o.text}" onclick="${o.onclick}"`);
+          console.log(`         <${o.tag}> "${o.text}" onclick="${o.onclick}"`);
         }
       }
       if (diag.tableRows && diag.tableRows.length) {
-        console.log(` visible table rows (${diag.tableRows.length}):`);
+        console.log(`       visible table rows (${diag.tableRows.length}):`);
         for (const t of diag.tableRows) {
-          console.log(` tr: "${t}"`);
+          console.log(`         tr: "${t}"`);
         }
       }
       return [];
     }
 
-    console.log(` 🇱🇹 viesiejipirkimai: ${allDocs.length} doc(s) captured (resourceId=${resourceId})`);
+    console.log(`    🇱🇹 viesiejipirkimai: ${allDocs.length} doc(s) captured (resourceId=${resourceId})`);
     for (const d of allDocs.slice(0, 6)) {
-      console.log(` doc id=${d.docId} "${(d.filename || d.text).slice(0, 60)}" url=${(d.url || '').slice(-80)} bytes=${d._capturedBuf?.length || 0}`);
+      console.log(`       doc id=${d.docId} "${(d.filename || d.text).slice(0, 60)}" url=${(d.url || '').slice(-80)} bytes=${d._capturedBuf?.length || 0}`);
     }
 
     // STEP 5 — parse the captured binaries. We already have the bytes
     // from the in-browser click + page.on('response') interceptor —
-    // No second fetch needed.
+    // no second fetch needed.
     let pdfParseLib = null, mammothLib = null, XLSXLib = null, AdmZipLib = null;
     try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-    try { mammothLib = require('mammoth'); } catch (_) {}
-    try { XLSXLib = require('xlsx'); } catch (_) {}
-    try { AdmZipLib = require('adm-zip'); } catch (_) {}
+    try { mammothLib  = require('mammoth');   } catch (_) {}
+    try { XLSXLib     = require('xlsx');      } catch (_) {}
+    try { AdmZipLib   = require('adm-zip');   } catch (_) {}
 
     const texts = [];
     const MAX_DOCS = 6;
     for (const doc of allDocs.slice(0, MAX_DOCS)) {
       const labelName = (doc.filename || doc.text || `doc-${doc.docId}`).slice(0, 100);
       // Use captured bytes (set by response interceptor above). Fall back
-      // to fetch() if for some reason the click didn't capture (eg, the
+      // to fetch() if for some reason the click didn't capture (e.g., the
       // click opened a popup we couldn't trace).
       let resultData = null;
       let resultCt = '';
@@ -5000,7 +5000,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
         }, doc.url).catch((e) => ({ ok: false, error: e.message }));
         if (!result || !result.ok || !result.data || result.data.length < 500) {
-          console.log(` ⚠️ viesiejipirkimai: fetch failed "${labelName.slice(0, 40)}" (status=${result?.status || '?'})`);
+          console.log(`    ⚠️  viesiejipirkimai: fetch failed "${labelName.slice(0, 40)}" (status=${result?.status || '?'})`);
           continue;
         }
         resultData = result.data;
@@ -5008,7 +5008,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
       }
       const result = { data: resultData, ct: resultCt };
       if (!result.data || result.data.length < 500) {
-        console.log(` ⚠️ viesiejipirkimai: empty/tiny content for "${labelName.slice(0, 40)}"`);
+        console.log(`    ⚠️  viesiejipirkimai: empty/tiny content for "${labelName.slice(0, 40)}"`);
         continue;
       }
       const buf = Buffer.from(result.data);
@@ -5024,10 +5024,10 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           fmt = 'PDF';
         } else if (isZip) {
           // ZIP magic could mean three different things:
-          // (a) Single DOCX file (Office Open XML — DOCX is technically a ZIP)
-          // (b) Single XLSX file (also a ZIP container)
-          // (c) Generic ZIP archive bundling many files (CVPP bulk
-          // "Pirkimo documentai.zip" — PDF + DOCX + XML siblings).
+          //   (a) Single DOCX file (Office Open XML — DOCX is technically a ZIP)
+          //   (b) Single XLSX file (also a ZIP container)
+          //   (c) Generic ZIP archive bundling many files (CVPP bulk
+          //       "Pirkimo dokumentai.zip" — PDF + DOCX + XML siblings).
           //
           // CVPP bulk downloads are case (c) — filenames like
           // "1008_8083405.zip", which are NOT valid DOCX/XLSX. Mammoth
@@ -5055,7 +5055,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
           // request, technical annexes, price tables, contract templates).
           //
           // 2026-06-03 (Task #150) — NESTED ZIP recursion. CVPP often
-          // wraps the actual ToR docs in an inner "Pirkimo documentai.zip"
+          // wraps the actual ToR docs in an inner "Pirkimo dokumentai.zip"
           // file (run 73 examples: Teisės aktų 7942837, Duomenų valdymo
           // 7824033). Without recursion we get 6-7K ch of placeholder
           // text from the outer wrapper and miss the 100K+ ch ToR inside.
@@ -5077,7 +5077,7 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
                 const { buf: zbuf, depth, pathPrefix } = queue.shift();
                 let zip;
                 try { zip = new AdmZipLib(zbuf); } catch (e) {
-                  console.log(` ⚠️ viesiejipirkimai: zip open failed at depth=${depth}: ${(e.message || '').slice(0, 80)}`);
+                  console.log(`    ⚠️  viesiejipirkimai: zip open failed at depth=${depth}: ${(e.message || '').slice(0, 80)}`);
                   continue;
                 }
                 const entries = zip.getEntries().filter((e) => !e.isDirectory);
@@ -5110,12 +5110,12 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
                     const innerClipped = innerTxt.slice(0, 60000);
                     const labelPath = pathPrefix + z.entryName.slice(-100);
                     parts.push(`--- ${labelPath} ---\n${innerClipped}`);
-                    console.log(` 📦 zip entry "${labelPath.slice(-80)}" (${innerBytes.length}B → ${innerClipped.length}ch, depth=${depth})`);
+                    console.log(`    📦 zip entry "${labelPath.slice(-80)}" (${innerBytes.length}B → ${innerClipped.length}ch, depth=${depth})`);
                     processedEntries++;
                   }
                 }
                 // 2) Queue nested .zip entries for next level (only at
-                // depth < 1 → max 2 levels total)
+                //    depth < 1 → max 2 levels total)
                 if (depth < 1) {
                   const nestedZips = entries
                     .filter((e) => RX_INNER_ZIP.test(e.entryName))
@@ -5123,14 +5123,14 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
                   for (const z of nestedZips) {
                     try {
                       const nestedBytes = z.getData();
-                      console.log(` 📦 nested ZIP "${z.entryName.slice(-80)}" (${nestedBytes.length}B) — recursing to depth ${depth + 1}`);
+                      console.log(`    📦 nested ZIP "${z.entryName.slice(-80)}" (${nestedBytes.length}B) — recursing to depth ${depth + 1}`);
                       queue.push({
                         buf: nestedBytes,
                         depth: depth + 1,
                         pathPrefix: pathPrefix + z.entryName + '/',
                       });
                     } catch (e) {
-                      console.log(` ⚠️ nested zip read failed for "${z.entryName.slice(-60)}": ${(e.message || '').slice(0, 60)}`);
+                      console.log(`    ⚠️  nested zip read failed for "${z.entryName.slice(-60)}": ${(e.message || '').slice(0, 60)}`);
                     }
                   }
                 }
@@ -5138,12 +5138,12 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
               text = parts.join('\n\n').trim();
               if (text.length > 100) fmt = `ZIP-bundle(${parts.length})`;
             } catch (e) {
-              console.log(` ⚠️ viesiejipirkimai: adm-zip parse failed for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+              console.log(`    ⚠️  viesiejipirkimai: adm-zip parse failed for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
             }
           }
         }
       } catch (e) {
-        console.log(` ⚠️ viesiejipirkimai: parse error "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 60)}`);
+        console.log(`    ⚠️  viesiejipirkimai: parse error "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 60)}`);
       }
       if (text && text.length > 100) {
         // ZIP bundles aggregate many inner docs — give them more room
@@ -5152,21 +5152,21 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
         const isBundle = String(fmt).startsWith('ZIP-bundle');
         const clipped = text.slice(0, isBundle ? 200000 : 80000);
         texts.push(`--- (viesiejipirkimai ${fmt}) ${labelName} ---\n${clipped}`);
-        console.log(` 🇱🇹 viesiejipirkimai: parsed ${fmt} "${labelName}" (${buf.length}B → ${clipped.length}ch)`);
+        console.log(`    🇱🇹 viesiejipirkimai: parsed ${fmt} "${labelName}" (${buf.length}B → ${clipped.length}ch)`);
         // 2026-06-02 (Task #143) — collect for Drive upload. Only the OUTER
         // file (the ZIP container or single PDF/DOCX). Inner ZIP entries
         // are parsed for AI text but the bundle is what the user wants in
         // Drive (one file per source row, not 10+ extracted children).
         _collectDriveFile(labelName, buf);
       } else {
-        console.log(` ⚠️ viesiejipirkimai: extracted text too short for "${labelName}" (${text.length}ch, fmt=${fmt})`);
+        console.log(`    ⚠️  viesiejipirkimai: extracted text too short for "${labelName}" (${text.length}ch, fmt=${fmt})`);
       }
     }
     return texts;
   } catch (e) {
-    console.log(` ⚠️ viesiejipirkimai handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  viesiejipirkimai handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -5179,12 +5179,12 @@ async function fetchViesiejiPirkimaiDocuments(browser, sourceUrl) {
 // URL pattern: /supplier/enterprises/0/tendering-workspaces/<id>/...
 //
 // Flow:
-// 1. Page loads with login-gated content (handled by upstream
-// attemptPortalLogin — creds in PORTAL_CREDS_JSON)
-// 2. Post login: SPA hydrates, shows tender workspace tabs
-// 3. Procurement documents live in a "Documents" / "Documents de
-// marché" / "Opdrachtdocumenten" tab. Click it to load file list.
-// 4. Files are listed as anchors or "Télécharger" buttons.
+//   1. Page loads with login-gated content (handled by upstream
+//      attemptPortalLogin — creds in PORTAL_CREDS_JSON)
+//   2. Post-login: SPA hydrates, shows tender workspace tabs
+//   3. Procurement documents live in a "Documents" / "Documents de
+//      marché" / "Opdrachtdocumenten" tab. Click it to load file list.
+//   4. Files are listed as anchors or "Télécharger" buttons.
 //
 // Strategy mirrors fetchArtifikDocuments: capture /api/* JSON during
 // SPA navigation + click Documents tab + harvest anchors with diagnostic.
@@ -5202,21 +5202,21 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
     }
   } catch (_) { return []; }
 
-  // 2026-06-04 (Task #166) — bare URL fallback. Mercell hands us
+  // 2026-06-04 (Task #166) — bare-URL fallback. Mercell hands us
   // https://www.publicprocurement.be without tender ID for 3/run.
-  // Try to resolve via search using ctx.referenceNumber (eg "2026/2237").
+  // Try to resolve via search using ctx.referenceNumber (e.g. "2026/2237").
   // BE portal is Angular SPA; standard search URL pattern is the
   // tendering-workspaces list with searchTerm query parameter.
   if (isBareUrl) {
     const ref = (ctx.referenceNumber || '').trim();
     if (!ref) {
-      console.log(` 🇧🇪 publicprocurement.be: bare URL + no referenceNumber → skipping`);
+      console.log(`    🇧🇪 publicprocurement.be: bare URL + no referenceNumber → skipping`);
       return [];
     }
     // Standard SPA search URLs to try (in order). First match with a
     // visible result anchor → navigate to it (which becomes the new
     // sourceUrl for the rest of this handler).
-    console.log(` 🇧🇪 publicprocurement.be: bare URL — trying search with ref="${ref}"`);
+    console.log(`    🇧🇪 publicprocurement.be: bare URL — trying search with ref="${ref}"`);
     let probe = null;
     try {
       probe = await browser.newPage();
@@ -5236,7 +5236,7 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
           await new Promise((r) => setTimeout(r, 3000));
           const curUrl = probe.url();
           if (/keycloak|openid-connect\/auth|\/auth\/realms/i.test(curUrl)) {
-            console.log(` 🇧🇪 publicprocurement.be: search hit Keycloak — needs login first (will retry post-auth)`);
+            console.log(`    🇧🇪 publicprocurement.be: search hit Keycloak — needs login first (will retry post-auth)`);
             break;
           }
           // Look for a link to a specific tender workspace.
@@ -5252,16 +5252,16 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
             return null;
           }).catch(() => null);
           if (resolvedUrl) {
-            console.log(` 🇧🇪 publicprocurement.be: search resolved → ${resolvedUrl.slice(-100)}`);
+            console.log(`    🇧🇪 publicprocurement.be: search resolved → ${resolvedUrl.slice(-100)}`);
             break;
           }
         } catch (e) {
-          console.log(` 🇧🇪 publicprocurement.be: search probe failed (${su.slice(-60)}): ${(e.message || '').slice(0, 60)}`);
+          console.log(`    🇧🇪 publicprocurement.be: search probe failed (${su.slice(-60)}): ${(e.message || '').slice(0, 60)}`);
         }
       }
       try { await probe.close(); } catch (_) {}
       if (!resolvedUrl) {
-        console.log(` 🇧🇪 publicprocurement.be: search returned 0 matches for "${ref}"`);
+        console.log(`    🇧🇪 publicprocurement.be: search returned 0 matches for "${ref}"`);
         return [];
       }
       // Replace sourceUrl with resolved deep-link — rest of handler
@@ -5269,16 +5269,16 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
       sourceUrl = resolvedUrl;
     } catch (e) {
       try { if (probe) await probe.close(); } catch (_) {}
-      console.log(` 🇧🇪 publicprocurement.be: search flow threw: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇧🇪 publicprocurement.be: search flow threw: ${(e.message || '').slice(0, 80)}`);
       return [];
     }
   }
 
   let pdfParseLib = null, mammothLib = null, XLSXLib = null, admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-  try { mammothLib = require('mammoth'); } catch (_) {}
-  try { XLSXLib = require('xlsx'); } catch (_) {}
-  try { admZipLib = require('adm-zip'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { XLSXLib     = require('xlsx');      } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
 
   // CDP download capture — the BE bulk "Download all documents" button
   // streams a server-zipped bundle via Content-Disposition:attachment,
@@ -5320,7 +5320,7 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
 
     // Capture tender-specific API JSON responses (Angular SPA fetches
     // attachments via REST). We INTENTIONALLY exclude Mercell
-    // user management / notification services that the same SPA also
+    // user-management / notification services that the same SPA also
     // talks to — those are session metadata, not tender data, and
     // produce identical 30KB+ payloads across every tender.
     const apiResponses = [];
@@ -5354,16 +5354,16 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
     });
 
     // Compute the target URL BEFORE first navigation. Two transforms:
-    // (1) Substitute the active-enterprise placeholder `/enterprises/0/`
-    // with the supplier's real numeric enterprise ID. The BOSA
-    // eProcurement SPA refuses to render publication-workspaces
-    // under `/0/` and hard-redirects to /enterprises/overview to
-    // force the user to pick an enterprise. The real numeric ID
-    // (assigned after company registration) MUST be in the path.
-    // Configurable via BE_ENTERPRISE_ID env; default 872560 (CCT,
-    // the registered supplier for the scraper's BOSA account).
-    // (2) Swap trailing /general → /documents so we land directly on
-    // the documents view (saves an extra navigation + tab click).
+    //   (1) Substitute the active-enterprise placeholder `/enterprises/0/`
+    //       with the supplier's real numeric enterprise ID. The BOSA
+    //       eProcurement SPA refuses to render publication-workspaces
+    //       under `/0/` and hard-redirects to /enterprises/overview to
+    //       force the user to pick an enterprise. The real numeric ID
+    //       (assigned after company registration) MUST be in the path.
+    //       Configurable via BE_ENTERPRISE_ID env; default 872560 (CCT,
+    //       the registered supplier for the scraper's BOSA account).
+    //   (2) Swap trailing /general → /documents so we land directly on
+    //       the documents view (saves an extra navigation + tab click).
     const BE_ENTERPRISE_ID = (process.env.BE_ENTERPRISE_ID || '872560').trim();
     let targetUrl = sourceUrl;
     try {
@@ -5371,17 +5371,17 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
       targetUrl = targetUrl.replace(/\/tendering-workspaces\/(publication-workspace-detail|[^/]+)\/([0-9a-f-]{6,})\/(general|overview|summary)(\b|$)/i,
                                     '/tendering-workspaces/$1/$2/documents$4');
       if (targetUrl !== sourceUrl) {
-        console.log(` 🇧🇪 publicprocurement: redrote URL → /enterprises/${BE_ENTERPRISE_ID}/.../documents`);
+        console.log(`    🇧🇪 publicprocurement: rewrote URL → /enterprises/${BE_ENTERPRISE_ID}/.../documents`);
       }
     } catch (_) {}
 
     await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch((e) => {
-      console.log(` 🇧🇪 publicprocurement: nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇧🇪 publicprocurement: nav warn: ${(e.message || '').slice(0, 80)}`);
     });
     await new Promise((r) => setTimeout(r, 3500));
 
     // Post-auth deep-link recovery — if the SPA still dropped us off
-    // the tender workspace (eg session expired mid-flight, or the
+    // the tender workspace (e.g. session expired mid-flight, or the
     // enterprise ID was wrong and we got bounced to /enterprises/overview),
     // re-navigate once. This is a backstop; with the correct
     // BE_ENTERPRISE_ID the first goto should land us on the workspace.
@@ -5389,7 +5389,7 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
       const drifted = page.url();
       const onTender = /\/tendering-workspaces?\//i.test(drifted);
       if (!onTender && /\/tendering-workspaces?\//i.test(targetUrl)) {
-        console.log(` 🇧🇪 publicprocurement: SPA dropped deep link (landed on ${drifted.replace(/^https?:\/\/[^/]+/, '')}) — re-navigating`);
+        console.log(`    🇧🇪 publicprocurement: SPA dropped deep link (landed on ${drifted.replace(/^https?:\/\/[^/]+/, '')}) — re-navigating`);
         await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
         await new Promise((r) => setTimeout(r, 3000));
       }
@@ -5397,8 +5397,8 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
 
     // PREFERRED PATH — click the "Download all documents" Vuetify button.
     // The live page exposes a stable Vue test-id selector:
-    // button[data-cy="action-bar-item-Download all documents"]
-    // title="Download all documents"
+    //   button[data-cy="action-bar-item-Download all documents"]
+    //   title="Download all documents"
     // It streams a server-zipped bundle of ALL workspace docs via
     // Content-Disposition:attachment, captured by our CDP download config.
     let filesBefore = [];
@@ -5427,7 +5427,7 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
 
     let zipTexts = [];
     if (bulkButtonClicked) {
-      console.log(` 🇧🇪 publicprocurement: clicked bulk download (${bulkButtonClicked}) — waiting for ZIP`);
+      console.log(`    🇧🇪 publicprocurement: clicked bulk download (${bulkButtonClicked}) — waiting for ZIP`);
       // Wait up to 40s for ZIP (BE tender bundles can be 5-25MB)
       const watchDeadline = Date.now() + 40000;
       let newFile = null;
@@ -5449,7 +5449,7 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
       if (newFile && admZipLib) {
         try {
           const buf = fs.readFileSync(newFile.path);
-          console.log(` 🇧🇪 publicprocurement: ✓ captured bulk ZIP ${buf.length}B: "${newFile.name}"`);
+          console.log(`    🇧🇪 publicprocurement: ✓ captured bulk ZIP ${buf.length}B: "${newFile.name}"`);
           try { fs.unlinkSync(newFile.path); } catch (_) {}
           // Parse ZIP and extract text from common doc types
           try {
@@ -5472,24 +5472,24 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
               } catch (_) {}
               if (extracted && extracted.length > 100) {
                 // BE bundles often combine NL + FR + EN copies of the
-                // same cutlery; bump per entry cap so we keep one full
+                // same bestek; bump per-entry cap so we keep one full
                 // language version even with several siblings.
                 const clipped = extracted.slice(0, 60000);
                 zipTexts.push(`--- (zip:${newFile.name}) ${z.entryName} ---\n${clipped}`);
-                console.log(` 📦 zip entry "${z.entryName}" (${ext}, ${innerBytes.length}B → ${clipped.length}ch)`);
+                console.log(`    📦 zip entry "${z.entryName}" (${ext}, ${innerBytes.length}B → ${clipped.length}ch)`);
               }
             }
           } catch (e) {
-            console.log(` ⚠️ publicprocurement: ZIP parse failed: ${(e.message || '').slice(0, 80)}`);
+            console.log(`    ⚠️  publicprocurement: ZIP parse failed: ${(e.message || '').slice(0, 80)}`);
           }
         } catch (e) {
-          console.log(` ⚠️ publicprocurement: failed to read bulk ZIP: ${e.message}`);
+          console.log(`    ⚠️  publicprocurement: failed to read bulk ZIP: ${e.message}`);
         }
       } else if (!newFile) {
-        console.log(` ⚠️ publicprocurement: bulk click but no ZIP appeared within 40s — falling back to anchor scrape`);
+        console.log(`    ⚠️  publicprocurement: bulk click but no ZIP appeared within 40s — falling back to anchor scrape`);
       }
     } else {
-      console.log(` ℹ️ publicprocurement: "Download all documents" button not found — falling back to anchor scrape`);
+      console.log(`    ℹ️  publicprocurement: "Download all documents" button not found — falling back to anchor scrape`);
     }
 
     // If the bulk ZIP path worked, return early — we already have the
@@ -5505,12 +5505,12 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
     }
 
     // Click "Documents" tab — multilingual.
-    // FR: "Documents", "Documents de marché"
-    // NL: "Opdrachtdocumenten", "Documents"
-    // EN: "Procurement documents", "Documents"
-    // DE: "Order documents"
+    //   FR: "Documents", "Documents de marché"
+    //   NL: "Opdrachtdocumenten", "Documenten"
+    //   EN: "Procurement documents", "Documents"
+    //   DE: "Auftragsunterlagen"
     const tabClicked = await page.evaluate(() => {
-      const RE_TAB = /^\s*(documents?|documents?\s+de\s+march[ée]|procurement\s+documents?|opdrachtdocumenten|documenten|order documents|aanbestedingsdocumenten)\s*$/i;
+      const RE_TAB = /^\s*(documents?|documents?\s+de\s+march[ée]|procurement\s+documents?|opdrachtdocumenten|documenten|auftragsunterlagen|aanbestedingsdocumenten)\s*$/i;
       const cands = Array.from(document.querySelectorAll(
         'a, button, [role="tab"], [role="button"], li, span'
       ));
@@ -5524,7 +5524,7 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
       return null;
     }).catch(() => null);
     if (tabClicked) {
-      console.log(` 🇧🇪 publicprocurement: clicked "${tabClicked}" tab — waiting for content`);
+      console.log(`    🇧🇪 publicprocurement: clicked "${tabClicked}" tab — waiting for content`);
       await new Promise((r) => setTimeout(r, 3000));
       try { await page.waitForNetworkIdle({ idleTime: 1500, timeout: 8000 }); } catch (_) {}
     }
@@ -5534,7 +5534,7 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
     const anchors = await page.evaluate(() => {
       const RX_DL_EXT = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:\?|#|$)/i;
       const RX_DL_PATH = /\/(?:file|files|attachment|attachments|download|document-download|getDocument|asset)\/[^/]+/i;
-      const RX_DL_TEXT = /\b(t[ée]l[ée]charger|download|downloaden|download|atsisi[ųu]sti)\b/i;
+      const RX_DL_TEXT = /\b(t[ée]l[ée]charger|download|downloaden|herunterladen|atsisi[ųu]sti)\b/i;
       const out = [];
       const seen = new Set();
       for (const a of Array.from(document.querySelectorAll('a[href]'))) {
@@ -5564,11 +5564,11 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
       return out;
     }).catch(() => []);
 
-    console.log(` 🇧🇪 publicprocurement: ${anchors.length} doc anchor(s) detected, ${apiResponses.length} /api/* response(s) captured`);
+    console.log(`    🇧🇪 publicprocurement: ${anchors.length} doc anchor(s) detected, ${apiResponses.length} /api/* response(s) captured`);
 
     // Pretty-print a sample for visibility
     for (const a of anchors.slice(0, 6)) {
-      console.log(` doc: "${a.text.slice(0, 60)}" → ${(a.url || '').slice(-80)}`);
+      console.log(`       doc: "${a.text.slice(0, 60)}" → ${(a.url || '').slice(-80)}`);
     }
 
     // Fetch + parse downloadable anchors (skip __click__ placeholders for now)
@@ -5592,7 +5592,7 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
         } catch (e) { return { ok: false, error: String(e).slice(0, 200) }; }
       }, doc.url).catch(() => null);
       if (!result || !result.ok || !result.data || result.data.length < 500) {
-        console.log(` ⚠️ publicprocurement: fetch failed "${labelName.slice(0, 40)}" (status=${result?.status || '?'})`);
+        console.log(`    ⚠️  publicprocurement: fetch failed "${labelName.slice(0, 40)}" (status=${result?.status || '?'})`);
         continue;
       }
       const buf = Buffer.from(result.data);
@@ -5606,19 +5606,19 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
           try { const m = await mammothLib.extractRawText({ buffer: buf }); text = (m?.value || '').trim(); } catch (_) {}
         }
       } catch (e) {
-        console.log(` ⚠️ publicprocurement: parse error "${labelName}": ${(e.message || '').slice(0, 60)}`);
+        console.log(`    ⚠️  publicprocurement: parse error "${labelName}": ${(e.message || '').slice(0, 60)}`);
       }
       if (text && text.length > 100) {
         const clipped = text.slice(0, 60000);
         texts.push(`--- (publicprocurement) ${labelName} ---\n${clipped}`);
-        console.log(` 🇧🇪 publicprocurement: parsed ${fmt.toUpperCase()} "${labelName}" (${buf.length}B → ${clipped.length}ch)`);
+        console.log(`    🇧🇪 publicprocurement: parsed ${fmt.toUpperCase()} "${labelName}" (${buf.length}B → ${clipped.length}ch)`);
         _collectDriveFile(labelName, buf);
       }
     }
 
     // Fallback — if no anchors but API JSON has tender data, include it
     // verbatim so AI can extract from API metadata. We further drop
-    // localization/lookup endpoints (countries, currencies, NUTS, doc
+    // localisation/lookup endpoints (countries, currencies, NUTS, doc
     // type enums, enterprises/categories) — those are public reference
     // tables that bloat the payload without naming the tender. Without
     // this filter every BE row gets the same 30KB of dictionary JSON.
@@ -5632,9 +5632,9 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
     );
     const tenderApiResponses = apiResponses.filter((r) => !IS_LOOKUP_API(r.url));
     if (texts.length === 0 && tenderApiResponses.length > 0) {
-      console.log(` 🇧🇪 publicprocurement: no doc anchors but ${tenderApiResponses.length} tender API JSON response(s) — including verbatim for AI`);
+      console.log(`    🇧🇪 publicprocurement: no doc anchors but ${tenderApiResponses.length} tender API JSON response(s) — including verbatim for AI`);
       for (const r of tenderApiResponses.slice(0, 8)) {
-        console.log(` api: ${r.url.replace(/^https?:\/\/[^/]+/, '').slice(0, 120)} (${r.body.length}B)`);
+        console.log(`       api: ${r.url.replace(/^https?:\/\/[^/]+/, '').slice(0, 120)} (${r.body.length}B)`);
       }
       const out = ['--- (publicprocurement API JSON) ---'];
       let totalChars = 0;
@@ -5654,9 +5654,9 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
     } else if (texts.length === 0 && apiResponses.length > 0) {
       // We captured APIs but they were ALL lookup/reference data —
       // worth logging so we can iterate, but not appended to AI input.
-      console.log(` 🇧🇪 publicprocurement: ${apiResponses.length} API response(s) captured, but all are lookup/reference (no tender data) — skipping verbatim dump`);
+      console.log(`    🇧🇪 publicprocurement: ${apiResponses.length} API response(s) captured, but all are lookup/reference (no tender data) — skipping verbatim dump`);
       for (const r of apiResponses.slice(0, 6)) {
-        console.log(` lookup: ${r.url.replace(/^https?:\/\/[^/]+/, '').slice(0, 120)}`);
+        console.log(`       lookup: ${r.url.replace(/^https?:\/\/[^/]+/, '').slice(0, 120)}`);
       }
     }
 
@@ -5681,20 +5681,20 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
           };
         }).catch(() => null);
         if (diag) {
-          console.log(` 🇧🇪 publicprocurement: 0 docs harvested — diag:`);
-          console.log(` URL: ${diag.url.slice(-100)}`);
-          console.log(` title: "${diag.title}"`);
-          console.log(` tabs (${diag.tabs.length}): ${JSON.stringify(diag.tabs)}`);
-          console.log(` headings (${diag.headings.length}): ${JSON.stringify(diag.headings)}`);
+          console.log(`    🇧🇪 publicprocurement: 0 docs harvested — diag:`);
+          console.log(`       URL: ${diag.url.slice(-100)}`);
+          console.log(`       title: "${diag.title}"`);
+          console.log(`       tabs (${diag.tabs.length}): ${JSON.stringify(diag.tabs)}`);
+          console.log(`       headings (${diag.headings.length}): ${JSON.stringify(diag.headings)}`);
         }
       } catch (_) {}
     }
 
     return texts;
   } catch (e) {
-    console.log(` ⚠️ publicprocurement handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  publicprocurement handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
     // Clean up the BOSA download tempdir on any exit path (early
     // return from zipTexts handles it inline; this is for the anchor /
@@ -5712,37 +5712,37 @@ async function fetchPublicProcurementBeDocuments(browser, sourceUrl, ctx = {}) {
 // =====================================================================
 // community.vortal.biz Documents handler — Vortalskin/Vortal SaaS portal
 // used by Portuguese (PT1.NTC.*) and other regional public buyers.
-// The contract-notice-view page is a Vue/Vuetify SP A: a single deep-link
+// The contract-notice-view page is a Vue/Vuetify SPA: a single deep-link
 // URL like
-// https://community.vortal.biz/Public/contract-notice-view/PT1.NTC.3703261/?SkinName=VortalSkin1¤tLanguage=en
+//   https://community.vortal.biz/Public/contract-notice-view/PT1.NTC.3703261/?SkinName=VortalSkin1&currentLanguage=en
 // renders Summary → ManagingAuthority → Object of Contract A/B →
 // LegalEconomicFinancialAndTechnicalInformation (inline selection
 // criteria — the actual qualification text we want, often present even
 // before any docs are downloaded) → AvailableDocuments table.
 //
 // Strategy (no login — anonymous notice view is public):
-// 1) Two URL flavors from Mercell:
-// (a) /Public/contract-notice-view/<PT_ID>/... — direct deep-link
-// (b) /public/ (bare search URL) — needs search step
-// Confirmed by run 58: ALL three PT tenders had flavor (b) and
-// previous handler returned [] for them. For (b) we navigate to the
-// search page, type the buyer reference into "Reference/Title/Description",
-// click Search, then click Detail on the matching row to reach the
-// contract-notice-view URL.
-// 2) Force `currentLanguage=en` to keep the body text consistent.
-// 3) Wait for SPA hydration (Vuetify mounts a `.v-application` root;
-// AvailableDocuments table populates via XHR shortly after).
-// 4) Scroll the AvailableDocuments anchor into view so any lazy-loaded
-// child components render.
-// 5) Capture the full body innerText (40K cap) — this includes the
-// inline LegalEconomicFinancialAndTechnicalInformation section,
-// which by itself often satisfies the qualifications field.
-// 6) Harvest doc anchors from the AvailableDocuments section and fetch
-// each in-page (cookieful), parse PDF/DOCX/XLSX, append to output.
+//   1) Two URL flavours from Mercell:
+//      (a) /Public/contract-notice-view/<PT_ID>/...   — direct deep-link
+//      (b) /public/  (bare search URL)                — needs search step
+//      Confirmed by run 58: ALL three PT tenders had flavour (b) and
+//      previous handler returned [] for them. For (b) we navigate to the
+//      search page, type the buyer reference into "Reference/Title/Description",
+//      click Search, then click Detail on the matching row to reach the
+//      contract-notice-view URL.
+//   2) Force `currentLanguage=en` to keep the body text consistent.
+//   3) Wait for SPA hydration (Vuetify mounts a `.v-application` root;
+//      AvailableDocuments table populates via XHR shortly after).
+//   4) Scroll the AvailableDocuments anchor into view so any lazy-loaded
+//      child components render.
+//   5) Capture the full body innerText (40K cap) — this includes the
+//      inline LegalEconomicFinancialAndTechnicalInformation section,
+//      which by itself often satisfies the qualifications field.
+//   6) Harvest doc anchors from the AvailableDocuments section and fetch
+//      each in-page (cookieful), parse PDF/DOCX/XLSX, append to output.
 //
-// ctx = { referenceNumber, title } — propagated from the caller like this
-// flavor (b) can search. If back to title-keyword search if no
-// Reference is available.
+// ctx = { referenceNumber, title } — propagated from the caller so
+// flavour (b) can search. Falls back to title-keyword search if no
+// reference is available.
 async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
   let ptId = null;
   let isBarePublic = false;
@@ -5762,20 +5762,20 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
 
   const refNumber = (ctx.referenceNumber || '').trim();
   const tenderTitle = (ctx.title || '').trim();
-  // For bare /public/ flavor we MUST have a search term, otherwise the
+  // For bare /public/ flavour we MUST have a search term, otherwise the
   // search page will just show stale default results that aren't our tender.
   if (isBarePublic && !refNumber && !tenderTitle) {
-    console.log(` 🇵🇹 vortal: bare /public/ URL but no reference or title — skipping`);
+    console.log(`    🇵🇹 vortal: bare /public/ URL but no reference or title — skipping`);
     return [];
   }
 
   let pdfParseLib = null, mammothLib = null, XLSXLib = null, admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-  try { mammothLib = require('mammoth'); } catch (_) {}
-  try { XLSXLib = require('xlsx'); } catch (_) {}
-  try { admZipLib = require('adm-zip'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { XLSXLib     = require('xlsx');      } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
 
-  // Force English UI to stabilize body innerText across Portuguese /
+  // Force English UI to stabilise body innerText across Portuguese /
   // Spanish / Italian Vortal deployments.
   let pageUrl = sourceUrl;
   try {
@@ -5796,17 +5796,17 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
       await page.setUserAgent(ua.replace(/HeadlessChrome/i, 'Chrome'));
     } catch (_) {}
 
-    // ----- BARE /public/ FLAVOR: search-by-reference flow -----
+    // ----- BARE /public/ FLAVOUR: search-by-reference flow -----
     // Navigate to the search page, type the reference, submit, then click
     // Detail on the first matching row → that lands on contract-notice-view.
     if (isBarePublic) {
       const searchTerm = refNumber || tenderTitle;
       const searchUrl = 'https://community.vortal.biz/public?currentLanguage=en';
-      console.log(` 🇵🇹 vortal: bare /public/ — searching by "${searchTerm.slice(0, 60)}"`);
+      console.log(`    🇵🇹 vortal: bare /public/ — searching by "${searchTerm.slice(0, 60)}"`);
       try {
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
       } catch (e) {
-        console.log(` 🇵🇹 vortal: search nav warn: ${(e.message || '').slice(0, 80)}`);
+        console.log(`    🇵🇹 vortal: search nav warn: ${(e.message || '').slice(0, 80)}`);
       }
       try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 12000 }); }
       catch (_) {}
@@ -5821,7 +5821,7 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
         let target = null;
         for (const inp of inputs) {
           if (inp.offsetParent === null) continue;
-          // Check aria label, placeholder, name
+          // Check aria-label, placeholder, name
           const meta = `${inp.getAttribute('aria-label') || ''} ${inp.placeholder || ''} ${inp.name || ''}`;
           if (matchLabel.test(meta)) { target = inp; break; }
           // Check associated <label> via .v-input wrapper
@@ -5833,7 +5833,7 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
         }
         // Fallback: first visible text input
         if (!target) {
-          target = inputs.find((i) => i.offsetParent !== null) || zero;
+          target = inputs.find((i) => i.offsetParent !== null) || null;
         }
         if (!target) return { ok: false, reason: 'no-input' };
         try { target.focus(); } catch (_) {}
@@ -5847,11 +5847,11 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
         return { ok: true, name: target.name || target.getAttribute('aria-label') || target.placeholder || 'input' };
       }, searchTerm).catch((e) => ({ ok: false, reason: String(e).slice(0, 80) }));
 
-      if (!typedOK?.ok) {
-        console.log(` 🇵🇹 vortal: search input not found (${typedOk?.reason || 'unknown'}) — bailing`);
+      if (!typedOk?.ok) {
+        console.log(`    🇵🇹 vortal: search input not found (${typedOk?.reason || 'unknown'}) — bailing`);
         return [];
       }
-      console.log(` 🇵🇹 vortal: typed into "${typedOk.name}"`);
+      console.log(`    🇵🇹 vortal: typed into "${typedOk.name}"`);
 
       // Click the Search button. Match by text or by type=submit inside a form.
       const submitted = await page.evaluate(() => {
@@ -5872,13 +5872,13 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
         // Try pressing Enter on the input as a fallback
         try {
           await page.keyboard.press('Enter');
-          console.log(` 🇵🇹 vortal: Search button not found — pressed Enter`);
+          console.log(`    🇵🇹 vortal: Search button not found — pressed Enter`);
         } catch (_) {
-          console.log(` 🇵🇹 vortal: could not submit search — bailing`);
+          console.log(`    🇵🇹 vortal: could not submit search — bailing`);
           return [];
         }
       } else {
-        console.log(` 🇵🇹 vortal: clicked "${submitted.txt}"`);
+        console.log(`    🇵🇹 vortal: clicked "${submitted.txt}"`);
       }
 
       // Wait for results table to populate
@@ -5935,13 +5935,13 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
             }));
             return { body, rows, anchors };
           });
-          console.log(` 🇵🇹 vortal: 0 detail links found — rows=${diag.rows}, body="${diag.body.slice(0, 200)}", anchors=${JSON.stringify(diag.anchors).slice(0, 300)}`);
+          console.log(`    🇵🇹 vortal: 0 detail links found — rows=${diag.rows}, body="${diag.body.slice(0, 200)}", anchors=${JSON.stringify(diag.anchors).slice(0, 300)}`);
         } catch (_) {}
         return [];
       }
-      console.log(` 🇵🇹 vortal: found detail URL ${detailUrl.slice(0, 100)}`);
+      console.log(`    🇵🇹 vortal: found detail URL ${detailUrl.slice(0, 100)}`);
 
-      // Normalize + force English on the detail URL
+      // Normalise + force English on the detail URL
       try {
         const du = new URL(detailUrl);
         du.searchParams.set('currentLanguage', 'en');
@@ -5952,13 +5952,13 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
       } catch (_) {
         pageUrl = detailUrl;
       }
-      // Fall through to the deep link goto below
+      // Fall through to the deep-link goto below
     }
 
     try {
       await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e) {
-      console.log(` 🇵🇹 vortal: nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇵🇹 vortal: nav warn: ${(e.message || '').slice(0, 80)}`);
     }
     // Vue/Vuetify hydration + initial XHR for AvailableDocuments.
     try { await page.waitForNetworkIdle({ idleTime: 1200, timeout: 15000 }); }
@@ -5997,10 +5997,10 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
           .slice(0, 20);
         return { h1, sectionIds: sectionIds.slice(0, 20), anchorTargets };
       }).catch(() => ({}));
-      console.log(` 🇵🇹 vortal: PT_ID=${ptId} h1="${diag.h1 || ''}" sections=${(diag.sectionIds || []).length} sidebar=${(diag.anchorTargets || []).length}`);
+      console.log(`    🇵🇹 vortal: PT_ID=${ptId} h1="${diag.h1 || ''}" sections=${(diag.sectionIds || []).length} sidebar=${(diag.anchorTargets || []).length}`);
     } catch (_) {}
 
-    // Capture the fully-rendered body innerText. Contract notice view
+    // Capture the fully-rendered body innerText. Contract-notice-view
     // pages on Vortal embed the entire LegalEconomicFinancialAndTechnical
     // selection criteria inline; in many tenders this body text by itself
     // is sufficient even when no doc anchors surface.
@@ -6035,14 +6035,14 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
       return out;
     }).catch(() => []);
 
-    console.log(` 🇵🇹 vortal: PT_ID=${ptId} — body=${bodyText.length}ch, ${docHrefs.length} doc anchor(s) in AvailableDocuments`);
+    console.log(`    🇵🇹 vortal: PT_ID=${ptId} — body=${bodyText.length}ch, ${docHrefs.length} doc anchor(s) in AvailableDocuments`);
 
     const out = [];
     if (bodyText && bodyText.length > 800) {
       out.push(`--- (vortal contract-notice-view, PT_ID=${ptId}) ---\n${bodyText.slice(0, 40000)}`);
     }
 
-    // Fetch each document in-page (cookieful, same-origin). Cap totally
+    // Fetch each document in-page (cookieful, same-origin). Cap total
     // appended doc content at 80K — typical Vortal notices have 2-6 small
     // PDFs with the same content as the inline body anyway.
     const TOTAL_DOC_CAP = 80000;
@@ -6061,7 +6061,7 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
           } catch (e) { return { ok: false, err: String(e).slice(0, 100) }; }
         }, href).catch(() => null);
         if (!fetched || !fetched.ok) {
-          console.log(` 🇵🇹 vortal: ${label.slice(0, 40)} fetch failed (${fetched?.status || fetched?.err || 'unknown'})`);
+          console.log(`    🇵🇹 vortal: ${label.slice(0, 40)} fetch failed (${fetched?.status || fetched?.err || 'unknown'})`);
           continue;
         }
         const buf = Buffer.from(fetched.bytes);
@@ -6133,24 +6133,24 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
           const chunk = text.slice(0, Math.min(PER_DOC_CAP, remaining));
           out.push(`--- (vortal doc: ${label.slice(0, 80)}) ---\n${chunk}`);
           docTotal += chunk.length;
-          console.log(` 🇵🇹 vortal: ${label.slice(0, 40)} → ${chunk.length}ch`);
+          console.log(`    🇵🇹 vortal: ${label.slice(0, 40)} → ${chunk.length}ch`);
         } else {
-          console.log(` 🇵🇹 vortal: ${label.slice(0, 40)} → unparseable (${buf.length}b)`);
+          console.log(`    🇵🇹 vortal: ${label.slice(0, 40)} → unparseable (${buf.length}b)`);
         }
       } catch (e) {
-        console.log(` 🇵🇹 vortal: doc fetch error: ${(e.message || '').slice(0, 80)}`);
+        console.log(`    🇵🇹 vortal: doc fetch error: ${(e.message || '').slice(0, 80)}`);
       }
     }
 
     if (!out.length) {
-      console.log(` 🇵🇹 vortal: PT_ID=${ptId} — no body or doc content captured`);
+      console.log(`    🇵🇹 vortal: PT_ID=${ptId} — no body or doc content captured`);
       return [];
     }
     return [out.join('\n\n')];
   } catch (e) {
-    console.log(` ⚠️ vortal handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  vortal handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -6159,32 +6159,32 @@ async function fetchCommunityVortalBizDocuments(browser, sourceUrl, ctx = {}) {
 // contractaciopublica.cat Documents handler — Catalan Government public
 // procurement platform ("Plataforma de Serveis de Contractació Pública").
 // Anonymous viewing is allowed; the platform is a Bootstrap-based SSR
-// site with two URL flavors that Mercell gives us:
+// site with two URL flavours that Mercell gives us:
 //
-// (a) /ca/perfils-contractant/detall/<buyer_id> — BUYER profile page
-// (eg "Sistema d'Emergències Mèdiques (SEM)"). Default landing
-// shows "Select a post type to search" — publications NOT rendered
-// until a sub-tab is clicked. Sub-tabs under "Tenders":
-// Future alerts (N) | Tender announcements on time (N) |
-// Preliminary market inquiries (N) | Files under evaluation (N) |
-// Previous announcements (N)
-// After clicking a sub-tab the list of publications renders as:
-// <li class="list-group-item">
-// <a class="fw-bold text-black fs-4"
-// href="/ca/detall-publicacio/300677295">Title</a>
-// </li>
+//   (a) /ca/perfils-contractant/detall/<buyer_id>  — BUYER profile page
+//       (e.g. "Sistema d'Emergències Mèdiques (SEM)"). Default landing
+//       shows "Select a post type to search" — publications NOT rendered
+//       until a sub-tab is clicked. Sub-tabs under "Tenders":
+//         Future alerts (N) | Tender announcements on time (N) |
+//         Preliminary market inquiries (N) | Files under evaluation (N) |
+//         Previous announcements (N)
+//       After clicking a sub-tab the list of publications renders as:
+//         <li class="list-group-item">
+//           <a class="fw-bold text-black fs-4"
+//              href="/ca/detall-publicacio/300677295">Title</a>
+//         </li>
 //
-// (b) /ca/detall-publicacio/<publication_id> — direct deep-link to a
-// single tender. This is the page we ultimately need, where the
-// PCAP/PPT/Plec docs live. Mercell rarely hands us this directly;
-// run 52 example /ca/detall-publicacio/300780298 returned a 404
-// (publication expired or wrong domain). We'll fall back to flavor
-// (a) + reference-search to find the live publication.
+//   (b) /ca/detall-publicacio/<publication_id>  — direct deep-link to a
+//       single tender. This is the page we ultimately need, where the
+//       PCAP/PPT/Plec docs live. Mercell rarely hands us this directly;
+//       run 52 example /ca/detall-publicacio/300780298 returned a 404
+//       (publication expired or wrong domain). We'll fall back to flavour
+//       (a) + reference-search to find the live publication.
 //
-// Strategy: for flavor (a), navigate to the buyer profile, click each
+// Strategy: for flavour (a), navigate to the buyer profile, click each
 // "open" sub-tab (Tender announcements + Files under evaluation), harvest
 // all publication anchors, filter by ctx.referenceNumber substring (the
-// expediente number, eg "Z42-2026-0013", "B196/26"), navigate to the
+// expediente number, e.g. "Z42-2026-0013", "B196/26"), navigate to the
 // matching /ca/detall-publicacio/ URL, capture body + harvest docs.
 //
 // First-pass implementation includes a diagnostic dump of the detail
@@ -6211,9 +6211,9 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
 
   let pdfParseLib = null, mammothLib = null, XLSXLib = null, admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-  try { mammothLib = require('mammoth'); } catch (_) {}
-  try { XLSXLib = require('xlsx'); } catch (_) {}
-  try { admZipLib = require('adm-zip'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { XLSXLib     = require('xlsx');      } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
 
   // CDP download capture — contractaciopublica.cat docs are rendered as
   // <button class="btn-link"> elements (not <a href>); the click handler
@@ -6252,18 +6252,18 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
       }).catch(() => null);
     } catch (_) {}
 
-    // ----- BUYER PROFILE FLAVOR: find publication via sub-tab list -----
+    // ----- BUYER PROFILE FLAVOUR: find publication via sub-tab list -----
     if (buyerId) {
       if (!refNumber && !tenderTitle) {
-        console.log(` 🏴————————————————— contractaciopublica: buyer profile ${buyerId} but no reference/title — skipping`);
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: buyer profile ${buyerId} but no reference/title — skipping`);
         return [];
       }
       const searchTerm = refNumber || tenderTitle;
-      console.log(` 🏴————————————————— contractaciopublica: buyer ${buyerId} — searching by "${searchTerm.slice(0, 60)}"`);
+      console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: buyer ${buyerId} — searching by "${searchTerm.slice(0, 60)}"`);
       try {
         await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
       } catch (e) {
-        console.log(` 🏴———————————————————— contractaciopublica: buyer nav warn: ${(e.message || '').slice(0, 80)}`);
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: buyer nav warn: ${(e.message || '').slice(0, 80)}`);
       }
       try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
       await new Promise((r) => setTimeout(r, 1200));
@@ -6278,7 +6278,7 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
       // in a different section we hadn't clicked. The Tenders pseudo-tab
       // has 5 sub-categories AND the page has 5 sibling tabs at the same
       // level (Awards and formalities, Aggregated publications, etc.).
-      // We now walk both axes to maximize harvested anchors.
+      // We now walk both axes to maximise harvested anchors.
       // ORDER MATTERS — run 64 lesson (buyer 9176738):
       // Sub-tabs ("Anuncis de licitació en termini (1)" etc.) are children
       // of "Licitacions" main tab and are hidden until the parent is
@@ -6301,10 +6301,10 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
         'Acords marc', 'Acuerdos marco', 'Framework agreements',
         // --- Sub-tabs under "Tenders" main tab (now reachable) ---
         'Anuncis de licitació en termini', 'Anuncios de licitación en plazo', 'Tender announcements on time',
-        'Expedients in evaluation', 'Expedients in evaluation', 'Files under evaluation',
+        'Expedients en avaluació', 'Expedientes en evaluación', 'Files under evaluation',
         'Anuncis previs', 'Anuncios previos', 'Future alerts',
         'Alertes futures', 'Alertas futuras',
-        'Consults preliminars del mercat', 'Consultes preliminars de mercat',
+        'Consultes preliminars del mercat', 'Consultes preliminars de mercat',
         'Consultas preliminares del mercado', 'Consultas preliminares de mercado',
         'Preliminary market inquiries',
         'Anuncis anteriors', 'Anuncios anteriores', 'Previous announcements',
@@ -6312,7 +6312,7 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
       // INCREMENTAL HARVEST — Run 65 lesson (Salut Sant Joan de Reus
        // buyer 81774653): some buyers expose only an "Acords marc" main
        // tab; clicking it puts the page into a state where the previously
-       // visible Tenders sub-tabs disappear from DOM. The end of loop
+       // visible Tenders sub-tabs disappear from DOM. The end-of-loop
        // single harvest then sees 0 pubs.
        //
        // Fix: harvest pubs into a Set AFTER the initial page load AND
@@ -6376,7 +6376,7 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
        await harvestNow();
 
        const pubs = Array.from(collectedPubs.values());
-       console.log(` 🏴———————————————————— contractaciopublica: harvested ${pubs.length} publication link(s) in buyer ${buyerId}`);
+       console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: harvested ${pubs.length} publication link(s) in buyer ${buyerId}`);
 
       if (!pubs.length) {
         // 0-pubs diagnostic — dump all visible tab labels + nav anchors so we
@@ -6401,8 +6401,8 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
             }
             return tabs;
           });
-          console.log(` 🏴————————————————— contractaciopublica: 0 pubs — visible tab/button text (top 40):`);
-          for (const t of diag0) console.log(` • ${t.slice(0, 80)}`);
+          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: 0 pubs — visible tab/button text (top 40):`);
+          for (const t of diag0) console.log(`       • ${t.slice(0, 80)}`);
         } catch (_) {}
         return [];
       }
@@ -6419,13 +6419,13 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
         const hayStrip = hayLow.replace(/[/_\s]+/g, '');
         if (refStrip.length >= 4 && hayStrip.includes(refStrip)) { matched = p; break; }
       }
-      // Title token fallback. Run 63 lesson: Mercell's "reference" can be a
-      // TED publication ID (eg "00373935-2026") that the Catalan portal
+      // Title-token fallback. Run 63 lesson: Mercell's "reference" can be a
+      // TED publication ID (e.g. "00373935-2026") that the Catalan portal
       // doesn't expose in pub labels — so the only signal is the title.
       //
       // Run 64 lesson: "1 hit" was TOO loose — buyer 81774653 had 2 pubs
       // ("ecògrafs" + "vehicles") and our target tender ("enucleación
-      // prostática") wasn't among them, but a single weak token (eg
+      // prostática") wasn't among them, but a single weak token (e.g.
       // "hospital" elsewhere on the page) triggered a false positive match.
       // Tightened: require 2+ token hits OR a single hit on a strong
       // (8+ char) specific token — domain-specific words like
@@ -6437,7 +6437,7 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
           'gestión', 'gestio', 'gestion', 'management',
           'para', 'pels', 'pour', 'per',
           'sobre', 'about',
-          'hospital', 'hospitales', 'hospitals', // too generic
+          'hospital', 'hospitales', 'hospitals',  // too generic
           'sistema', 'sistemas', 'sistemes',
           'centro', 'centre', 'centros', 'centres',
           'general', 'generales', 'general',
@@ -6469,9 +6469,9 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
         // Accept only: 2+ generic hits OR 1 strong (8+ char) hit.
         if (bestPub && (bestHits >= 2 || (bestHits >= 1 && bestStrongHit))) {
           matched = bestPub;
-          console.log(` 🏴rechner (››››)››› contractaciopublica: matched via title-token (${bestHits} hit(s)${bestStrongHit ? ', strong' : ''})`);
+          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: matched via title-token (${bestHits} hit(s)${bestStrongHit ? ', strong' : ''})`);
         } else if (bestPub) {
-          console.log(` 🏴———————————————————— contractaciopublica: title-token best=${bestHits} hit(s) — too weak, rejecting`);
+          console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: title-token best=${bestHits} hit(s) — too weak, rejecting`);
         }
       }
 
@@ -6479,11 +6479,11 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
         // Diagnostic: dump first 5 pubs so we can see what reference field
         // they expose for future regex tightening.
         const sample = pubs.slice(0, 5).map((p, i) =>
-          `[${i}] ${p.label.slice(0, 60)} | row: ${p.rowText.slice(0, 100)}`).join('\n ');
-        console.log(` 🏴äum.slice(0, 50)}"\n ${sample}`);
+          `[${i}] ${p.label.slice(0, 60)} | row: ${p.rowText.slice(0, 100)}`).join('\n       ');
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: 0 publication match for ref "${searchTerm.slice(0, 50)}"\n       ${sample}`);
         return [];
       }
-      console.log(` 🏴———————————————————— contractaciopublica: matched → ${matched.label.slice(0, 60)} (${matched.href.slice(-30)})`);
+      console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: matched → ${matched.label.slice(0, 60)} (${matched.href.slice(-30)})`);
 
       // Navigate into the publication detail page.
       const mp = matched.href.match(/\/ca\/detall-publicacio\/([^/?#]+)/i);
@@ -6491,16 +6491,16 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
       try {
         await page.goto(matched.href, { waitUntil: 'domcontentloaded', timeout: 30000 });
       } catch (e) {
-        console.log(` 🏴———————————————————— contractaciopublica: pub nav warn: ${(e.message || '').slice(0, 80)}`);
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: pub nav warn: ${(e.message || '').slice(0, 80)}`);
       }
       try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
       await new Promise((r) => setTimeout(r, 1500));
     } else {
-      // ----- DIRECT DEEP-LINK FLAVOR -----
+      // ----- DIRECT DEEP-LINK FLAVOUR -----
       try {
         await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
       } catch (e) {
-        console.log(` 🏴———————————————————— contractaciopublica: pub nav warn: ${(e.message || '').slice(0, 80)}`);
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: pub nav warn: ${(e.message || '').slice(0, 80)}`);
       }
       try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
       await new Promise((r) => setTimeout(r, 1500));
@@ -6526,9 +6526,9 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
           .filter(Boolean),
       };
     }).catch(() => ({}));
-    console.log(` 🏴———————————————————— contractaciopublica: pub_id=${publicationId} h1="${diag.h1 || ''}" anchors=${diag.totalAnchors || 0} buttons=${diag.totalButtons || 0} docButtons=${diag.ButdoctonCount || 0}`);
+    console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: pub_id=${publicationId} h1="${diag.h1 || ''}" anchors=${diag.totalAnchors || 0} buttons=${diag.totalButtons || 0} docButtons=${diag.docButtonCount || 0}`);
     if (diag.sectionHeaders && diag.sectionHeaders.length) {
-      console.log(` sections: ${JSON.stringify(diag.sectionHeaders)}`);
+      console.log(`       sections: ${JSON.stringify(diag.sectionHeaders)}`);
     }
 
     // Capture full body innerText — Catalan procurement notice pages
@@ -6544,17 +6544,17 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
     }
 
     // Harvest doc BUTTONS — confirmed pattern (user inspection 2026-05-28):
-    // <div class="d-flex">
-    // <button type="button" class="btn btn-link p-0 text-truncate">
-    // <font...>CME23C015Av1 - IN CPM ... .pdf</font>
-    // </button>
-    // </div>
+    //   <div class="d-flex">
+    //     <button type="button" class="btn btn-link p-0 text-truncate">
+    //       <font...>CME23C015Av1 - IN CPM ... .pdf</font>
+    //     </button>
+    //   </div>
     // The button has no visible href; click triggers an internal JS handler
     // that fires a Content-Disposition:attachment download. We capture the
     // resulting file from the CDP download dir.
     //
     // Listen for "real" doc-name buttons only — text must include an
-    // extension we recognize; skip generic "Cancel" / "Tornar" / nav buttons.
+    // extension we recognise; skip generic "Cancel" / "Tornar" / nav buttons.
     const docButtonHandles = await page.evaluateHandle(() => {
       const out = [];
       const buttons = Array.from(document.querySelectorAll('button'));
@@ -6590,7 +6590,7 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
       }
       return out;
     }).catch(() => []);
-    console.log(` 🏴———————————————————— contractaciopublica: ${docButtons.length} doc button(s) detected`);
+    console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: ${docButtons.length} doc button(s) detected`);
 
     const TOTAL_DOC_CAP = 100000;
     const PER_DOC_CAP = 30000;
@@ -6626,7 +6626,7 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
         try { target.click(); return true; } catch (_) { return false; }
       }, i).catch(() => false);
       if (!clicked) {
-        console.log(` 🏴———————————————————— contractaciopublica: failed to click "${label.slice(0, 40)}"`);
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: failed to click "${label.slice(0, 40)}"`);
         continue;
       }
 
@@ -6646,14 +6646,14 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
         }
       }
       if (!newFile) {
-        console.log(` 🏴gesetze.slice(0, 40)}" → no download captured in 20s`);
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: "${label.slice(0, 40)}" → no download captured in 20s`);
         continue;
       }
 
       // Parse the captured file
       let buf, text = '';
       try { buf = fs.readFileSync(newFile.path); } catch (e) {
-        console.log(` 🏴———————————————————— contractaciopublica: failed to read "${newFile.name}": ${(e.message || '').slice(0, 60)}`);
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: failed to read "${newFile.name}": ${(e.message || '').slice(0, 60)}`);
         try { fs.unlinkSync(newFile.path); } catch (_) {}
         continue;
       }
@@ -6701,21 +6701,21 @@ async function fetchContractacioPublicaCatDocuments(browser, sourceUrl, ctx = {}
         const chunk = text.slice(0, Math.min(PER_DOC_CAP, remaining));
         out.push(`--- (contractaciopublica doc: ${label.slice(0, 80)}) ---\n${chunk}`);
         docTotal += chunk.length;
-        console.log(` 🏴gesetze.slice(0, 40)}" → ${chunk.length}ch (${newFile.size}B ${ext || '?'})`);
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: "${label.slice(0, 40)}" → ${chunk.length}ch (${newFile.size}B ${ext || '?'})`);
       } else {
-        console.log(` 🏴gesetze.slice(0, 40)}" → unparseable (${newFile.size}B ${ext || '?'})`);
+        console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: "${label.slice(0, 40)}" → unparseable (${newFile.size}B ${ext || '?'})`);
       }
     }
 
     if (!out.length) {
-      console.log(` 🏴———————————————————— contractaciopublica: pub_id=${publicationId} — no body or doc content`);
+      console.log(`    🏴󠁥󠁳󠁣󠁴󠁿 contractaciopublica: pub_id=${publicationId} — no body or doc content`);
       return [];
     }
     return [out.join('\n\n')];
   } catch (e) {
-    console.log(` ⚠️ contractaciopublica handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  contractaciopublica handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
     // Clean up download tempdir
     try {
@@ -6766,23 +6766,23 @@ async function fetchArtifikDocuments(browser, sourceUrl) {
     });
 
     await page.goto(sourceUrl, { waitUntil: 'networkidle2', timeout: 20000 }).catch((e) => {
-      console.log(` 🇳🇴 artifact: nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇳🇴 artifik: nav warn: ${(e.message || '').slice(0, 80)}`);
     });
     await new Promise((r) => setTimeout(r, 4000));
 
-    // Click through every tab/section we can reasonably find. Multi pass:
+    // Click through every tab/section we can reasonably find. Multi-pass:
     // some SPAs add tabs after first click.
     const TAB_LABELS = [
       // Norwegian
       'Krav', 'Kvalifikasjon', 'Kvalifikasjonskrav', 'Tildelingskriterier',
-      'Documenter', 'Vedlegg', 'Om anskaffelsen', 'Om', 'Detaljer',
+      'Dokumenter', 'Vedlegg', 'Om anskaffelsen', 'Om', 'Detaljer',
       'Tilbudsinvitasjon', 'Konkurransegrunnlag',
       // English
       'Requirements', 'Qualifications', 'Qualification requirements',
       'Award criteria', 'Documents', 'Attachments', 'About', 'Details',
       'Tender invitation',
       // Swedish (some Norwegian municipalities operate cross-border)
-      'Krav', 'Tilldelningscriterier', 'Document',
+      'Krav', 'Tilldelningskriterier', 'Dokument',
     ];
     const triedLabels = new Set();
     let clickedAnything = false;
@@ -6826,7 +6826,7 @@ async function fetchArtifikDocuments(browser, sourceUrl) {
     // sort it out.
     const RELEVANT_HINTS = [
       'qualification', 'kvalifik', 'criteria', 'kriterier', 'tildeling',
-      'award', 'requirement', 'krav', 'document', 'document',
+      'award', 'requirement', 'krav', 'document', 'dokument',
       'pris', 'price', 'reference', 'referans',
     ];
     const scoredApi = apiResponses.map(({ url, body }) => {
@@ -6869,9 +6869,9 @@ async function fetchArtifikDocuments(browser, sourceUrl) {
     // — no login required. Click + CDP capture, then parse with adm-zip.
     let pdfParseLib = null, mammothLib = null, XLSXLib = null, admZipLib = null;
     try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-    try { mammothLib = require('mammoth'); } catch (_) {}
-    try { XLSXLib = require('xlsx'); } catch (_) {}
-    try { admZipLib = require('adm-zip'); } catch (_) {}
+    try { mammothLib  = require('mammoth');   } catch (_) {}
+    try { XLSXLib     = require('xlsx');      } catch (_) {}
+    try { admZipLib   = require('adm-zip');   } catch (_) {}
     try {
       const fs = require('fs');
       const path = require('path');
@@ -6903,7 +6903,7 @@ async function fetchArtifikDocuments(browser, sourceUrl) {
         return null;
       }).catch(() => null);
       if (zipClicked) {
-        console.log(` 🇳🇴 artifik: clicked "${zipClicked}" — waiting for ZIP`);
+        console.log(`    🇳🇴 artifik: clicked "${zipClicked}" — waiting for ZIP`);
         const deadline = Date.now() + 25000;
         let zipPath = null;
         while (Date.now() < deadline) {
@@ -6927,7 +6927,7 @@ async function fetchArtifikDocuments(browser, sourceUrl) {
         if (zipPath && admZipLib) {
           try {
             const buf = fs.readFileSync(zipPath);
-            console.log(` 🇳🇴 artifik: ZIP captured (${buf.length}B) — parsing`);
+            console.log(`    🇳🇴 artifik: ZIP captured (${buf.length}B) — parsing`);
             // 2026-06-04 — collect outer ZIP for Drive (Task #143).
             // Task #165 auto-unwrap will explode this into individual
             // entries automatically, so we only need to register the
@@ -6961,16 +6961,16 @@ async function fetchArtifikDocuments(browser, sourceUrl) {
               } catch (_) {}
               if (innerTxt && innerTxt.length > 100) {
                 const clipped = innerTxt.slice(0, 60000);
-                // 2026-06-08 — prefix with "(artifik ZIP)" so the AI ​​prompt's
+                // 2026-06-08 — prefix with "(artifik ZIP)" so the AI prompt's
                 // "--- (handler) <filename> ---" pattern matches and
                 // qualificationsSourceFile / requirementsSourceFile get a real
                 // filename → M/L columns become clickable HYPERLINKs (Task #168).
                 // Previously the header was "--- <filename> ---" (no handler
-                // prefix), so the AI ​​often returned an empty source file and
+                // prefix), so the AI often returned an empty source-file and
                 // the qualification link silently dropped to plain text.
                 const innerName = z.entryName.split('/').pop().slice(-100);
-                zipParts.push(`--- (artificial ZIP) ${innerName} ---\n${clipped}`);
-                console.log(` 📦 artifik zip entry "${z.entryName.slice(-80)}" (${innerBuf.length}B → ${clipped.length}ch)`);
+                zipParts.push(`--- (artifik ZIP) ${innerName} ---\n${clipped}`);
+                console.log(`    📦 artifik zip entry "${z.entryName.slice(-80)}" (${innerBuf.length}B → ${clipped.length}ch)`);
                 // No _collectDriveFile call here — Task #165 auto-unwrap
                 // already extracts and registers every ZIP entry once.
               }
@@ -6979,28 +6979,28 @@ async function fetchArtifikDocuments(browser, sourceUrl) {
               out.push(`--- (artifik ZIP bundle, PID=${pid}) ---\n${zipParts.join('\n\n').slice(0, 200000)}`);
             }
           } catch (zerr) {
-            console.log(` ⚠️ artifik: ZIP parse failed: ${(zerr.message || '').slice(0, 100)}`);
+            console.log(`    ⚠️  artifik: ZIP parse failed: ${(zerr.message || '').slice(0, 100)}`);
           }
         } else if (!zipPath) {
-          console.log(` ⚠️ artifik: ZIP download polling timed out`);
+          console.log(`    ⚠️  artifik: ZIP download polling timed out`);
         }
       }
       try { if (cdpSession) await cdpSession.detach(); } catch (_) {}
       try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch (_) {}
     } catch (e) {
-      console.log(` ⚠️ artifik: ZIP step failed: ${(e.message || '').slice(0, 100)}`);
+      console.log(`    ⚠️  artifik: ZIP step failed: ${(e.message || '').slice(0, 100)}`);
     }
 
     if (!out.length) {
-      console.log(` 🇳🇴 artifik: PID=${pid} — no API responses or body content captured`);
+      console.log(`    🇳🇴 artifik: PID=${pid} — no API responses or body content captured`);
       return [];
     }
-    console.log(` 🇳🇴 artifik: PID=${pid} — captured ${apiResponses.length} API response(s), ${finalBody.length}ch body, ${clickedAnything ? 'clicked tabs' : 'no tabs clicked'}`);
+    console.log(`    🇳🇴 artifik: PID=${pid} — captured ${apiResponses.length} API response(s), ${finalBody.length}ch body, ${clickedAnything ? 'clicked tabs' : 'no tabs clicked'}`);
     return [out.join('\n\n')];
   } catch (e) {
-    console.log(` ⚠️ artifik handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  artifik handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -7021,8 +7021,8 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
   let mammothLib = null;
   let admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-  try { mammothLib = require('mammoth'); } catch (_) {}
-  try { admZipLib = require('adm-zip'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
 
   let page = null;
   try {
@@ -7030,7 +7030,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     page.setDefaultNavigationTimeout(30000);
     page.setDefaultTimeout(30000);
     // v6 fix: bigger viewport. Puppeteer default (800×600) was too
-    // small — Document tab rendered but scrollIntoView+mouse.click
+    // small — Documenten tab rendered but scrollIntoView+mouse.click
     // at (x,y) coordinates landed outside the actual hit area. With
     // a desktop-sized viewport the tab bar fits in the visible
     // window and selector-based page.click handles scroll itself.
@@ -7050,7 +7050,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         Object.defineProperty(navigator, 'plugins', {
           get: () => [1, 2, 3, 4, 5],
         });
-        // navigator.languages ​​— real browsers have a populated list
+        // navigator.languages — real browsers have a populated list
         Object.defineProperty(navigator, 'languages', {
           get: () => ['nl-NL', 'nl', 'en-US', 'en'],
         });
@@ -7072,14 +7072,14 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     // (Material wrapper without a working handler from our perspective),
     // BUT when the Documenten tab activates, Angular's HttpClient fires
     // a REST call to /papi/tenderned-rs-tns/v2/... that returns the
-    // document list as JSON. Capture those responses so we can extract
+    // documenten list as JSON. Capture those responses so we can extract
     // per-file URLs / IDs without touching the click handler.
     const capturedJsonResponses = [];
     const papiResponseHandler = async (resp) => {
       try {
         const url = resp.url();
         if (!/tenderned\.nl/i.test(url)) return;
-        // Match likely documents/aanbesteding endpoints.
+        // Match likely documenten/aanbesteding endpoints.
         if (!/\/(?:papi|api)\b.*\/(?:aanbestedingen?|aankondiging|documenten?|documents?|files|stuk|attachments?)\b/i.test(url)) return;
         const ct = (resp.headers()['content-type'] || '').toLowerCase();
         if (!ct.includes('json') && !ct.includes('javascript')) return;
@@ -7087,16 +7087,16 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         const body = await resp.text().catch(() => null);
         if (!body || body.length < 50) return;
         capturedJsonResponses.push({ url, ct, body: body.slice(0, 200000) });
-      } catch ( _) {}
+      } catch (_) {}
     };
     page.on('response', papiResponseHandler);
 
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e) {
-      console.log(` 🇳🇱 tendered: nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇳🇱 tenderned: nav warn: ${(e.message || '').slice(0, 80)}`);
     }
-    // TenderNed is an Angular SPA — Document tab content needs
+    // TenderNed is an Angular SPA — Documenten tab content needs
     // Angular Material hydration + initial REST fetch to populate.
     // 6s timeout was too tight; bump to 12s networkidle + 2.5s extra
     // settle for slow CI runners.
@@ -7104,7 +7104,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     catch (_) { /* timeout ok */ }
     await new Promise((r) => setTimeout(r, 2500));
 
-    // Diagnostic: count tabs and report aria-selected state as we can
+    // Diagnostic: count tabs and report aria-selected state so we can
     // verify Angular Material rendered before our click attempt.
     try {
       const tabDiag = await page.evaluate(() => {
@@ -7120,7 +7120,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         };
       }).catch(() => ({ count: 0, tabs: [] }));
       console.log(
-        ` 🇳🇱 tendered: pre-click tab diag — ` +
+        `    🇳🇱 tenderned: pre-click tab diag — ` +
         `${tabDiag.count} tab(s) found. ${tabDiag.tabs.map(t => `[${t.text}${t.selected ? '*' : ''}]`).join(' ')}`
       );
     } catch (_) {}
@@ -7131,15 +7131,15 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     // element.dispatchEvent — Angular Material's gesture detector
     // requires CDP-level pointer events to fire all ripple/state
     // handlers correctly. We find the tab in evaluate, scroll into
-    // view, return its center rect, then click via page.mouse.
-    // 2026-05-12 fix: v4 dispatchEvent caused "Documents tab not
+    // view, return its centre rect, then click via page.mouse.
+    // 2026-05-12 fix: v4 dispatchEvent caused "Documenten tab not
     // found" even when diag showed it; root cause was textContent +
     // innerText concatenation breaking the anchored regex.
     let tabClicked = false;
     let tabRect = null;
     try {
       tabRect = await page.evaluate(() => {
-        const RX_TAB = /^\s*(documenten|bijlagen|passed|documents|attachments)\s*$/i;
+        const RX_TAB = /^\s*(documenten|bijlagen|bestanden|documents|attachments)\s*$/i;
         const cands = Array.from(document.querySelectorAll(
           '[role="tab"], .mat-mdc-tab, .mdc-tab, button, a, [role="button"], summary'
         ));
@@ -7149,7 +7149,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         for (const el of cands) {
           // Use textContent ONLY — innerText concatenation duplicated
           // the label ("Documenten Documenten") and broke the anchored
-          // regex. textContent reliably returns "Documents" for the
+          // regex. textContent reliably returns "Documenten" for the
           // mat-tab DOM structure (nested mdc-tab__text-label span).
           const t = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60);
           if (RX_TAB.test(t)) {
@@ -7160,14 +7160,14 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
                 // Build a stable selector — Puppeteer's page.click()
                 // auto-scrolls and clicks reliably (better than raw
                 // mouse.click(x,y) which misses tabs that aren't yet
-                // in viewport). Prefer id; fall back to a sibling
+                // in viewport). Prefer id; fall back to a sibling-
                 // independent attribute selector.
                 let selector = null;
                 if (el.id) selector = '#' + esc(el.id);
                 else if (el.getAttribute('data-test-id')) selector = `[data-test-id="${el.getAttribute('data-test-id')}"]`;
                 return {
                   x: rect.left + rect.width / 2,
-                  y: rect.top + rect.height/2,
+                  y: rect.top + rect.height / 2,
                   text: t,
                   selector,
                   id: el.id || null,
@@ -7181,20 +7181,20 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     } catch (_) {}
 
     if (tabRect) {
-      console.log(` 🇳🇱 tendered: tab match — text="${tabRect.text}", id="${tabRect.id || '(none)'}", coords=(${Math.round(tabRect.x)},${Math.round(tabRect.y)})`);
+      console.log(`    🇳🇱 tenderned: tab match — text="${tabRect.text}", id="${tabRect.id || '(none)'}", coords=(${Math.round(tabRect.x)},${Math.round(tabRect.y)})`);
       // v7 fix: Angular Material 14+ MDC tabs don't reliably activate
       // from Puppeteer's CDP-level synthetic mouse events (v6 ran
       // page.click without error but post-click tab stayed "Details").
       // Strategy: fire page.click() for native pointer-event coverage
       // AND el.click() in evaluate (DOM-level fallback). Material's
       // click handler is attached to role="tab"; el.click() directly
-      // invokes it bypassing all pointer-event chains. Idempotent.
+      // invokes it bypassing all pointer-event chain. Idempotent.
       if (tabRect.selector) {
         try {
           await page.click(tabRect.selector, { delay: 50 });
           tabClicked = true;
         } catch (e) {
-          console.log(` 🇳🇱 tendered: page.click(${tabRect.selector}) failed: ${(e.message || '').slice(0, 80)} — falling back to mouse.click`);
+          console.log(`    🇳🇱 tenderned: page.click(${tabRect.selector}) failed: ${(e.message || '').slice(0, 80)} — falling back to mouse.click`);
         }
         // ALSO call el.click() in DOM context — this is the only thing
         // that reliably fires Material's tab-activation handler.
@@ -7217,12 +7217,12 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
           await page.mouse.click(tabRect.x, tabRect.y, { delay: 50 });
           tabClicked = true;
         } catch (e) {
-          console.log(` 🇳🇱 tendered: mouse.click failed: ${(e.message || '').slice(0, 80)}`);
+          console.log(`    🇳🇱 tenderned: mouse.click failed: ${(e.message || '').slice(0, 80)}`);
         }
       }
     }
     if (tabClicked) {
-      console.log(` 🇳🇱 tendered: clicked Documents tab — waiting for content`);
+      console.log(`    🇳🇱 tenderned: clicked Documenten tab — waiting for content`);
       // Tab activation triggers XHR (api/documenten/...) — wait for it
       // to settle, then a bit more for Angular to render the list.
       try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); }
@@ -7238,21 +7238,21 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
             h4Count: document.querySelectorAll('h4').length,
           };
         }).catch(() => ({}));
-        console.log(` 🇳🇱 tendered: post-click — active tab: "${post.activeText || 'none'}", h4 count: ${post.h4Count}`);
+        console.log(`    🇳🇱 tenderned: post-click — active tab: "${post.activeText || 'none'}", h4 count: ${post.h4Count}`);
       } catch (_) {}
     } else {
-      console.log(` 🇳🇱 tendered: ⚠️ Documents tab not found (will scan current DOM as-is)`);
+      console.log(`    🇳🇱 tenderned: ⚠️ Documenten tab not found (will scan current DOM as-is)`);
     }
 
-    // TenderNed's Document panel renders filenames as plain <h4>
+    // TenderNed's Documenten panel renders filenames as plain <h4>
     // elements (Angular click handler downloads via XHR — no <a href>).
     // First pass: scan h4 text for diagnostic (lets us verify the tab
     // click actually revealed content). Second pass: try the "Download
-    // all documents" / "Download all documents" button, which
+    // alle documenten" / "Download all documents" button, which
     // returns a ZIP containing every document. We intercept the
     // network response and parse the ZIP — much simpler than fetching
     // each doc individually and avoids needing to reverse-engineer
-    // per-doc URL patterns. User confirmed DOM 2026-05-12.
+    // per-doc URL patterns. User-confirmed DOM 2026-05-12.
     const filenamesProbe = await page.evaluate(() => {
       const RX_FILE = /\.(pdf|docx?|xlsx?|zip|rtf|odt|ods)\b/i;
       const h4s = Array.from(document.querySelectorAll('h4'));
@@ -7265,30 +7265,30 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
       return { filenames: names, totalH4: h4s.length };
     }).catch(() => ({ filenames: [], totalH4: 0 }));
     console.log(
-      ` 🇳🇱 tendered: notice ${noticeId} — ` +
+      `    🇳🇱 tenderned: notice ${noticeId} — ` +
       `${filenamesProbe.filenames.length}/${filenamesProbe.totalH4} h4 filename(s) detected on tab. ` +
       `Top: ${filenamesProbe.filenames.slice(0, 4).map(n => n.slice(0, 60)).join(' | ')}`
     );
 
-    // Try the "Download all documents" / "Download all documents"
+    // Try the "Download alle documenten" / "Download all documents"
     // button. Set up a response interceptor BEFORE the click so we
     // catch the ZIP whatever URL it comes from. The button text comes
     // verbatim from the user's DOM: <span class="text-nowrap">
-    // Download all documents </span>.
+    // Download alle documenten </span>.
     const texts = [];
 
     // v11 — direct bulk ZIP fetch via the actual TenderNed REST URL.
     // User-confirmed 2026-05-14 (chrome://downloads/ source URL):
-    // https://www.tenderned.nl/papi/tenderned-rs-tns/v2/publicaties/
-    // {noticeId}/documenten/zip ← bulk
-    // https://www.tenderned.nl/papi/tenderned-rs-tns/v2/publicaties/
-    // {noticeId}/documenten/{docId}/content ← per-file
+    //   https://www.tenderned.nl/papi/tenderned-rs-tns/v2/publicaties/
+    //       {noticeId}/documenten/zip                            ← bulk
+    //   https://www.tenderned.nl/papi/tenderned-rs-tns/v2/publicaties/
+    //       {noticeId}/documenten/{docId}/content                ← per-file
     // Files are publicly accessible — no auth required. This bypasses
     // ALL click-based logic (the Download-all click never fires any
     // network request from headless Chromium, see v8/v9 failures).
     if (admZipLib) {
       const bulkUrl = `https://www.tenderned.nl/papi/tenderned-rs-tns/v2/publicaties/${noticeId}/documenten/zip`;
-      console.log(` 🇳🇱 tendered: v11 direct bulk-ZIP fetch → ${bulkUrl.slice(-70)}`);
+      console.log(`    🇳🇱 tenderned: v11 direct bulk-ZIP fetch → ${bulkUrl.slice(-70)}`);
       try {
         // v12 retry — "TypeError: Failed to fetch" hits ~25% of large
         // (5-13MB) responses, likely Chromium race condition between
@@ -7309,13 +7309,13 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
           // Only retry on transient errors — not on HTTP error codes.
           const isTransient = r && !r.ok && r.error && /failed\s*to\s*fetch|network\s*error|err_|aborted/i.test(r.error);
           if (!isTransient || attempt === 3) break;
-          console.log(` 🇳🇱 tendered: v11 attempt ${attempt} transient (${r.error.slice(0, 60)}) — retrying after 1.5s`);
+          console.log(`    🇳🇱 tenderned: v11 attempt ${attempt} transient (${r.error.slice(0, 60)}) — retrying after 1.5s`);
           await new Promise((rs) => setTimeout(rs, 1500));
         }
         if (r && r.ok && r.data && r.data.length > 1024) {
           const buf = Buffer.from(r.data);
           if (buf[0] === 0x50 && buf[1] === 0x4b) {
-            console.log(` 🇳🇱 tendered: v11 bulk ZIP OK (${buf.length}B, ct=${r.ct})`);
+            console.log(`    🇳🇱 tenderned: v11 bulk ZIP OK (${buf.length}B, ct=${r.ct})`);
             try {
               const zip = new admZipLib(buf);
               const entries = zip.getEntries();
@@ -7336,7 +7336,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
                 .map((e) => ({ entry: e, score: scoreOf(e.entryName) }))
                 .sort((a, b) => b.score - a.score)
                 .slice(0, 6);
-              console.log(` 🇳🇱 tendered: ZIP has ${entries.length} entries, parsing top ${docEntries.length}`);
+              console.log(`    🇳🇱 tenderned: ZIP has ${entries.length} entries, parsing top ${docEntries.length}`);
               for (const item of docEntries) {
                 const entry = item.entry;
                 const name = entry.entryName.slice(-100);
@@ -7355,15 +7355,15 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
                   if (text.length > 200) {
                     const clipped = text.slice(0, 80000);
                     texts.push(`--- (tenderned) ${name} ---\n${clipped}`);
-                    console.log(` 🇳🇱 tenderned: parsed "${name}" (${data.length}B → ${clipped.length}ch, score=${item.score})`);
+                    console.log(`    🇳🇱 tenderned: parsed "${name}" (${data.length}B → ${clipped.length}ch, score=${item.score})`);
                     _collectDriveFile(name, Buffer.isBuffer(data) ? data : Buffer.from(data));
                   }
                 } catch (e) {
-                  console.log(` ⚠️ tenderned: parse failed "${name}": ${(e.message || '').slice(0, 80)}`);
+                  console.log(`    ⚠️  tenderned: parse failed "${name}": ${(e.message || '').slice(0, 80)}`);
                 }
               }
             } catch (e) {
-              console.log(` ⚠️ tendered: ZIP parse error: ${(e.message || '').slice(0, 100)}`);
+              console.log(`    ⚠️  tenderned: ZIP parse error: ${(e.message || '').slice(0, 100)}`);
             }
             // If we got any text, return early — skip all click logic.
             if (texts.length > 0) {
@@ -7371,13 +7371,13 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
               return texts;
             }
           } else {
-            console.log(` ⚠️ tenderned: v11 bulk ZIP wrong magic (got ${buf.slice(0, 4).toString('hex')}, ct=${r.ct})`);
+            console.log(`    ⚠️  tenderned: v11 bulk ZIP wrong magic (got ${buf.slice(0, 4).toString('hex')}, ct=${r.ct})`);
           }
         } else {
-          console.log(` ⚠️ tendered: v11 bulk ZIP fetch failed (status=${r?.status || r?.error || '?'})`);
+          console.log(`    ⚠️  tenderned: v11 bulk ZIP fetch failed (status=${r?.status || r?.error || '?'})`);
         }
       } catch (e) {
-        console.log(` ⚠️ tendered: v11 bulk fetch error: ${(e.message || '').slice(0, 100)}`);
+        console.log(`    ⚠️  tenderned: v11 bulk fetch error: ${(e.message || '').slice(0, 100)}`);
       }
     }
 
@@ -7396,7 +7396,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
           // Match likely Download-all endpoints. TenderNed serves the
           // ZIP via a `documenten` or `zip` path segment — both noted in
           // user inspection 2026-05-12.
-          if (!/\b(?:zip|documenten\/all|download(?:all)?\/?|all)\b/i.test(url)) return;
+          if (!/\b(?:zip|documenten\/all|download(?:all)?\/?|alle)\b/i.test(url)) return;
           // Skip static assets, CSS/JS chunks.
           if (/\.(?:js|css|png|svg|woff2?|ico|map)\b/i.test(url)) return;
           const rt = req.resourceType();
@@ -7407,12 +7407,12 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
       };
       page.on('request', reqHandler);
 
-      // v9 fix: Puppeteer's default behavior BLOCKS downloads silently.
+      // v9 fix: Puppeteer's default behaviour BLOCKS downloads silently.
       // v8 logs showed "no request URL captured either" — the click on
       // Download-all triggered a download attempt but Chromium aborted
       // it without emitting any request the response listener could see
       // (because the navigation target was a Content-Disposition asset
-      // and download manager was disabled). Enable CDP level allow +
+      // and download manager was disabled). Enable CDP-level allow +
       // tmp directory so the file is actually written to disk; we then
       // poll the directory for a new .zip and read it back.
       let downloadDir = null;
@@ -7465,7 +7465,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         // Search across all clickable-ish elements + walk up to find
         // the actual <button>/<a> ancestor. User confirmed the label
         // span lives inside a wrapping button (DOM 2026-05-12:
-        // <span class="text-nowrap"> Download all documents </span>).
+        // <span class="text-nowrap"> Download alle documenten </span>).
         const all = Array.from(document.querySelectorAll('span, button, a, [role="button"]'));
         for (const el of all) {
           const t = (el.textContent || '').trim().replace(/\s+/g, ' ');
@@ -7485,7 +7485,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
               else if (target.getAttribute('data-test-id')) selector = `[data-test-id="${target.getAttribute('data-test-id')}"]`;
               return {
                 x: rect.left + rect.width / 2,
-                y: rect.top + rect.height/2,
+                y: rect.top + rect.height / 2,
                 tag: target.tagName,
                 text: t.slice(0, 40),
                 selector,
@@ -7504,9 +7504,9 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
             await page.click(downloadRect.selector, { delay: 50 });
             downloadClicked = `${downloadRect.tag} "${downloadRect.text}" via ${downloadRect.selector}`;
           } catch (e) {
-            console.log(` 🇳🇱 tendered: Download-all page.click(${downloadRect.selector}) failed: ${(e.message || '').slice(0, 80)} — falling back to mouse.click`);
+            console.log(`    🇳🇱 tenderned: Download-all page.click(${downloadRect.selector}) failed: ${(e.message || '').slice(0, 80)} — falling back to mouse.click`);
           }
-          // v7: also DOM click for Material event chain (idempotent).
+          // v7: also DOM-click for Material event chain (idempotent).
           try {
             await page.evaluate((sel) => {
               const el = document.querySelector(sel);
@@ -7524,13 +7524,13 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
             await page.mouse.click(downloadRect.x, downloadRect.y, { delay: 50 });
             downloadClicked = `${downloadRect.tag} "${downloadRect.text}" via mouse coords`;
           } catch (e) {
-            console.log(` 🇳🇱 tenderned: Download-all mouse.click failed: ${(e.message || '').slice(0, 80)}`);
+            console.log(`    🇳🇱 tenderned: Download-all mouse.click failed: ${(e.message || '').slice(0, 80)}`);
           }
         }
       }
 
       if (downloadClicked) {
-        console.log(` 🇳🇱 tendered: clicked Download-all (${downloadClicked}) — waiting for ZIP`);
+        console.log(`    🇳🇱 tenderned: clicked Download-all (${downloadClicked}) — waiting for ZIP`);
         let zipResp = await zipResponsePromise;
         page.off('request', reqHandler);
         // v8 fallback: response stream may have been hijacked by the
@@ -7538,7 +7538,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         // re-fetch it via page.evaluate with the session cookies — this
         // avoids the download routing entirely.
         if ((!zipResp || !zipResp.buf) && capturedReqUrl) {
-          console.log(` 🇳🇱 tendered: response capture failed — rerefetching ${capturedReqUrl.slice(0, 100)} via page session`);
+          console.log(`    🇳🇱 tenderned: response capture failed — refetching ${capturedReqUrl.slice(0, 100)} via page session`);
           try {
             const refetch = await page.evaluate(async (url) => {
               try {
@@ -7546,7 +7546,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
                 if (!r.ok) return { ok: false, status: r.status };
                 const ab = await r.arrayBuffer();
                 return {
-                  OK: true,
+                  ok: true,
                   status: r.status,
                   ct: r.headers.get('content-type') || '',
                   url: r.url || url,
@@ -7558,18 +7558,18 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
               const buf = Buffer.from(refetch.data);
               if (buf[0] === 0x50 && buf[1] === 0x4b) {
                 zipResp = { buf, url: refetch.url, ct: refetch.ct };
-                console.log(` 🇳🇱 tendered: session refetch OK (${buf.length}B)`);
+                console.log(`    🇳🇱 tenderned: session refetch OK (${buf.length}B)`);
               } else {
-                console.log(` ⚠️ tendered: refetched bytes don't have ZIP magic (got ct=${refetch.ct}, first 2 bytes: ${buf[0].toString(16)} ${buf[1].toString(16)})`);
+                console.log(`    ⚠️  tenderned: refetched bytes don't have ZIP magic (got ct=${refetch.ct}, first 2 bytes: ${buf[0].toString(16)} ${buf[1].toString(16)})`);
               }
             } else {
-              console.log(` ⚠️ tendered: session refetch failed: status=${refetch?.status || refetch?.error || '?'}`);
+              console.log(`    ⚠️  tenderned: session refetch failed: status=${refetch?.status || refetch?.error || '?'}`);
             }
           } catch (e) {
-            console.log(` ⚠️ tendered: refetch error: ${(e.message || '').slice(0, 100)}`);
+            console.log(`    ⚠️  tenderned: refetch error: ${(e.message || '').slice(0, 100)}`);
           }
         } else if (!zipResp || !zipResp.buf) {
-          console.log(` ⚠️ tendered: no request URL captured either — click may not have triggered any download endpoint`);
+          console.log(`    ⚠️  tenderned: no request URL captured either — click may not have triggered any download endpoint`);
         }
         // v9 fallback: if still no ZIP, poll the CDP download directory.
         // Chromium routes Content-Disposition:attachment directly to the
@@ -7609,24 +7609,24 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
               const buf = fs.readFileSync(zipPath);
               if (buf.length > 1024 && buf[0] === 0x50 && buf[1] === 0x4b) {
                 zipResp = { buf, url: `file://${zipPath}`, ct: 'application/zip' };
-                console.log(` 🇳🇱 tendered: ZIP captured from disk (${buf.length}B → ${path.basename(zipPath)})`);
+                console.log(`    🇳🇱 tenderned: ZIP captured from disk (${buf.length}B → ${path.basename(zipPath)})`);
               } else {
-                console.log(` ⚠️ tendered: disk file "${path.basename(zipPath)}" not a ZIP (${buf.length}B, magic=${buf.slice(0, 4).toString('hex')})`);
+                console.log(`    ⚠️  tenderned: disk file "${path.basename(zipPath)}" not a ZIP (${buf.length}B, magic=${buf.slice(0, 4).toString('hex')})`);
               }
             } else {
-              console.log(` ⚠️ tendered: download dir polling timed out — no file appeared in ${downloadDir.slice(-40)}`);
+              console.log(`    ⚠️  tenderned: download dir polling timed out — no file appeared in ${downloadDir.slice(-40)}`);
             }
           } catch (e) {
-            console.log(` ⚠️ tendered: disk read error: ${(e.message || '').slice(0, 100)}`);
+            console.log(`    ⚠️  tenderned: disk read error: ${(e.message || '').slice(0, 100)}`);
           }
         }
         if (zipResp && zipResp.buf) {
-          console.log(` 🇳🇱 tendered: ZIP captured (${zipResp.buf.length}B) from ${zipResp.url.slice(0, 100)}`);
+          console.log(`    🇳🇱 tenderned: ZIP captured (${zipResp.buf.length}B) from ${zipResp.url.slice(0, 100)}`);
           try {
             const zip = new admZipLib(zipResp.buf);
             const entries = zip.getEntries();
             // Priority entries first — Selectieleidraad / Programma van
-            // Iron / Aanbestedingsleidraad / UEA, then fall through.
+            // Eisen / Aanbestedingsleidraad / UEA, then fall through.
             const SCORE_RULES = [
               { rx: /selectie\s*leidraad|selectiecriteri|selectie[-\s]?eisen|selection\s*criteria/i, score: 25 },
               { rx: /aanbestedings?\s*leidraad|procurement\s*guide|request\s*for\s*quotation/i, score: 18 },
@@ -7644,7 +7644,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
               .map((e) => ({ entry: e, score: scoreOf(e.entryName) }))
               .sort((a, b) => b.score - a.score)
               .slice(0, 6);
-            console.log(` 🇳🇱 tendered: ZIP has ${entries.length} entries, parsing top ${docEntries.length} (PDFs/DOCXs)`);
+            console.log(`    🇳🇱 tenderned: ZIP has ${entries.length} entries, parsing top ${docEntries.length} (PDFs/DOCXs)`);
             for (const item of docEntries) {
               const entry = item.entry;
               const name = entry.entryName.slice(-100);
@@ -7663,23 +7663,23 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
                 if (text.length > 200) {
                   const clipped = text.slice(0, 80000);
                   texts.push(`--- (tenderned) ${name} ---\n${clipped}`);
-                  console.log(` 🇳🇱 tenderned: parsed "${name}" (${data.length}B → ${clipped.length}ch, score=${item.score})`);
+                  console.log(`    🇳🇱 tenderned: parsed "${name}" (${data.length}B → ${clipped.length}ch, score=${item.score})`);
                   _collectDriveFile(name, Buffer.isBuffer(data) ? data : Buffer.from(data));
                 } else {
-                  console.log(` ⚠️ tendered: "${name}" extracted text too short (${text.length}ch)`);
+                  console.log(`    ⚠️  tenderned: "${name}" extracted text too short (${text.length}ch)`);
                 }
               } catch (e) {
-                console.log(` ⚠️ tenderned: parse failed for "${name}": ${(e.message || '').slice(0, 80)}`);
+                console.log(`    ⚠️  tenderned: parse failed for "${name}": ${(e.message || '').slice(0, 80)}`);
               }
             }
           } catch (e) {
-            console.log(` ⚠️ tendered: ZIP parse error: ${(e.message || '').slice(0, 100)}`);
+            console.log(`    ⚠️  tenderned: ZIP parse error: ${(e.message || '').slice(0, 100)}`);
           }
         } else {
-          console.log(` ⚠️ tendered: Download-all click fired but no ZIP response captured`);
+          console.log(`    ⚠️  tenderned: Download-all click fired but no ZIP response captured`);
         }
       } else {
-        console.log(` ⚠️ tendered: Download-all button not found on page`);
+        console.log(`    ⚠️  tenderned: Download-all button not found on page`);
         // Clean up request listener if we never clicked.
         try { page.off('request', reqHandler); } catch (_) {}
       }
@@ -7694,10 +7694,10 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     }
 
     // v10 API fallback — Angular fires /papi/.../documenten when the
-    // Document tab activates. We captured all such responses above;
+    // Documenten tab activates. We captured all such responses above;
     // parse them for per-file URLs / IDs. Run only if ZIP path failed.
     if (texts.length === 0 && capturedJsonResponses.length > 0) {
-      console.log(` 🇳🇱 tendered: API fallback — ${capturedJsonResponses.length} JSON response(s) captured during tab activation`);
+      console.log(`    🇳🇱 tenderned: API fallback — ${capturedJsonResponses.length} JSON response(s) captured during tab activation`);
       const apiDocs = [];
       for (const cap of capturedJsonResponses) {
         let json;
@@ -7709,13 +7709,13 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
           if (Array.isArray(node)) { for (const x of node) collect(x, depth + 1); return; }
           if (!node || typeof node !== 'object') return;
           // Detect file-shaped objects — common TenderNed keys: id,
-          // inventoryname, naam, filename, name, contentType, type, size.
+          // bestandsnaam, naam, filename, name, contentType, type, size.
           const keys = Object.keys(node);
-          const hasName = keys.some((k) => /^(?:fondsnaam|filename|fileName|naam|name)$/i.test(k));
-          const hasId = keys.some((k) => /^(?:id|fileId|documentId|stukId|existentId)$/i.test(k));
+          const hasName = keys.some((k) => /^(?:bestandsnaam|filename|fileName|naam|name)$/i.test(k));
+          const hasId = keys.some((k) => /^(?:id|fileId|documentId|stukId|bestandId)$/i.test(k));
           if (hasName && hasId) {
-            const name = node.stockname || node.filename || node.fileName || node.naam || node.name || '';
-            const id = node.id || node.fileId || node.documentId || node.stukId || node.stockId || '';
+            const name = node.bestandsnaam || node.filename || node.fileName || node.naam || node.name || '';
+            const id   = node.id || node.fileId || node.documentId || node.stukId || node.bestandId || '';
             if (name && id && /\.(?:pdf|docx?|xlsx?|zip|rtf|odt|ods)$/i.test(name)) {
               apiDocs.push({ name: String(name).slice(0, 200), id: String(id), src: cap.url.slice(0, 80) });
             }
@@ -7725,10 +7725,10 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
         try { collect(json, 0); } catch (_) {}
       }
       if (apiDocs.length === 0) {
-        console.log(` ⚠️ tendered: API responses captured but no file-shaped objects found. URLs: ${capturedJsonResponses.slice(0, 4).map((c) => c.url.slice(-60)).join(' | ')}`);
+        console.log(`    ⚠️  tenderned: API responses captured but no file-shaped objects found. URLs: ${capturedJsonResponses.slice(0, 4).map((c) => c.url.slice(-60)).join(' | ')}`);
         // v12 diagnostic — dump top-level keys + sample object shapes
-        // from the first response so we can refine the file shape
-        // detector. Limited to 1 response and 400 characters to avoid noise.
+        // from the first response so we can refine the file-shape
+        // detector. Limited to 1 response and 400 chars to avoid noise.
         try {
           const first = capturedJsonResponses[0];
           if (first) {
@@ -7739,7 +7739,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
               return `primitive(${typeof parsed})`;
             })();
             const snippet = JSON.stringify(parsed).slice(0, 400);
-            console.log(` 🔎 tendered: JSON shape — ${summary}. Snippet: ${snippet}`);
+            console.log(`    🔎 tenderned: JSON shape — ${summary}. Snippet: ${snippet}`);
           }
         } catch (_) {}
       } else {
@@ -7752,8 +7752,8 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
           seen.add(k);
           uniq.push(d);
         }
-        console.log(` 🇳🇱 tenderned: API discovered ${uniq.length} document(s) — sample: ${uniq.slice(0, 4).map((d) => d.name.slice(0, 50)).join(' | ')}`);
-        // Score & priority — same vocab as ZIP path.
+        console.log(`    🇳🇱 tenderned: API discovered ${uniq.length} document(s) — sample: ${uniq.slice(0, 4).map((d) => d.name.slice(0, 50)).join(' | ')}`);
+        // Score & prioritise — same vocab as ZIP path.
         const API_SCORE = [
           { rx: /selectie\s*leidraad|selectiecriteri|selectie[-\s]?eisen/i, score: 25 },
           { rx: /aanbestedings?\s*leidraad|procurement\s*guide/i, score: 18 },
@@ -7793,7 +7793,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
               }, candUrl).catch(() => null);
               if (r && r.ok && r.data && r.data.length > 500) {
                 const buf = Buffer.from(r.data);
-                // Accept PDF magic OR Office ZIP (DOCX/XLSX).
+                // Accept PDF magic OR Office-ZIP (DOCX/XLSX).
                 if ((buf[0] === 0x25 && buf[1] === 0x50) || (buf[0] === 0x50 && buf[1] === 0x4b)) {
                   fetched = { buf, ct: r.ct, url: candUrl };
                   break;
@@ -7801,7 +7801,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
               }
             }
             if (!fetched) {
-              console.log(` ⚠️ tendered: API download failed for "${doc.name.slice(0, 50)}" — all URL patterns rejected`);
+              console.log(`    ⚠️  tenderned: API download failed for "${doc.name.slice(0, 50)}" — all URL patterns rejected`);
               continue;
             }
             try {
@@ -7819,12 +7819,12 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
               if (text.length > 200) {
                 const clipped = text.slice(0, 80000);
                 texts.push(`--- (tenderned API) ${doc.name} ---\n${clipped}`);
-                console.log(` 🇳🇱 tenderned: API parsed "${doc.name.slice(0, 60)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+                console.log(`    🇳🇱 tenderned: API parsed "${doc.name.slice(0, 60)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
               } else {
-                console.log(` ⚠️ tendered: API "${doc.name.slice(0, 50)}" text too short (${text.length}ch)`);
+                console.log(`    ⚠️  tenderned: API "${doc.name.slice(0, 50)}" text too short (${text.length}ch)`);
               }
             } catch (e) {
-              console.log(` ⚠️ tendered: API parse failed "${doc.name.slice(0, 50)}": ${(e.message || '').slice(0, 80)}`);
+              console.log(`    ⚠️  tenderned: API parse failed "${doc.name.slice(0, 50)}": ${(e.message || '').slice(0, 80)}`);
             }
           }
         }
@@ -7839,9 +7839,9 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     if (texts.length > 0) return texts;
 
     const probe = await page.evaluate(() => {
-      const RX_DOC_EXT = /\.(pdf|docx?|xlsx?|zip|rtf|odt|ods)(?:[?#]|$)/i;
-      const RX_DOC_PATH = /\/(?:document(?:en)?|stock(?:en)?|attachment|download|papi\/.*?\/documenten|bijlag|stuk)\b/i;
-      const RX_DOC_TXT = /\b(?:Bijlage|Aanbestedings(?:leidraad|document)|Selectie(?:leidraad|criteri)|Programma\s*van\s*Eisen|UEA|ESPD|TN\d{4,}|EF\d+\s*Aankondiging)\b/i;
+      const RX_DOC_EXT  = /\.(pdf|docx?|xlsx?|zip|rtf|odt|ods)(?:[?#]|$)/i;
+      const RX_DOC_PATH = /\/(?:document(?:en)?|bestand(?:en)?|attachment|download|papi\/.*?\/documenten|bijlag|stuk)\b/i;
+      const RX_DOC_TXT  = /\b(?:Bijlage|Aanbestedings(?:leidraad|document)|Selectie(?:leidraad|criteri)|Programma\s*van\s*Eisen|UEA|ESPD|TN\d{4,}|EF\d+\s*Aankondiging)\b/i;
       const RX_FILE_TXT = /\.(?:pdf|docx?|xlsx?|zip|rtf|odt|ods)\b/i;
       const seen = new Set();
       const out = [];
@@ -7878,13 +7878,13 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     const docs = probe.docs;
     if (!docs.length) {
       console.log(
-        ` 🇳🇱 tendered: notice ${noticeId} — no document anchors found ` +
+        `    🇳🇱 tenderned: notice ${noticeId} — no document anchors found ` +
         `(scanned ${probe.totalAnchors} same-domain links). Sample: ` +
         JSON.stringify(probe.sampleHrefs.slice(0, 6))
       );
       return [];
     }
-    console.log(` 🇳🇱 tendered: notice ${noticeId} — ${docs.length} document anchor(s) found`);
+    console.log(`    🇳🇱 tenderned: notice ${noticeId} — ${docs.length} document anchor(s) found`);
 
     // Priority — Selectieleidraad / Selectiecriterium > Aanbestedingsleidraad
     // > Programma van Eisen > UEA/ESPD > rest. Higher score = fetched first.
@@ -7904,7 +7904,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
     }
     docs.sort((a, b) => b.score - a.score);
     const topDocs = docs.slice(0, 6);
-    console.log(` 🇳🇱 tendered: priority docs: ${topDocs.map(d => `${d.name.slice(0, 40)}[s=${d.score}]`).join(' | ')}`);
+    console.log(`    🇳🇱 tenderned: priority docs: ${topDocs.map(d => `${d.name.slice(0, 40)}[s=${d.score}]`).join(' | ')}`);
 
     // Reuse outer `texts` (declared above before the ZIP path) — the
     // anchor fallback runs only if ZIP capture returned nothing.
@@ -7922,10 +7922,10 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
           const cd = resp.headers.get('content-disposition') || '';
           const ab = await resp.arrayBuffer();
           return {
-            OK: true,
+            ok: true,
             status: resp.status,
             ct,
-            CD,
+            cd,
             url: resp.url || url,
             data: Array.from(new Uint8Array(ab)),
           };
@@ -7936,7 +7936,7 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
 
       if (!result || !result.ok || !result.data || result.data.length < 500) {
         const status = result?.status || result?.error || '?';
-        console.log(` ⚠️ tendered: download failed for "${labelName}" (status=${status})`);
+        console.log(`    ⚠️  tenderned: download failed for "${labelName}" (status=${status})`);
         continue;
       }
       const buf = Buffer.from(result.data);
@@ -7953,26 +7953,26 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
           const out = await mammothLib.extractRawText({ buffer: buf });
           text = ((out && out.value) || '').trim();
         } else {
-          console.log(` ⚠️ tendered: "${labelName}" — unsupported type (ct=${ctL.slice(0, 40)})`);
+          console.log(`    ⚠️  tenderned: "${labelName}" — unsupported type (ct=${ctL.slice(0, 40)})`);
           continue;
         }
         if (text.length > 200) {
           const clipped = text.slice(0, 80000);
           texts.push(`--- (tenderned) ${labelName} ---\n${clipped}`);
-          console.log(` 🇳🇱 tenderned: parsed "${labelName}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+          console.log(`    🇳🇱 tenderned: parsed "${labelName}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
           _collectDriveFile(labelName, buf);
         } else {
-          console.log(` ⚠️ tendered: "${labelName}" extracted text too short (${text.length}ch)`);
+          console.log(`    ⚠️  tenderned: "${labelName}" extracted text too short (${text.length}ch)`);
         }
       } catch (e) {
-        console.log(` ⚠️ tenderned: parse failed for "${labelName}": ${(e.message || '').slice(0, 80)}`);
+        console.log(`    ⚠️  tenderned: parse failed for "${labelName}": ${(e.message || '').slice(0, 80)}`);
       }
     }
     return texts;
   } catch (e) {
-    console.log(` ⚠️ tendered handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  tenderned handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -7984,22 +7984,22 @@ async function fetchTenderNedDocuments(browser, sourceUrl) {
 // tender front-end on Cloudia SaaS) expose a direct ZIP download URL
 // at /Zip/TarjousPyynnonLiitteet/<noticeId> after authentication.
 // User-confirmed DOM 2026-05-12:
-// <a href="/Zip/TarjousPyynnonLiitteet/611615" target="_blank">
-// Download all documents (ZIP)
-// </a>
+//   <a href="/Zip/TarjousPyynnonLiitteet/611615" target="_blank">
+//     Download all documents (ZIP)
+//   </a>
 //
-// The noticeId is the `id` query parameter on the source URL, eg
-// https://tarjouspalvelu.fi/keuda?id=611615&tpk=...
+// The noticeId is the `id` query parameter on the source URL, e.g.
+//   https://tarjouspalvelu.fi/keuda?id=611615&tpk=...
 // → ZIP: https://tarjouspalvelu.fi/Zip/TarjousPyynnonLiitteet/611615
 //
 // We open a new tab with the SAME browser context so the Cloudia
 // session cookies set by attemptPortalLogin are available, navigate
 // to the source URL once to anchor location, then page.evaluate(fetch)
-// the ZIP URL. Parse with adm-zip, prioritize Finnish keyword docs:
-// Tarjouspyyntö (Request for Quotation) — top
-// Soveltuvuusvaatimukset (Suitability requirements)
-// Valintaperusteet (Selection criteria)
-// UEA / ESPD
+// the ZIP URL. Parse with adm-zip, prioritise Finnish keyword docs:
+//   Tarjouspyyntö (Request for Quotation) — top
+//   Soveltuvuusvaatimukset (Suitability requirements)
+//   Valintaperusteet (Selection criteria)
+//   UEA / ESPD
 // =====================================================================
 async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
   let noticeId = null;
@@ -8011,17 +8011,17 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
     if (!idParam || !/^\d+$/.test(idParam)) return [];
     noticeId = idParam;
     const segs = u.pathname.split('/').filter(Boolean);
-    tenant = segs[0] || ''; // eg "keuda"
+    tenant = segs[0] || ''; // e.g. "keuda"
   } catch (_) { return []; }
 
   let pdfParseLib = null;
   let mammothLib = null;
   let admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-  try { mammothLib = require('mammoth'); } catch (_) {}
-  try { admZipLib = require('adm-zip'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
   if (!admZipLib || !pdfParseLib) {
-    console.log(` 🇫🇮 tarjouspalvelu: pdf-parse or adm-zip unavailable — skipping`);
+    console.log(`    🇫🇮 tarjouspalvelu: pdf-parse or adm-zip unavailable — skipping`);
     return [];
   }
 
@@ -8031,39 +8031,39 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
     page.setDefaultNavigationTimeout(25000);
     page.setDefaultTimeout(25000);
 
-    // Anchor location at the source URL so the fetch() runs with that
+    // Anchor location at the source URL so the fetch() runs with the
     // correct origin/cookies. This also ensures we have an authenticated
     // session — attemptPortalLogin sets cookies on the browser context,
     // so this fresh page inherits them.
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
     } catch (e) {
-      console.log(` 🇫🇮 tarjouspalvelu: nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇫🇮 tarjouspalvelu: nav warn: ${(e.message || '').slice(0, 80)}`);
     }
     await new Promise((r) => setTimeout(r, 1500));
 
     // EMAIL-FIRST MULTI-PAGE LOGIN (2026-05-15 fix).
     //
     // User-confirmed real auth flow for tarjouspalvelu.fi:
-    // 1. Visit tarjouspalvelu.fi/<tenant>?id=X (anonymous tender page)
-    // 2. Top corner has email input + "Kirjaudu/Login" button
-    // 3. Fill email + click → redirects to
-    // login.cloudia.net/user/login?username=X&application=redirect:UUID
-    // (email pre-filled, UUID = tarjouspalvelu's Cloudia app id)
-    // 4. Fill password + submit
-    // 5. Cloudia auth → redirects back to tarjouspalvelu.fi (or to
-    // cloudia.net/user/user; we then re-nav back to source URL)
-    // 6. Now authenticated on tarjouspalvelu.fi — session cookie set
+    //   1. Visit tarjouspalvelu.fi/<tenant>?id=X (anonymous tender page)
+    //   2. Top-corner has email input + "Kirjaudu/Login" button
+    //   3. Fill email + click → redirects to
+    //      login.cloudia.net/user/login?username=X&application=redirect:UUID
+    //      (email pre-filled, UUID = tarjouspalvelu's Cloudia app id)
+    //   4. Fill password + submit
+    //   5. Cloudia auth → redirects back to tarjouspalvelu.fi (or to
+    //      cloudia.net/user/user; we then re-nav back to source URL)
+    //   6. Now authenticated on tarjouspalvelu.fi — session cookie set
     //
     // Our previous SSO warmup approach used the dedicated
     // login.cloudia.net/user/login URL WITHOUT the application=redirect
-    // parameters, so Cloudia auth granted Cloudia dashboard access but
+    // parameter, so Cloudia auth granted Cloudia dashboard access but
     // NOT tarjouspalvelu tender access. The correct flow starts from
     // tarjouspalvelu's own corner Login button, which sets the
     // application=redirect:UUID parameter on the redirect to Cloudia.
     const tpCreds = getPortalCreds('tarjouspalvelu.fi');
     if (!tpCreds || !tpCreds.username || !tpCreds.password) {
-      console.log(` ⚠️ tarjouspalvelu: no credentials configured — bailing`);
+      console.log(`    ⚠️  tarjouspalvelu: no credentials configured — bailing`);
       return [];
     }
 
@@ -8072,7 +8072,7 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       const cookiesBefore = await page.cookies('https://tarjouspalvelu.fi', 'https://login.cloudia.net');
       const cloudia = cookiesBefore.filter((c) => /cloudia/i.test(c.domain)).map((c) => c.name);
       const tp = cookiesBefore.filter((c) => /tarjouspalvelu/i.test(c.domain)).map((c) => c.name);
-      console.log(` 🇫🇮 tarjouspalvelu: cookies before login — cloudia=[${cloudia.join(',')}] tarjouspalvelu=[${tp.join(',')}]`);
+      console.log(`    🇫🇮 tarjouspalvelu: cookies before login — cloudia=[${cloudia.join(',')}] tarjouspalvelu=[${tp.join(',')}]`);
     } catch (_) {}
 
     // Step 1.5: ALREADY-AUTHENTICATED detection (2026-05-15 fix).
@@ -8081,9 +8081,9 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
     // URL renders WITHOUT login form — instead we see the authenticated
     // supplier portal ("My profile / Log out / sales@cornercasetech.com").
     // Detection signals:
-    // 1. `TarjPalv` cookie on tarjouspalvelu.fi domain
-    // 2. Body contains "Log out" / "Kirjaudu ulos" / our email
-    // 3. URL contains /UX/TP/ (authenticated supplier portal route)
+    //   1. `TarjPalv` cookie on tarjouspalvelu.fi domain
+    //   2. Body contains "Log out" / "Kirjaudu ulos" / our email
+    //   3. URL contains /UX/TP/ (authenticated supplier portal route)
     // If authenticated, SKIP the entire email/login flow and proceed
     // directly to ZIP fetch.
     let alreadyAuthenticated = false;
@@ -8103,7 +8103,7 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       alreadyAuthenticated = hasTarjPalv && (authMarker?.hasLoggedOut || authMarker?.hasOurEmail || onAuthRoute);
       if (alreadyAuthenticated) {
         console.log(
-          ` ✅ tarjouspalvelu: ALREADY authenticated (TarjPalv=${hasTarjPalv}, ` +
+          `    ✅ tarjouspalvelu: ALREADY authenticated (TarjPalv=${hasTarjPalv}, ` +
           `logOutMarker=${!!authMarker?.hasLoggedOut}, emailInBody=${!!authMarker?.hasOurEmail}, ` +
           `onAuthRoute=${onAuthRoute}) — skipping login, proceeding to ZIP fetch`
         );
@@ -8186,16 +8186,16 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
     }, tpCreds.username).catch(() => ({ ok: false, reason: 'evaluate-error' }));
     if (!emailFieldFilled.ok) {
       console.log(
-        ` ⚠️ tarjouspalvelu: email input not found (${emailFieldFilled.reason}) — ` +
+        `    ⚠️  tarjouspalvelu: email input not found (${emailFieldFilled.reason}) — ` +
         `${emailFieldFilled.visibleInputs || 0}/${emailFieldFilled.totalInputs || 0} visible inputs. ` +
         `Sample: ${JSON.stringify((emailFieldFilled.sample || []).slice(0, 5))}`
       );
       // 2026-05-15 fix v3: even without email pre-fill, try clicking the
       // Login button. Maybe the click navigates to cloudia.net where we
       // can fill BOTH email and password fields. Don't bail entirely.
-      console.log(` 🇫🇮 tarjouspalvelu: attempting Login click WITHOUT email pre-fill (will fill on Cloudia page)`);
+      console.log(`    🇫🇮 tarjouspalvelu: attempting Login click WITHOUT email pre-fill (will fill on Cloudia page)`);
     } else {
-      console.log(` 🇫🇮 tarjouspalvelu: email filled (${emailFieldFilled.sel}, placeholder="${emailFieldFilled.placeholder}") — clicking Login`);
+      console.log(`    🇫🇮 tarjouspalvelu: email filled (${emailFieldFilled.sel}, placeholder="${emailFieldFilled.placeholder}") — clicking Login`);
     }
 
     // Step 3: Click Login button. Could be a submit input/button,
@@ -8217,10 +8217,10 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       return { ok: false };
     }).catch(() => ({ ok: false }));
     if (!loginClicked.ok) {
-      console.log(` ⚠️ tarjouspalvelu: Login button not found — bailing`);
+      console.log(`    ⚠️  tarjouspalvelu: Login button not found — bailing`);
       return [];
     }
-    console.log(` 🇫🇮 tarjouspalvelu: Login clicked ("${loginClicked.text}") — waiting for Cloudia page`);
+    console.log(`    🇫🇮 tarjouspalvelu: Login clicked ("${loginClicked.text}") — waiting for Cloudia page`);
 
     // Step 4: Wait for navigation to login.cloudia.net page.
     try {
@@ -8231,16 +8231,16 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
 
     // Step 5: Multi-step login state machine. 2026-05-15 fix v3:
     // FI run revealed the actual flow has THREE pages:
-    // Page A: tarjouspalvelu.fi/<tenant>?id=X — only LOG IN button
-    // (no email field visible, hidden via CSS/modal)
-    // Page B: tarjouspalvelu.fi/UX/TP/SiirryTarjouspyyntoon/?tpId=X&p=Y
-    // — intermediate page with email input (NO password yet)
-    // Page C: login.cloudia.net/user/login?username=X&application=redirect:UUID
-    // — password input
+    //   Page A: tarjouspalvelu.fi/<tenant>?id=X — only LOG IN button
+    //           (no email field visible, hidden via CSS/modal)
+    //   Page B: tarjouspalvelu.fi/UX/TP/SiirryTarjouspyyntoon/?tpId=X&p=Y
+    //           — intermediate page with email input (NO password yet)
+    //   Page C: login.cloudia.net/user/login?username=X&application=redirect:UUID
+    //           — password input
     // After password submit → redirects back to tarjouspalvelu.fi (auth).
     //
     // State machine: up to 4 iterations of "look for inputs, fill, submit, wait".
-    // Each iteration handles one side of the chain.
+    // Each iteration handles one page of the chain.
     let passFilled = { ok: false, reason: 'not-attempted' };
     for (let step = 0; step < 4; step++) {
       const stepResult = await page.evaluate((email, password) => {
@@ -8292,7 +8292,7 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
         return { state: 'no-field', url: location.href };
       }, tpCreds.username, tpCreds.password).catch(() => ({ state: 'evaluate-error' }));
 
-      console.log(` 🇫🇮 tarjouspalvelu: login step ${step + 1} — state=${stepResult.state}, url=${(stepResult.url || '').slice(-60)}`);
+      console.log(`    🇫🇮 tarjouspalvelu: login step ${step + 1} — state=${stepResult.state}, url=${(stepResult.url || '').slice(-60)}`);
 
       if (stepResult.state === 'both-filled') {
         passFilled = { ok: true, url: stepResult.url };
@@ -8318,10 +8318,10 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       }
     }
     if (!passFilled.ok) {
-      console.log(` ⚠️ tarjouspalvelu: password field not found on ${(passFilled.url || '').slice(-60)} (${passFilled.reason}) — bailing`);
+      console.log(`    ⚠️  tarjouspalvelu: password field not found on ${(passFilled.url || '').slice(-60)} (${passFilled.reason}) — bailing`);
       return [];
     }
-    console.log(` 🇫🇮 tarjouspalvelu: password filled on ${(passFilled.url || '').slice(-60)} — submitting`);
+    console.log(`    🇫🇮 tarjouspalvelu: password filled on ${(passFilled.url || '').slice(-60)} — submitting`);
 
     // Step 6: Click submit button.
     let pwSubmitFired = false;
@@ -8338,7 +8338,7 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       }
     }
     if (!pwSubmitFired) {
-      console.log(` ⚠️ tarjouspalvelu: no submit method worked — bailing`);
+      console.log(`    ⚠️  tarjouspalvelu: no submit method worked — bailing`);
       return [];
     }
     try {
@@ -8353,7 +8353,7 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       const cloudia = cookiesAfter.filter((c) => /cloudia/i.test(c.domain)).map((c) => c.name);
       const tp = cookiesAfter.filter((c) => /tarjouspalvelu/i.test(c.domain)).map((c) => c.name);
       const finalUrl = page.url();
-      console.log(` 🇫🇮 tarjouspalvelu: cookies after login — cloudia=[${cloudia.join(',')}] tarjouspalvelu=[${tp.join(',')}] | URL=${finalUrl.slice(-80)}`);
+      console.log(`    🇫🇮 tarjouspalvelu: cookies after login — cloudia=[${cloudia.join(',')}] tarjouspalvelu=[${tp.join(',')}] | URL=${finalUrl.slice(-80)}`);
       // Auth-cookie heuristic — if we have ANY cookie name suggesting
       // auth (Auth/Login/Token/Session beyond the basic SessionId we
       // had pre-login), consider it OK.
@@ -8361,9 +8361,9 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       loginVerified = newCookies.some((n) => /auth|login|token|sso|signin/i.test(n)) || /tarjouspalvelu/i.test(finalUrl);
     } catch (_) {}
     if (!loginVerified) {
-      console.log(` ⚠️ tarjouspalvelu: login verification weak — proceeding anyway`);
+      console.log(`    ⚠️  tarjouspalvelu: login verification weak — proceeding anyway`);
     } else {
-      console.log(` ✅ tarjouspalvelu: login verified`);
+      console.log(`    ✅ tarjouspalvelu: login verified`);
     }
 
     // Step 8: Navigate back to source URL — Cloudia might have landed
@@ -8372,13 +8372,13 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
       try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
       await new Promise((r) => setTimeout(r, 1500));
-      console.log(` 🇫🇮 tarjouspalvelu: re-anchored to source URL — ${page.url().slice(-80)}`);
+      console.log(`    🇫🇮 tarjouspalvelu: re-anchored to source URL — ${page.url().slice(-80)}`);
     } catch (_) { /* best-effort */ }
     } // close `if (!alreadyAuthenticated) {` block — login flow only runs when not already auth.
 
     // Build the ZIP URL — tenant-relative.
     const zipUrl = `https://tarjouspalvelu.fi/Zip/TarjousPyynnonLiitteet/${noticeId}`;
-    console.log(` 🇫🇮 tarjouspalvelu: tender ${noticeId} (tenant=${tenant || 'n/a'}) — fetching ZIP from ${zipUrl}`);
+    console.log(`    🇫🇮 tarjouspalvelu: tender ${noticeId} (tenant=${tenant || 'n/a'}) — fetching ZIP from ${zipUrl}`);
 
     const result = await page.evaluate(async (url) => {
       try {
@@ -8391,10 +8391,10 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
         const cd = resp.headers.get('content-disposition') || '';
         const ab = await resp.arrayBuffer();
         return {
-          OK: true,
+          ok: true,
           status: resp.status,
           ct,
-          CD,
+          cd,
           url: resp.url || url,
           data: Array.from(new Uint8Array(ab)),
         };
@@ -8405,17 +8405,17 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
 
     if (!result || !result.ok || !result.data || result.data.length < 1024) {
       const status = result?.status || result?.error || '?';
-      console.log(` ⚠️ tarjouspalvelu: ZIP fetch failed (status=${status}, len=${result?.data?.length || 0})`);
+      console.log(`    ⚠️  tarjouspalvelu: ZIP fetch failed (status=${status}, len=${result?.data?.length || 0})`);
       return [];
     }
     const buf = Buffer.from(result.data);
     // Verify ZIP magic — sometimes auth wall returns HTML with 200.
     if (buf[0] !== 0x50 || buf[1] !== 0x4b) {
       const sniff = buf.slice(0, 80).toString('utf8').replace(/\s+/g, ' ').slice(0, 80);
-      console.log(` ⚠️ tarjouspalvelu: response is not a ZIP (ct=${result.ct}, sniff="${sniff}"). Likely auth wall — login session may be invalid.`);
+      console.log(`    ⚠️  tarjouspalvelu: response is not a ZIP (ct=${result.ct}, sniff="${sniff}"). Likely auth wall — login session may be invalid.`);
       return [];
     }
-    console.log(` 🇫🇮 tarjouspalvelu: ZIP captured (${buf.length}B, ct=${result.ct})`);
+    console.log(`    🇫🇮 tarjouspalvelu: ZIP captured (${buf.length}B, ct=${result.ct})`);
 
     const texts = [];
     try {
@@ -8439,7 +8439,7 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
         .map((e) => ({ entry: e, score: scoreOf(e.entryName) }))
         .sort((a, b) => b.score - a.score)
         .slice(0, 6);
-      console.log(` 🇫🇮 tarjouspalvelu: ZIP has ${entries.length} entries, parsing top ${docEntries.length} (PDFs/DOCXs)`);
+      console.log(`    🇫🇮 tarjouspalvelu: ZIP has ${entries.length} entries, parsing top ${docEntries.length} (PDFs/DOCXs)`);
       for (const item of docEntries) {
         const entry = item.entry;
         const name = entry.entryName.slice(-100);
@@ -8458,23 +8458,23 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
           if (text.length > 200) {
             const clipped = text.slice(0, 80000);
             texts.push(`--- (tarjouspalvelu) ${name} ---\n${clipped}`);
-            console.log(` 🇫🇮 tarjouspalvelu: parsed "${name}" (${data.length}B → ${clipped.length}ch, score=${item.score})`);
+            console.log(`    🇫🇮 tarjouspalvelu: parsed "${name}" (${data.length}B → ${clipped.length}ch, score=${item.score})`);
             _collectDriveFile(name, Buffer.isBuffer(data) ? data : Buffer.from(data));
           } else {
-            console.log(` ⚠️ tarjouspalvelu: "${name}" extracted text too short (${text.length}ch)`);
+            console.log(`    ⚠️  tarjouspalvelu: "${name}" extracted text too short (${text.length}ch)`);
           }
         } catch (e) {
-          console.log(` ⚠️ tarjouspalvelu: parse failed for "${name}": ${(e.message || '').slice(0, 80)}`);
+          console.log(`    ⚠️  tarjouspalvelu: parse failed for "${name}": ${(e.message || '').slice(0, 80)}`);
         }
       }
     } catch (e) {
-      console.log(` ⚠️ tarjouspalvelu: ZIP parse error: ${(e.message || '').slice(0, 100)}`);
+      console.log(`    ⚠️  tarjouspalvelu: ZIP parse error: ${(e.message || '').slice(0, 100)}`);
     }
     return texts;
   } catch (e) {
-    console.log(` ⚠️ tarjouspalvelu handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  tarjouspalvelu handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -8483,7 +8483,7 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
 // fetchTendSignDocuments
 // ---------------------------------------------------------------------
 // TendSign (Visma Commerce) is a Swedish/Norwegian e-procurement
-// platform used by many public buyers. Tender URLs are typical
+// platform used by many public buyers. Tender URLs are typically
 // tendsign.com/Notice.aspx?UnikID=... — the announcement page itself
 // is mostly metadata; the actual procurement-document attachments
 // (Förfrågningsunderlag, Kvalificeringskrav, Bilagor) sit on the same
@@ -8493,22 +8493,22 @@ async function fetchTarjouspalveluDocuments(browser, sourceUrl) {
 // session cookie should be valid.
 //
 // Strategy (mirrors TenderNed handler):
-// 1. Stealth + 1280×900 viewport (TendSign uses Vue/jQuery — not as
-// aggressive about headless detection as TenderNed's Angular but
-// doesn't hurt).
-// 2. Navigate to source URL, settle DOM.
-// 3. Diagnostic anchor probe so we can iterate if the heuristic
-// misses a tenant variant (TendSign has multiple skins).
-// 4. Scan anchors for download patterns + score by Swedish/Norwegian
-// qualification vocabulary.
-// 5. Top 6 docs fetched via in-page fetch() (carries auth cookie).
+//   1. Stealth + 1280×900 viewport (TendSign uses Vue/jQuery — not as
+//      aggressive about headless detection as TenderNed's Angular but
+//      doesn't hurt).
+//   2. Navigate to source URL, settle DOM.
+//   3. Diagnostic anchor probe so we can iterate if the heuristic
+//      misses a tenant variant (TendSign has multiple skins).
+//   4. Scan anchors for download patterns + score by Swedish/Norwegian
+//      qualification vocabulary.
+//   5. Top 6 docs fetched via in-page fetch() (carries auth cookie).
 // =====================================================================
 async function fetchTendSignDocuments(browser, sourceUrl) {
   try {
     const u = new URL(sourceUrl);
     if (!/(^|\.)tendsign\.com$/i.test(u.hostname)) return [];
     // Defense in depth — if the source URL is still the gated doc.aspx
-    // variant (eg handler entered through a code path that bypassed
+    // variant (e.g. handler entered through a code path that bypassed
     // the rewriter in fetchSourcePageDetails), rewrite it now.
     if (/\/doc\.aspx/i.test(u.pathname)) {
       const noticeId = u.searchParams.get('MeFormsNoticeId') || u.searchParams.get('UnikID');
@@ -8520,9 +8520,9 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
 
   let pdfParseLib = null, mammothLib = null, admZipLib = null, XLSXLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-  try { mammothLib = require('mammoth'); } catch (_) {}
-  try { admZipLib = require('adm-zip'); } catch (_) {}
-  try { XLSXLib = require('xlsx'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
+  try { XLSXLib     = require('xlsx');      } catch (_) {}
 
   let page = null;
   try {
@@ -8547,24 +8547,24 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e) {
-      console.log(` 🇸🇪 tendsign: nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇸🇪 tendsign: nav warn: ${(e.message || '').slice(0, 80)}`);
     }
     try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
     await new Promise((r) => setTimeout(r, 1200));
 
     // STEP 1 — find the Documents tab anchor on the Advertisement
-    // (p_meformsnotice.aspx) page. User confirmed DOM 2026-05-13:
-    // <a class="topmenulinkhighlight"
-    // href="p_documents.aspx?UniqueId=&MeFormsNoticeId=91596&DocumentID=&BuyerProjectID=<opaque>">
-    // Document
-    // </a>
+    // (p_meformsnotice.aspx) page. User-confirmed DOM 2026-05-13:
+    //   <a class="topmenulinkhighlight"
+    //      href="p_documents.aspx?UniqueId=&MeFormsNoticeId=91596&DocumentID=&BuyerProjectID=<opaque>">
+    //     Document
+    //   </a>
     // BuyerProjectID is an opaque session token we can't construct —
     // must scrape it from the rendered page.
     if (/\/p_meformsnotice\.aspx/i.test(new URL(page.url()).pathname)) {
       // v4: handle THREE distinct TendSign Documents-tab anchor shapes:
-      // Flow A: <a href="p_documents.aspx?MeFormsNoticeId=X&BuyerProjectID=Y">
-      // Flow B: <a href="s_view_advertfiles.aspx?UniqueId=X&BuyerProjectID=Y">
-      // Flow C: <a href="../doc.aspx?MeFormsNoticeId=X&Goto=Docs">
+      //   Flow A:  <a href="p_documents.aspx?MeFormsNoticeId=X&BuyerProjectID=Y">
+      //   Flow B:  <a href="s_view_advertfiles.aspx?UniqueId=X&BuyerProjectID=Y">
+      //   Flow C:  <a href="../doc.aspx?MeFormsNoticeId=X&Goto=Docs">
       // Flow C is what the PUBLIC anonymous view emits when no buyer-
       // session cookie is present (user-confirmed DOM 2026-05-14 for
       // MeFormsNoticeId=91377). Clicking lands on a login wall; once
@@ -8601,7 +8601,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
       // to the bare doc.aspx?MeFormsNoticeId=<id> URL (NO Goto param);
       // with auth cookies present, tendsign renders the BUYER view of
       // the tender, which exposes Flow A or B anchors with proper
-      //BuyerProjectID. Then we follow that anchor as usual.
+      // BuyerProjectID. Then we follow that anchor as usual.
       let resolvedDocsTabUrl = docsTabUrl;
       if (!resolvedDocsTabUrl) {
         // Extract MeFormsNoticeId from current URL (already on public
@@ -8613,13 +8613,13 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
         } catch (_) {}
         if (noticeIdProbe && /^\d+$/.test(noticeIdProbe)) {
           const buyerProbeUrl = `https://tendsign.com/doc.aspx?MeFormsNoticeId=${noticeIdProbe}`;
-          console.log(` 🇸🇪 tendsign: no Flow A/B with BuyerProjectID on public view — probing buyer-view ${buyerProbeUrl}`);
+          console.log(`    🇸🇪 tendsign: no Flow A/B with BuyerProjectID on public view — probing buyer-view ${buyerProbeUrl}`);
           try {
             await page.goto(buyerProbeUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
             try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
             await new Promise((r) => setTimeout(r, 1200));
           } catch (e) {
-            console.log(` ⚠️ tendsign: buyer-view nav failed: ${(e.message || '').slice(0, 80)}`);
+            console.log(`    ⚠️  tendsign: buyer-view nav failed: ${(e.message || '').slice(0, 80)}`);
           }
           // Did we land on a login form? If so, cookies didn't carry —
           // bail; the Flow C path below would just hit the same wall.
@@ -8636,16 +8636,16 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
             // (set in a separate page context) DON'T carry into doc.aspx
             // fresh navigation. User-confirmed flow that DOES work in a
             // real browser:
-            // 1. Visit doc.aspx?MeFormsNoticeId=X
-            // 2. Tendsign 302s to login.aspx?URL=s_meformsnotice.aspx?MeFormsNoticeId=X
-            // 3. Fill credentials INLINE in same tab + submit
-            // 4. Tendsign creates session tied to THIS tender's URL
-            // 5. Lands on buyer view with Documents tab visible
+            //   1. Visit doc.aspx?MeFormsNoticeId=X
+            //   2. Tendsign 302s to login.aspx?URL=s_meformsnotice.aspx?MeFormsNoticeId=X
+            //   3. Fill credentials INLINE in same tab + submit
+            //   4. Tendsign creates session tied to THIS tender's URL
+            //   5. Lands on buyer view with Documents tab visible
             // So we need to submit credentials in THIS page (not give up).
-            console.log(` 🇸🇪 tendsign: buyer-view probe hit login wall — attempting INLINE login to establish tender-bound session`);
+            console.log(`    🇸🇪 tendsign: buyer-view probe hit login wall — attempting INLINE login to establish tender-bound session`);
             const tsCreds = getPortalCreds('tendsign.com');
             if (!tsCreds || !tsCreds.username || !tsCreds.password) {
-              console.log(` ⚠️ tendsign: no credentials for inline login — bailing`);
+              console.log(`    ⚠️  tendsign: no credentials for inline login — bailing`);
             } else {
               // Find username + password fields on the login page.
               const sels = await page.evaluate(() => {
@@ -8671,7 +8671,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
                 };
               }).catch(() => ({ userSel: null, passSel: null }));
               if (!sels.passSel) {
-                console.log(` ⚠️ tendsign: inline login — password field not found, bailing`);
+                console.log(`    ⚠️  tendsign: inline login — password field not found, bailing`);
               } else {
                 try {
                   if (sels.userSel) {
@@ -8696,7 +8696,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
                     }
                   }
                   if (submitFired) {
-                    console.log(` 🇸🇪 tendsign: inline login submitted — waiting for buyer view`);
+                    console.log(`    🇸🇪 tendsign: inline login submitted — waiting for buyer view`);
                     await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 })
                       .catch(() => null);
                     await new Promise((r) => setTimeout(r, 1500));
@@ -8707,12 +8707,12 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
                       bodyLen: (document.body?.innerText || '').length,
                     })).catch(() => null);
                     if (afterLogin && !afterLogin.hasPass) {
-                      console.log(` ✅ tendsign: inline login OK — on ${(afterLogin.url || '').slice(-60)}, bodyLen=${afterLogin.bodyLen}`);
+                      console.log(`    ✅ tendsign: inline login OK — on ${(afterLogin.url || '').slice(-60)}, bodyLen=${afterLogin.bodyLen}`);
                       // 2026-05-15 fix v2: when bodyLen is suspiciously
-                      // small (eg 0) RIGHT after login, page might not
+                      // small (e.g. 0) RIGHT after login, page might not
                       // have rendered yet — give it 3 more seconds.
                       if (afterLogin.bodyLen < 500) {
-                        console.log(` 🇸🇪 tendsign: bodyLen=${afterLogin.bodyLen} suspicious — waiting extra 3s for render`);
+                        console.log(`    🇸🇪 tendsign: bodyLen=${afterLogin.bodyLen} suspicious — waiting extra 3s for render`);
                         await new Promise((r) => setTimeout(r, 3000));
                       }
                       // Now scan for Flow A/B anchor on this buyer view.
@@ -8728,7 +8728,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
                         return null;
                       }).catch(() => null);
                       if (resolvedDocsTabUrl) {
-                        console.log(` 🇸🇪 tendsign: inline-login → Flow A/B URL with BuyerProjectID resolved`);
+                        console.log(`    🇸🇪 tendsign: inline-login → Flow A/B URL with BuyerProjectID resolved`);
                       } else {
                         // 2026-05-15 fix v2: when inline login lands on
                         // /supplier/start.aspx (dashboard, not tender),
@@ -8739,7 +8739,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
                         const onSupplierStart = /\/supplier\/start\.aspx/i.test(afterLogin.url || '');
                         if (onSupplierStart && noticeIdProbe) {
                           const supplierTenderUrl = `https://tendsign.com/supplier/s_meformsnotice.aspx?MeFormsNoticeId=${noticeIdProbe}`;
-                          console.log(` 🇸🇪 tendsign: landed on /supplier/start.aspx — navigating to specific tender URL ${supplierTenderUrl}`);
+                          console.log(`    🇸🇪 tendsign: landed on /supplier/start.aspx — navigating to specific tender URL ${supplierTenderUrl}`);
                           try {
                             await page.goto(supplierTenderUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
                             try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
@@ -8749,7 +8749,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
                               hasPass: !!document.querySelector('input[type="password"]:not([disabled]):not([aria-hidden="true"])'),
                               bodyLen: (document.body?.innerText || '').length,
                             })).catch(() => null);
-                            console.log(` 🇸🇪 tendsign: supplier-tender page state: url=${(supplierState?.url || '').slice(-60)}, bodyLen=${supplierState?.bodyLen || 0}, hasPass=${supplierState?.hasPass || false}`);
+                            console.log(`    🇸🇪 tendsign: supplier-tender page state: url=${(supplierState?.url || '').slice(-60)}, bodyLen=${supplierState?.bodyLen || 0}, hasPass=${supplierState?.hasPass || false}`);
                             // Re-scan for Flow A/B anchor on supplier view.
                             resolvedDocsTabUrl = await page.evaluate(() => {
                               const anchors = Array.from(document.querySelectorAll('a[href]'));
@@ -8763,23 +8763,23 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
                               return null;
                             }).catch(() => null);
                             if (resolvedDocsTabUrl) {
-                              console.log(` ✅ tendsign: supplier-tender nav → Flow A/B URL resolved`);
+                              console.log(`    ✅ tendsign: supplier-tender nav → Flow A/B URL resolved`);
                             } else {
-                              console.log(` ⚠️ tendsign: supplier-tender page has no Flow A/B anchor — likely buyer hasn't approved our account for this tender`);
+                              console.log(`    ⚠️  tendsign: supplier-tender page has no Flow A/B anchor — likely buyer hasn't approved our account for this tender`);
                             }
                           } catch (e) {
-                            console.log(` ⚠️ tendsign: supplier-tender nav failed: ${(e.message || '').slice(0, 80)}`);
+                            console.log(`    ⚠️  tendsign: supplier-tender nav failed: ${(e.message || '').slice(0, 80)}`);
                           }
                         } else {
-                          console.log(` ⚠️ tendsign: inline login OK but no Flow A/B anchor in DOM`);
+                          console.log(`    ⚠️  tendsign: inline login OK but no Flow A/B anchor in DOM`);
                         }
                       }
                     } else {
                       // 2026-05-15 diagnostic: capture error messages /
-                      // validation hints on the login page as we know
-                      // WHY didn't submit't clear password. Look for
+                      // validation hints on the login page so we know
+                      // WHY submit didn't clear password. Look for
                       // common Swedish/English login-fail signals
-                      // (Invalid / Felactig / Captcha / Account locked).
+                      // (Invalid / Felaktig / Captcha / Account locked).
                       const failDiag = await page.evaluate(() => {
                         const body = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
                         // Heuristic — extract error-looking sentences.
@@ -8797,17 +8797,17 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
                             .filter((t) => t.length > 0),
                         };
                       }).catch(() => null);
-                      console.log(` ⚠️ tendsign: inline login didn't clear password field — url=${(afterLogin?.url || '').slice(-60)}`);
+                      console.log(`    ⚠️  tendsign: inline login didn't clear password field — url=${(afterLogin?.url || '').slice(-60)}`);
                       if (failDiag) {
-                        console.log(` 🔍 tendsign post-fail diag: bodyLen=${failDiag.bodyLen}, errorHints=${JSON.stringify(failDiag.errorHints)}, errorElements=${JSON.stringify(failDiag.errorElements)}`);
-                        if (failDiag.bodyHead) console.log(` 🔍 tendsign post-fail body head: "${failDiag.bodyHead.slice(0, 250)}"`);
+                        console.log(`    🔍 tendsign post-fail diag: bodyLen=${failDiag.bodyLen}, errorHints=${JSON.stringify(failDiag.errorHints)}, errorElements=${JSON.stringify(failDiag.errorElements)}`);
+                        if (failDiag.bodyHead) console.log(`    🔍 tendsign post-fail body head: "${failDiag.bodyHead.slice(0, 250)}"`);
                       }
                     }
                   } else {
-                    console.log(` ⚠️ tendsign: inline login submit failed (no button matched)`);
+                    console.log(`    ⚠️  tendsign: inline login submit failed (no button matched)`);
                   }
                 } catch (e) {
-                  console.log(` ⚠️ tendsign: inline login error: ${(e.message || '').slice(0, 80)}`);
+                  console.log(`    ⚠️  tendsign: inline login error: ${(e.message || '').slice(0, 80)}`);
                 }
               }
             }
@@ -8825,9 +8825,9 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
               return null;
             }).catch(() => null);
             if (resolvedDocsTabUrl) {
-              console.log(` 🇸🇪 tendsign: buyer-view resolved → Flow A/B URL with BuyerProjectID`);
+              console.log(`    🇸🇪 tendsign: buyer-view resolved → Flow A/B URL with BuyerProjectID`);
             } else {
-              console.log(` ⚠️ tendsign: buyer-view rendered but no Flow A/B anchor found`);
+              console.log(`    ⚠️  tendsign: buyer-view rendered but no Flow A/B anchor found`);
             }
           }
         }
@@ -8837,19 +8837,19 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
 
       if (finalDocsTabUrl) {
         const flowLabel = /s_view_advertfiles/i.test(finalDocsTabUrl) ? 'B' : 'A';
-        console.log(` 🇸🇪 tendsign: Documents tab (Flow ${flowLabel}) → ${finalDocsTabUrl.slice(0, 110)}`);
+        console.log(`    🇸🇪 tendsign: Documents tab (Flow ${flowLabel}) → ${finalDocsTabUrl.slice(0, 110)}`);
         try {
           await page.goto(finalDocsTabUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
           try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
           await new Promise((r) => setTimeout(r, 1200));
         } catch (e) {
-          console.log(` ⚠️ tendsign: Documents tab nav failed: ${(e.message || '').slice(0, 80)}`);
+          console.log(`    ⚠️  tendsign: Documents tab nav failed: ${(e.message || '').slice(0, 80)}`);
         }
 
         // Flow B continuation — if we're on s_view_advertfiles.aspx
         // (NOT in /supplier/ yet), look for the "Next step" button.
         // User-confirmed onclick payload:
-        // document.location.href='../supplier/s_view_advertfiles.aspx?UniqueId=X&BuyerProjectID=Y'
+        //   document.location.href='../supplier/s_view_advertfiles.aspx?UniqueId=X&BuyerProjectID=Y'
         if (/s_view_advertfiles\.aspx/i.test(new URL(page.url()).pathname)
             && !/\/supplier\//i.test(new URL(page.url()).pathname)) {
           const nextStepUrl = await page.evaluate(() => {
@@ -8868,36 +8868,36 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
             return null;
           }).catch(() => null);
           if (nextStepUrl) {
-            console.log(` 🇸🇪 tendsign: Next step → ${nextStepUrl.slice(0, 110)}`);
+            console.log(`    🇸🇪 tendsign: Next step → ${nextStepUrl.slice(0, 110)}`);
             try {
               await page.goto(nextStepUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
               try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
               await new Promise((r) => setTimeout(r, 1200));
             } catch (e) {
-              console.log(` ⚠️ tendsign: Next step nav failed: ${(e.message || '').slice(0, 80)}`);
+              console.log(`    ⚠️  tendsign: Next step nav failed: ${(e.message || '').slice(0, 80)}`);
             }
           } else {
-            console.log(` ⚠️ tendsign: on s_view_advertfiles but no "Next step" button found`);
+            console.log(`    ⚠️  tendsign: on s_view_advertfiles but no "Next step" button found`);
           }
         }
       } else {
-        console.log(` ⚠️ tendsign: no Documents tab anchor on p_meformsnotice.aspx — staying on Advertisement view`);
+        console.log(`    ⚠️  tendsign: no Documents tab anchor on p_meformsnotice.aspx — staying on Advertisement view`);
       }
     }
 
-    // STEP 2 — scan for download URLs. Via user-confirmed DOM
+    // STEP 2 — scan for download URLs. Per user-confirmed DOM
     // 2026-05-13, each document is a <a href="javascript:void(0);"
     // onclick="javascript:window.open('../tools/download.aspx?Filename=
-    // X&ObjectType=1&ObjectID=<opaque>&PathType=1&Report=1', ...);">
+    //   X&ObjectType=1&ObjectID=<opaque>&PathType=1&Report=1', ...);">
     // <text>Document name</text></a>. The href is meaningless —
     // the real URL is inside the onclick string. Extract it with a
     // regex, resolve relative to the current page (which is on
-    // /public/p_documents.aspx like this ../tools/download.aspx →
+    // /public/p_documents.aspx so ../tools/download.aspx →
     // /tools/download.aspx).
     const probe = await page.evaluate(() => {
       const RX_WINDOW_OPEN = /window\.open\(\s*['"]([^'"]+)['"]/i;
-      const RX_DOC_PATH = /\/(?:tools\/download|DownloadAttachment|DownloadDocument|DownloadFile|GetFile|GetDocument|Attachment(?:s)?|Document(?:s)?)\.aspx/i;
-      const RX_DOC_EXT = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:[?&]|$)/i;
+      const RX_DOC_PATH    = /\/(?:tools\/download|DownloadAttachment|DownloadDocument|DownloadFile|GetFile|GetDocument|Attachment(?:s)?|Document(?:s)?)\.aspx/i;
+      const RX_DOC_EXT     = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:[?&]|$)/i;
       const seen = new Set();
       const docs = [];
       const sampleHrefs = [];
@@ -8963,12 +8963,12 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
     }).catch(() => ({ docs: [], totalAnchors: 0, sampleHrefs: [] }));
 
     console.log(
-      ` 🇸🇪 tendsign: page=${(new URL(page.url())).pathname.slice(-32)}, ${probe.totalAnchors} anchor(s), ` +
+      `    🇸🇪 tendsign: page=${(new URL(page.url())).pathname.slice(-32)}, ${probe.totalAnchors} anchor(s), ` +
       `${probe.docs.length} doc candidate(s)`
     );
     if (!probe.docs.length) {
       console.log(
-        ` 🇸🇪 tendsign: no download anchors matched — sample hrefs: ` +
+        `    🇸🇪 tendsign: no download anchors matched — sample hrefs: ` +
         JSON.stringify(probe.sampleHrefs.slice(0, 6))
       );
       return [];
@@ -8978,13 +8978,13 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
     // Kvalificeringskrav / Krav på anbudsgivaren / Skakrav (must-haves)
     // — the document classes the user explicitly cares about. Vocab
     // refined per user-confirmed DOM 2026-05-13 (Administrativa krav,
-    // General Krav, Krav with an budsgivaren are recurring section
+    // Generella krav, Krav på anbudsgivaren are recurring section
     // names on TendSign-hosted Swedish tenders).
     const SCORE_RULES = [
       { rx: /Kvalificering(?:skrav)?|Krav\s+p[åa]\s+(?:anbudsgivare|leverant[öo]r|leverand[øo]r)|Lev(?:erant[öo]r)?krav|Skakrav|qualification\s*criteria|tender(?:er)?\s+requirements/i, score: 30 },
       { rx: /Administrativa\s+krav|Generella\s+krav|Krav\s+p[åa]\s+(?:tj[äa]nsten|varan|leveransen)|Uteslutningsgrund/i, score: 25 },
-      { rx: /F[öo]rfr[åa]gningsunderlag|FFU|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdocument|RFT|RFP|tender\s*document|Upphandlingsf[öo]reskrifter/i, score: 18 },
-      { rx: /AUC\b|Administrativa\s+f[öo]rekrifter|administrative\s*provisions/i, score: 12 },
+      { rx: /F[öo]rfr[åa]gningsunderlag|FFU|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdokument|RFT|RFP|tender\s*document|Upphandlingsf[öo]reskrifter/i, score: 18 },
+      { rx: /AUC\b|Administrativa\s+f[öo]reskrifter|administrative\s*provisions/i, score: 12 },
       { rx: /Anbudsformul[äa]r|Tilbudsformular|tender\s*form|bid\s*form|Egenf[öo]rs[äa]kran|ESPD|UEA|Uniform\s*European|Anbudsinbjudan/i, score: 10 },
       { rx: /Utv[äa]rderingskriterier|Grund\s+f[öo]r\s+tilldelning|tilldelningskriterier|award\s*criteria|evaluation\s*criteria/i, score: 8 },
       { rx: /Bilaga|Bilagor|Attachment|Vedlegg|appendix|H[åa]llbarhet|Sanningsf[öo]rs[äa]kran/i, score: 5 },
@@ -8992,7 +8992,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
     for (const d of probe.docs) {
       d.score = 0;
       // Score against the human-readable anchor text, the URL, AND
-      // the decoded filename (often the most specific signal — eg
+      // the decoded filename (often the most specific signal — e.g.
       // "2.Administrativa+krav-1.pdf" → "Administrativa krav").
       const targets = [d.name || '', d.url || '', d.filename || ''];
       for (const r of SCORE_RULES) {
@@ -9001,10 +9001,10 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
         }
       }
     }
-    sample.docs.sort((a, b) => b.score - a.score);
+    probe.docs.sort((a, b) => b.score - a.score);
     const topDocs = probe.docs.slice(0, 6);
     console.log(
-      ` 🇸🇪 tendsign: priority docs: ` +
+      `    🇸🇪 tendsign: priority docs: ` +
       topDocs.map((d) => `${(d.filename || d.name).slice(0, 40)}[s=${d.score}]`).join(' | ')
     );
 
@@ -9036,7 +9036,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
     // blobs (login redirect pages). UiT Norges 93074 case: anonymous flow
     // pulls PDF/DOCX (Konkurransebestemmelser, Tilbudsbrev) successfully
     // but the 3 XLSB Vedlegg files containing personnel/CV requirements
-    // return ct=text/html. We track htmlBlobCount and signal the FORCE
+    // return ct=text/html. We track htmlBlobCount and signal the FORCE-
     // LOGIN guard via _SOURCE_HANDLER_NEEDS_AUTH after the loop, so the
     // caller forces login + re-fetch.
     let htmlBlobCount = 0;
@@ -9053,7 +9053,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
           const cd = resp.headers.get('content-disposition') || '';
           const ab = await resp.arrayBuffer();
           return {
-            OK: true,
+            ok: true,
             status: resp.status,
             ct, cd,
             url: resp.url || url,
@@ -9072,12 +9072,12 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
         if (!isHtmlAuthWall) {
           buf = tmpBuf;
         } else {
-          console.log(` 🇸🇪 tendsign: "${labelName.slice(0, 40)}" — fetch got HTML, trying CDP download`);
+          console.log(`    🇸🇪 tendsign: "${labelName.slice(0, 40)}" — fetch got HTML, trying CDP download`);
         }
       }
       // STEP 2 — CDP download via navigation. ASP.NET /tools/download.aspx
       // serves PDFs only when the request comes through a session-bearing
-      //browser navigation. page.goto on a download URL triggers Chromium's
+      // browser navigation. page.goto on a download URL triggers Chromium's
       // download manager (with downloadPath set), writes file to disk.
       if (!buf && cdpSession && downloadDir) {
         try {
@@ -9115,17 +9115,17 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
           if (downloadedPath) {
             buf = fs.readFileSync(downloadedPath);
             viaDisk = true;
-            console.log(` 🇸🇪 tendsign: "${labelName.slice(0, 40)}" — CDP download OK (${buf.length}B)`);
+            console.log(`    🇸🇪 tendsign: "${labelName.slice(0, 40)}" — CDP download OK (${buf.length}B)`);
           } else {
-            console.log(` ⚠️ tendsign: "${labelName.slice(0, 40)}" — CDP polling timed out`);
+            console.log(`    ⚠️  tendsign: "${labelName.slice(0, 40)}" — CDP polling timed out`);
           }
         } catch (e) {
-          console.log(` ⚠️ tendsign: CDP download error for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+          console.log(`    ⚠️  tendsign: CDP download error for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
         }
       }
       if (!buf) {
         const status = result?.status || result?.error || '?';
-        console.log(` ⚠️ tendsign: download failed for "${labelName}" (fetch=${status}, disk=${viaDisk})`);
+        console.log(`    ⚠️  tendsign: download failed for "${labelName}" (fetch=${status}, disk=${viaDisk})`);
         continue;
       }
       // ct only meaningful for fetch path; CDP path uses magic bytes.
@@ -9142,7 +9142,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
         || (buf[0] === 0x50 && buf[1] === 0x4b && /\.docx(?:[?#]|$)/i.test(doc.url));
       // 2026-06-01 (Task #136) — XLSX/XLSB/XLS detection. Run 67 UiT Norges
       // tenderyje 4 Vedlegg (.xlsb) failai liko neapdoroti, nes nei isDocx
-      // (filename no .docx), no isZip (no .zip in URL/filename) no matter.
+      // (filename ne .docx), nei isZip (no .zip in URL/filename) nepagavo.
       // XLSB/XLSX/XLSM yra ZIP container — magic bytes 0x50 0x4B. SheetJS
       // (XLSXLib) palaiko XLSB su `type: "buffer"` auto-detect (.xlsb
       // tikrai dekoduojamas, jei buffer'is yra tikras XLSB binary, ne
@@ -9185,7 +9185,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
             }
             text = parts.join('\n\n').trim();
           } catch (e) {
-            console.log(` ⚠️ tendsign: XLSX/XLSB parse error for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+            console.log(`    ⚠️  tendsign: XLSX/XLSB parse error for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
           }
         } else if (isZip && admZipLib) {
           // ZIP fallback — Bilagor sometimes ship as a single archive.
@@ -9212,24 +9212,24 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
         if (text.length > 200) {
           const clipped = text.slice(0, 80000);
           texts.push(`--- (tendsign) ${labelName} ---\n${clipped}`);
-          console.log(` 🇸🇪 tendsign: parsed "${labelName}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+          console.log(`    🇸🇪 tendsign: parsed "${labelName}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
           _collectDriveFile(labelName, buf);
         } else {
           // 2026-06-01 (Task #136) — augmented diag: show isXlsx + first
           // 4 bytes as hex + isHtmlBlob flag, so we can distinguish "binary
           // download fail" (need URL rewrite or login) from "ZIP container
-          // we don't handle yet" (need new parsing branch).
+          // we don't yet handle" (need new parsing branch).
           const magic = Array.from(buf.slice(0, 4))
             .map((b) => b.toString(16).padStart(2, '0')).join(' ');
           const htmlSnip = isHtmlBlob
             ? ` htmlSnip="${buf.slice(0, 120).toString('utf8').replace(/\s+/g, ' ').slice(0, 80)}"`
             : '';
           console.log(
-            ` ⚠️ tendsign: "${labelName}" extracted text too short ` +
+            `    ⚠️  tendsign: "${labelName}" extracted text too short ` +
             `(${text.length}ch, isPdf=${isPdf}, isDocx=${isDocx}, isXlsx=${isXlsx}, ` +
             `isZip=${isZip}, isHtml=${isHtmlBlob}, magic=${magic}, ct=${ctL.slice(0, 40)})${htmlSnip}`
           );
-          // 2026-06-03 (Task #147) — count HTML blob responses among
+          // 2026-06-03 (Task #147) — count HTML-blob responses among
           // priority docs. These signal that the doc URL is gated
           // behind auth even though the public page itself rendered.
           // After the loop we set _SOURCE_HANDLER_NEEDS_AUTH so the
@@ -9238,7 +9238,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
           if (isHtmlBlob) htmlBlobCount++;
         }
       } catch (e) {
-        console.log(` ⚠️ tendsign: parse failed for "${labelName}": ${(e.message || '').slice(0, 80)}`);
+        console.log(`    ⚠️  tendsign: parse failed for "${labelName}": ${(e.message || '').slice(0, 80)}`);
       }
     }
     // 2026-06-03 (Task #147) — signal caller to force login + re-fetch
@@ -9250,7 +9250,7 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
     if (htmlBlobCount > 0) {
       _SOURCE_HANDLER_NEEDS_AUTH = true;
       console.log(
-        ` 🔐 tendsign: ${htmlBlobCount} priority doc(s) came back as HTML — ` +
+        `    🔐 tendsign: ${htmlBlobCount} priority doc(s) came back as HTML — ` +
         `signaling FORCE-LOGIN bypass to caller for re-fetch with auth`
       );
     }
@@ -9264,9 +9264,9 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
     } catch (_) {}
     return texts;
   } catch (e) {
-    console.log(` ⚠️ tendsign handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  tendsign handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -9277,14 +9277,14 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
 // e-avrop.com (Antirio platform) tender pages render a "Documents"
 // section after login (Announcement.aspx). Each individual document is
 // listed inside an iframe (which the post-auth iframe-merge in
-// fetchSourcePageDetails already picks up for text extraction). But
+// fetchSourcePageDetails already picks up for text-extraction). But
 // the SAME section also exposes a single one-click bulk-download:
 //
-// <a id="mainContent_createZip"
-// title="Download ZIP file including full documentation"
-// href="javascript:__doPostBack('ctl00$mainContent$createZip','')">
-// All documents
-// </a>
+//   <a id="mainContent_createZip"
+//      title="Download ZIP-file including full documentation"
+//      href="javascript:__doPostBack('ctl00$mainContent$createZip','')">
+//     All documents
+//   </a>
 //
 // Clicking this fires an ASP.NET postback that streams back a ZIP
 // containing every attachment. That gives us PDF/DOCX content for the
@@ -9292,19 +9292,19 @@ async function fetchTendSignDocuments(browser, sourceUrl) {
 // per-document download URLs (which aren't trivially extractable; they
 // require ASPX ViewState replay).
 //
-// Strategy (mirrors tendsign Flow B + tendered bulk-ZIP):
-// 1. New page, stealth.
-// 2. Navigate to source URL (assumes login already done — host is in
-// ALWAYS_LOGIN_HOSTS, so the browser's cookie jar carries auth).
-// 3. Set up CDP download manager pointing to a tmp dir.
-// 4. Wait for #mainContent_createZip to appear (max 10s).
-// 5. Fire __doPostBack('ctl00$mainContent$createZip','') via eval —
-// ASP.NET will write the ZIP to the download stream and Chromium
-// writes it to disk.
-// 6. Poll the tmp dir for the new .zip file.
-// 7. Parse with adm-zip, extract PDFs/DOCXs, score by qualification
-// vocabulary, concatenate up to 4 docs' text.
-// 8. Return [] no-op for non-e-avrop sources.
+// Strategy (mirrors tendsign Flow B + tenderned bulk-ZIP):
+//   1. New page, stealth.
+//   2. Navigate to source URL (assumes login already done — host is in
+//      ALWAYS_LOGIN_HOSTS, so the browser's cookie jar carries auth).
+//   3. Set up CDP download manager pointing to a tmp dir.
+//   4. Wait for #mainContent_createZip to appear (max 10s).
+//   5. Fire __doPostBack('ctl00$mainContent$createZip','') via eval —
+//      ASP.NET will write the ZIP to the download stream and Chromium
+//      writes it to disk.
+//   6. Poll the tmp dir for the new .zip file.
+//   7. Parse with adm-zip, extract PDFs/DOCXs, score by qualification
+//      vocabulary, concatenate up to 4 docs' text.
+//   8. Return [] no-op for non-e-avrop sources.
 // =====================================================================
 async function fetchEavropDocuments(browser, sourceUrl) {
   try {
@@ -9314,10 +9314,10 @@ async function fetchEavropDocuments(browser, sourceUrl) {
 
   let pdfParseLib = null, mammothLib = null, admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-  try { mammothLib = require('mammoth'); } catch (_) {}
-  try { admZipLib = require('adm-zip'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
   if (!admZipLib) {
-    console.log(` ⚠️ e-avrop: adm-zip not available — skipping bulk ZIP fetch`);
+    console.log(`    ⚠️  e-avrop: adm-zip not available — skipping bulk ZIP fetch`);
     return [];
   }
 
@@ -9364,7 +9364,7 @@ async function fetchEavropDocuments(browser, sourceUrl) {
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e) {
-      console.log(` 🇸🇪 e-avrop: nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇸🇪 e-avrop: nav warn: ${(e.message || '').slice(0, 80)}`);
     }
     try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
     await new Promise((r) => setTimeout(r, 1500));
@@ -9395,7 +9395,7 @@ async function fetchEavropDocuments(browser, sourceUrl) {
         return !!document.querySelector('#navigationContent_SubscribeBtn');
       }).catch(() => false);
       if (hasSubscribeBtn) {
-        console.log(` 🇸🇪 e-avrop: createZip not found on main → firing SubscribeBtn (registers user as interested supplier)`);
+        console.log(`    🇸🇪 e-avrop: createZip not found on main → firing SubscribeBtn (registers user as interested supplier)`);
         let fired = 'no-attempt';
         try {
           await page.click('#navigationContent_SubscribeBtn');
@@ -9415,7 +9415,7 @@ async function fetchEavropDocuments(browser, sourceUrl) {
             }).catch((e) => 'evaluate-error:' + (e.message || '').slice(0, 40));
           } catch (e) { fired = 'click-error:' + (e.message || '').slice(0, 40); }
         }
-        console.log(` 🇸🇪 e-avrop: SubscribeBtn trigger = ${fired}`);
+        console.log(`    🇸🇪 e-avrop: SubscribeBtn trigger = ${fired}`);
         try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
         await new Promise((r) => setTimeout(r, 2000));
         // Check createZip on main page after SubscribeBtn — postback
@@ -9423,7 +9423,7 @@ async function fetchEavropDocuments(browser, sourceUrl) {
         try {
           await page.waitForSelector('#mainContent_createZip', { timeout: 5000 });
           createZipFound = true;
-          console.log(` 🇸🇪 e-avrop: createZip now visible on main page after SubscribeBtn`);
+          console.log(`    🇸🇪 e-avrop: createZip now visible on main page after SubscribeBtn`);
         } catch (_) { /* may need iframe URL nav next */ }
       }
     }
@@ -9449,25 +9449,25 @@ async function fetchEavropDocuments(browser, sourceUrl) {
         return null;
       }).catch(() => null);
       if (iframeUrl) {
-        console.log(` 🇸🇪 e-avrop: trying supplier iframe URL after SubscribeBtn → ${iframeUrl.slice(0, 110)}`);
+        console.log(`    🇸🇪 e-avrop: trying supplier iframe URL after SubscribeBtn → ${iframeUrl.slice(0, 110)}`);
         try {
           await page.goto(iframeUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
           try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
           await new Promise((r) => setTimeout(r, 1500));
         } catch (e) {
-          console.log(` ⚠️ e-avrop: iframe URL nav failed: ${(e.message || '').slice(0, 80)}`);
+          console.log(`    ⚠️  e-avrop: iframe URL nav failed: ${(e.message || '').slice(0, 80)}`);
         }
         try {
           await page.waitForSelector('#mainContent_createZip', { timeout: 8000 });
           createZipFound = true;
-          console.log(` 🇸🇪 e-avrop: createZip visible on supplier iframe URL`);
+          console.log(`    🇸🇪 e-avrop: createZip visible on supplier iframe URL`);
         } catch (_) { /* still missing — bail */ }
       }
     }
 
     if (!createZipFound) {
       // Diagnostic — log whether the Documents section exists at all,
-      // and dump the first few <a id="mainContent_*"> anchors as we can
+      // and dump the first few <a id="mainContent_*"> anchors so we can
       // iterate if Antirio re-renames the ID.
       const diag = await page.evaluate(() => {
         const sections = Array.from(document.querySelectorAll('.section, h1, h2, h3'))
@@ -9487,17 +9487,17 @@ async function fetchEavropDocuments(browser, sourceUrl) {
           anchors,
         };
       }).catch(() => null);
-      console.log(` ⚠️ e-avrop: #mainContent_createZip not found (after iframe + SubscribeBtn fallbacks) — ${JSON.stringify(diag).slice(0, 300)}`);
+      console.log(`    ⚠️  e-avrop: #mainContent_createZip not found (after iframe + SubscribeBtn fallbacks) — ${JSON.stringify(diag).slice(0, 300)}`);
       return [];
     }
 
-    console.log(` 🇸🇪 e-avrop: #mainContent_createZip found — firing __doPostBack for bulk ZIP`);
+    console.log(`    🇸🇪 e-avrop: #mainContent_createZip found — firing __doPostBack for bulk ZIP`);
 
     // Snapshot existing files before triggering the postback.
     const before = new Set();
     try { for (const n of fs.readdirSync(downloadDir)) before.add(n); } catch (_) {}
 
-    // Fire the postback. 2026-05-14 fix v2 — avoid the strict mode
+    // Fire the postback. 2026-05-14 fix v2 — avoid the strict-mode
     // pitfall (Antirio's __doPostBack uses `arguments.callee` which
     // V8 rejects when called from page.evaluate strict scope). Prefer
     // page.click() which navigates via the page's non-strict context;
@@ -9526,7 +9526,7 @@ async function fetchEavropDocuments(browser, sourceUrl) {
         }).catch((e) => 'evaluate-error:' + (e.message || '').slice(0, 50));
       } catch (e) { fired = 'click-error:' + (e.message || '').slice(0, 50); }
     }
-    console.log(` 🇸🇪 e-avrop: postback trigger result = ${fired}`);
+    console.log(`    🇸🇪 e-avrop: postback trigger result = ${fired}`);
 
     // Poll the download dir for a fresh .zip — bulk ZIP can take a few
     // seconds for big tenders. 30s total, 400ms poll interval.
@@ -9553,16 +9553,16 @@ async function fetchEavropDocuments(browser, sourceUrl) {
       }
     }
     if (!zipPath) {
-      console.log(` ⚠️ e-avrop: ZIP download polling timed out (no new file in ${downloadDir})`);
+      console.log(`    ⚠️  e-avrop: ZIP download polling timed out (no new file in ${downloadDir})`);
       return [];
     }
     const zipBuf = fs.readFileSync(zipPath);
-    console.log(` 🇸🇪 e-avrop: ZIP downloaded (${zipBuf.length}B) — parsing entries`);
+    console.log(`    🇸🇪 e-avrop: ZIP downloaded (${zipBuf.length}B) — parsing entries`);
 
     // Verify magic bytes — must be PK\003\004.
     if (!(zipBuf[0] === 0x50 && zipBuf[1] === 0x4b && zipBuf[2] === 0x03 && zipBuf[3] === 0x04)) {
       console.log(
-        ` ⚠️ e-avrop: downloaded file is not a ZIP ` +
+        `    ⚠️  e-avrop: downloaded file is not a ZIP ` +
         `(magic=${zipBuf.slice(0, 4).toString('hex')}, head=${zipBuf.slice(0, 80).toString('utf8').replace(/[^\x20-\x7e]/g, '?').slice(0, 60)})`
       );
       return [];
@@ -9574,8 +9574,8 @@ async function fetchEavropDocuments(browser, sourceUrl) {
     const SCORE_RULES = [
       { rx: /Kvalificering(?:skrav)?|Krav\s+p[åa]\s+(?:anbudsgivare|leverant[öo]r|leverand[øo]r)|Lev(?:erant[öo]r)?krav|Skakrav|qualification\s*criteria|tender(?:er)?\s+requirements/i, score: 30 },
       { rx: /Administrativa\s+krav|Generella\s+krav|Krav\s+p[åa]\s+(?:tj[äa]nsten|varan|leveransen)|Uteslutningsgrund/i, score: 25 },
-      { rx: /F[öo]rfr[åa]gningsunderlag|FFU|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdocument|RFT|RFP|tender\s*document|Upphandlingsf[öo]reskrifter/i, score: 18 },
-      { rx: /AUC\b|Administrativa\s+f[öo]rekrifter|administrative\s*provisions/i, score: 12 },
+      { rx: /F[öo]rfr[åa]gningsunderlag|FFU|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdokument|RFT|RFP|tender\s*document|Upphandlingsf[öo]reskrifter/i, score: 18 },
+      { rx: /AUC\b|Administrativa\s+f[öo]reskrifter|administrative\s*provisions/i, score: 12 },
       { rx: /Anbudsformul[äa]r|Tilbudsformular|tender\s*form|bid\s*form|Egenf[öo]rs[äa]kran|ESPD|UEA|Uniform\s*European|Anbudsinbjudan/i, score: 10 },
       { rx: /Utv[äa]rderingskriterier|Grund\s+f[öo]r\s+tilldelning|tilldelningskriterier|award\s*criteria|evaluation\s*criteria/i, score: 8 },
       { rx: /Bilaga|Bilagor|Attachment|Vedlegg|appendix|H[åa]llbarhet|Sanningsf[öo]rs[äa]kran/i, score: 5 },
@@ -9594,15 +9594,15 @@ async function fetchEavropDocuments(browser, sourceUrl) {
         })
         .sort((a, b) => b.score - a.score);
     } catch (e) {
-      console.log(` ⚠️ e-avrop: adm-zip parse failed: ${(e.message || '').slice(0, 100)}`);
+      console.log(`    ⚠️  e-avrop: adm-zip parse failed: ${(e.message || '').slice(0, 100)}`);
       return [];
     }
     if (!entries.length) {
-      console.log(` ⚠️ e-avrop: ZIP had no PDF/DOCX entries`);
+      console.log(`    ⚠️  e-avrop: ZIP had no PDF/DOCX entries`);
       return [];
     }
     console.log(
-      ` 🇸🇪 e-avrop: priority docs in ZIP: ` +
+      `    🇸🇪 e-avrop: priority docs in ZIP: ` +
       entries.slice(0, 8).map((x) => `${x.name.split('/').pop().slice(0, 40)}[s=${x.score}]`).join(' | ')
     );
 
@@ -9622,20 +9622,20 @@ async function fetchEavropDocuments(browser, sourceUrl) {
         if (text.length > 200) {
           const clipped = text.slice(0, 80000);
           texts.push(`--- (e-avrop) ${x.name.split('/').pop()} ---\n${clipped}`);
-          console.log(` 🇸🇪 e-avrop: parsed "${x.name.split('/').pop().slice(0, 40)}" (${data.length}B → ${clipped.length}ch, score=${x.score})`);
+          console.log(`    🇸🇪 e-avrop: parsed "${x.name.split('/').pop().slice(0, 40)}" (${data.length}B → ${clipped.length}ch, score=${x.score})`);
           _collectDriveFile(x.name.split('/').pop(), Buffer.isBuffer(data) ? data : Buffer.from(data));
         } else {
-          console.log(` ⚠️ e-avrop: "${x.name.split('/').pop().slice(0, 40)}" extracted text too short (${text.length}ch)`);
+          console.log(`    ⚠️  e-avrop: "${x.name.split('/').pop().slice(0, 40)}" extracted text too short (${text.length}ch)`);
         }
       } catch (e) {
-        console.log(` ⚠️ e-avrop: parse failed for "${x.name.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+        console.log(`    ⚠️  e-avrop: parse failed for "${x.name.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
       }
     }
     return texts;
   } catch (e) {
-    console. log(` ⚠️ e-avrop handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  e-avrop handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (cdpSession) await cdpSession.detach(); } catch (_) {}
     try {
       if (downloadDir) {
@@ -9657,25 +9657,25 @@ async function fetchEavropDocuments(browser, sourceUrl) {
 // under explicit nav tabs after login. The standard post-login body
 // looks like:
 //
-// "Tender notice overview / Registration / Decline participation /
-// Contract documents / Entire tender form / Appendices /
-// Questions and answers / Additions / Create tender"
+//   "Tender notice overview / Registration / Decline participation /
+//    Contract documents / Entire tender form / Appendices /
+//    Questions and answers / Additions / Create tender"
 //
 // "Contract documents" / "Entire tender form" / "Appendices" are the
 // useful tabs for qualification extraction. Each is typically an
 // ASP.NET __doPostBack anchor or a regular href like:
-// /<tenant>/Notice/Documents.aspx?NoticeId=X
-// /<tenant>/Notice/RequestForTender.aspx?NoticeId=X
-// /<tenant>/Notice/Appendices.aspx?NoticeId=X
+//   /<tenant>/Notice/Documents.aspx?NoticeId=X
+//   /<tenant>/Notice/RequestForTender.aspx?NoticeId=X
+//   /<tenant>/Notice/Appendices.aspx?NoticeId=X
 //
 // Strategy:
-// 1. New page, Swedish locale, auth cookies from attemptPortalLogin.
-// 2. Navigate to source URL (NoticeDispatch.aspx?NoticeId=X).
-// 3. Find tab anchors by text match (EN/SV/NO synonyms).
-// 4. For each found tab URL, navigate, scan for PDF/DOCX/ZIP anchors.
-// 5. Fetch + parse via in-page fetch (carries session cookies).
-// 6. Score by Swedish qualification vocab, parse top 6 docs.
-// 7. Return [`--- (kommersannons) name ---\ntext`].
+//   1. New page, Swedish locale, auth cookies from attemptPortalLogin.
+//   2. Navigate to source URL (NoticeDispatch.aspx?NoticeId=X).
+//   3. Find tab anchors by text match (EN/SV/NO synonyms).
+//   4. For each found tab URL, navigate, scan for PDF/DOCX/ZIP anchors.
+//   5. Fetch + parse via in-page fetch (carries session cookies).
+//   6. Score by Swedish qualification vocab, parse top 6 docs.
+//   7. Return [`--- (kommersannons) name ---\ntext`].
 //
 // Diagnostic-heavy because we don't have full DOM inspection of all
 // possible tab URL variants — log every step so we can iterate.
@@ -9688,8 +9688,8 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
 
   let pdfParseLib = null, mammothLib = null, admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-  try { mammothLib = require('mammoth'); } catch (_) {}
-  try { admZipLib = require('adm-zip'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
 
   let page = null;
   try {
@@ -9698,7 +9698,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
     // kommersannons.se tenders hitting "Navigation timeout of 25000ms".
     // The portal may have added Cloudflare / anti-bot rules that delay
     // first response from GitHub Actions IPs. 45s gives the server room
-    // to respond. If still timing out, the real fix is ​​a residential
+    // to respond. If still timing out, the real fix is a residential
     // proxy — this is just a best-effort mitigation.
     page.setDefaultNavigationTimeout(45000);
     page.setDefaultTimeout(45000);
@@ -9722,7 +9722,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
       });
     } catch (_) {}
 
-    // 2026-05-27 — retry loop. Kommersannons sometimes refuses first
+    // 2026-05-27 — retry loop. kommersannons sometimes refuses first
     // connection (likely Cloudflare bot-check) but succeeds on retry.
     let navOk = false;
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -9732,7 +9732,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
         break;
       } catch (e) {
         const msg = (e.message || '').slice(0, 80);
-        console.log(` 🇸🇪 kommersannons: nav attempt ${attempt}/2 warn: ${msg}`);
+        console.log(`    🇸🇪 kommersannons: nav attempt ${attempt}/2 warn: ${msg}`);
         if (attempt < 2) {
           // Backoff before retry
           await new Promise((r) => setTimeout(r, 4000));
@@ -9743,34 +9743,34 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
       // Diagnostic: log what we actually landed on
       const currentUrl = page.url();
       const isErrorPage = /^(chrome-error|chromewebdata|about:)/i.test(currentUrl);
-      console.log(` 🇸🇪 kommersannons: navigation failed both attempts (landed on: ${currentUrl.slice(0, 80)})`);
+      console.log(`    🇸🇪 kommersannons: navigation failed both attempts (landed on: ${currentUrl.slice(0, 80)})`);
       if (isErrorPage) {
-        console.log(` ⚠️ kommersannons: chrome error page → likely IP-blocked or DNS issue (residential proxy would help)`);
+        console.log(`    ⚠️  kommersannons: chrome error page → likely IP-blocked or DNS issue (residential proxy would help)`);
         return [];
       }
     }
     try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
     await new Promise((r) => setTimeout(r, 2000));
 
-    // STEP 0 — click "Intresseanmälan" (Express interest) per tender,
+    // STEP 0 — click "Intresseanmälan" (Express interest) per-tender,
     // then submit the registration form that opens.
     //
     // 2026-05-27 — Log 42 revealed TWO issues with #102:
-    // 1) Bare "Registration" regex matched the site-wide account creation
-    // CTA on pre-login pages → wrong click. Tightened to require an
-    // explicit "interest" word with "register".
-    // 2) Clicking "Intresseanmälan" navigates to a separate /Register
-    // form, not a postback. We then have to SUBMIT that form
-    // (Anmäl intereste / Bekräfta / Schicka button) to actually
-    // register interest. Without form submit, docs stay hidden.
+    //   1) Bare "Registration" regex matched the site-wide account-creation
+    //      CTA on pre-login pages → wrong click. Tightened to require an
+    //      explicit "interest" word with "register".
+    //   2) Clicking "Intresseanmälan" navigates to a separate /Register
+    //      form, not a postback. We then have to SUBMIT that form
+    //      (Anmäl intresse / Bekräfta / Skicka button) to actually
+    //      register interest. Without form submit, docs stay hidden.
     //
-    // Match labels (STRICT — must contain explicit “interest” wording):
-    // SV: "Intresseanmälan" / "Anmäl intresse"
-    // EN: "Register interest" / "Express interest"
-    // NO: "Påmeldingsskjema" / "Report interest"
+    // Match labels (STRICT — must contain explicit "interest" wording):
+    //   SV: "Intresseanmälan" / "Anmäl intresse"
+    //   EN: "Register interest" / "Express interest"
+    //   NO: "Påmeldingsskjema" / "Meld interesse"
     // Anti-pattern (do NOT click): "Tacka nej" / "Decline" / "Registration"
     const interestClick = await page.evaluate(() => {
-      const RE_INTEREST = /^\s*(intresseanm[äa]lan|anm[äa]l\s*intresse|register\s+(?:my\s+)?interest|express(?:ing)?\s+(?:my\s+)?interest|p[åa]meldingsskjema|meld\s+interest)\s*$/i;
+      const RE_INTEREST = /^\s*(intresseanm[äa]lan|anm[äa]l\s*intresse|register\s+(?:my\s+)?interest|express(?:ing)?\s+(?:my\s+)?interest|p[åa]meldingsskjema|meld\s+interesse)\s*$/i;
       const RE_REJECT = /^\s*(tacka\s*nej|decline|reject|cancel|avst[åa]|registration\s*$|create\s*account|order\s*new\s*password)\b/i;
       const els = Array.from(document.querySelectorAll(
         'a, button, input[type="submit"], input[type="button"], [role="button"]'
@@ -9791,7 +9791,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
       return null;
     }).catch(() => null);
     if (interestClick) {
-      console.log(` 🇸🇪 kommersannons: clicked "${interestClick}" (interest registration link) — waiting for state update`);
+      console.log(`    🇸🇪 kommersannons: clicked "${interestClick}" (interest registration link) — waiting for state update`);
       // ASP.NET nav OR client-side route change
       await Promise.race([
         page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => null),
@@ -9800,18 +9800,18 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
       await new Promise((r) => setTimeout(r, 1500));
 
       // STEP 0.5 — submit the registration FORM that appeared.
-      // The Interesteanmälan link took us to /Notice/Shared/Register... or
+      // The Intresseanmälan link took us to /Notice/Shared/Register... or
       // /Notice/.../Interest.aspx. Find form submit button. Possible
       // labels (in priority order):
-      // "Anmäl intereste" (Submit interest — SV)
-      // "Skicka" / "Skicka in" (Submit — SV)
-      // "Bekräfta" / "Confirm" (Confirm — SV/EN)
-      // "Yes" / "Yes" (basic confirm)
-      // "Save" / "Save"
-      // "Fortätt" / "Continue"
+      //   "Anmäl intresse" (Submit interest — SV)
+      //   "Skicka" / "Skicka in" (Submit — SV)
+      //   "Bekräfta" / "Confirm" (Confirm — SV/EN)
+      //   "Ja" / "Yes" (basic confirm)
+      //   "Spara" / "Save"
+      //   "Fortsätt" / "Continue"
       const postClickUrl = page.url();
       const onRegisterForm = /Register|Interest|Anm[äa]l/i.test(postClickUrl);
-      console.log(` 🇸🇪 kommersannons: post-click URL: ${postClickUrl.slice(-100)} (register-form=${onRegisterForm})`);
+      console.log(`    🇸🇪 kommersannons: post-click URL: ${postClickUrl.slice(-100)} (register-form=${onRegisterForm})`);
 
       const submitClick = await page.evaluate(() => {
         const RE_SUBMIT_PRIORITY = /^\s*(anm[äa]l\s*intresse|register\s+interest|express\s+interest|submit\s+interest)\s*$/i;
@@ -9821,7 +9821,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           'button, input[type="submit"], input[type="button"], a.btn, [role="button"]'
         )).filter((el) => !el.disabled && el.offsetParent !== null);
 
-        // Pass 1 — exact “anmäl intereste” submit
+        // Pass 1 — exact "anmäl intresse" submit
         for (const el of els) {
           const text = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim();
           if (!text || text.length > 40) continue;
@@ -9843,7 +9843,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
       }).catch(() => null);
 
       if (submitClick) {
-        console.log(` 🇸🇪 kommersannons: registration form submitted "${submitClick}"`);
+        console.log(`    🇸🇪 kommersannons: registration form submitted "${submitClick}"`);
         await Promise.race([
           page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => null),
           new Promise((r) => setTimeout(r, 4000)),
@@ -9860,7 +9860,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           } catch (_) {}
         }
       } else {
-        console.log(` ⚠️ kommersannons: no submit button found on registration form — proceeding with whatever's visible`);
+        console.log(`    ⚠️  kommersannons: no submit button found on registration form — proceeding with whatever's visible`);
       }
     }
 
@@ -9869,7 +9869,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
     // __doPostBack anchor that triggers a navigate via JS. Match by
     // text: EN ("Contract documents" / "Entire tender form" /
     // "Appendices"), SV ("Avtalshandlingar" / "Förfrågningsunderlag" /
-    // "Bilagor"), NO ("Contract Documenter" / "Konkurransegrunnlag" /
+    // "Bilagor"), NO ("Kontraktsdokumenter" / "Konkurransegrunnlag" /
     // "Vedlegg"). Score order — higher = more likely to contain
     // qualifications.
     const TAB_RULES = [
@@ -9879,7 +9879,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
       // "Appendices" / "Bilagor" — contains Pliegos / annexes.
       { rx: /^\s*appendices\s*$|^\s*bilagor\s*$|^\s*vedlegg\s*$|^\s*attachments\s*$/i, score: 35, label: 'Appendices' },
       // "Contract documents" / "Avtalshandlingar" — contract draft + docs.
-      { rx: /contract\s*documents|avtalshandlingar|contractsdocuments|contracts(?:\s*document)?/i, score: 25, label: 'Contract' },
+      { rx: /contract\s*documents|avtalshandlingar|kontraktsdokumenter|kontrakts(?:\s*dokument)?/i, score: 25, label: 'Contract' },
     ];
 
     const tabProbe = await page.evaluate((rules) => {
@@ -9901,7 +9901,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
             try { target = new URL(hrefRaw, location.href).toString(); }
             catch (_) {}
           }
-          // __doPostBack anchors — record the eventTarget as we can
+          // __doPostBack anchors — record the eventTarget so we can
           // navigate via the resulting URL parameter (kommersannons
           // often uses Response.Redirect post-postback).
           if (!target && /__doPostBack\(/.test(hrefRaw + ' ' + onclick)) {
@@ -9929,12 +9929,12 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
       .catch((e) => ({ matched: [], totalAnchors: 0, sampleTexts: [], error: e.message }));
 
     console.log(
-      ` 🇸🇪 kommersannons: ${tabProbe.totalAnchors} anchor(s), ` +
+      `    🇸🇪 kommersannons: ${tabProbe.totalAnchors} anchor(s), ` +
       `${tabProbe.matched.length} tab match(es)` +
       (tabProbe.matched.length ? ` — ${tabProbe.matched.map((m) => `${m.label}[s=${m.score}]`).join(' | ')}` : '')
     );
     if (!tabProbe.matched.length) {
-      console.log(` ⚠️ kommersannons: no document-tab anchors matched. Sample texts: ${JSON.stringify(tabProbe.sampleTexts.slice(0, 12))}`);
+      console.log(`    ⚠️  kommersannons: no document-tab anchors matched. Sample texts: ${JSON.stringify(tabProbe.sampleTexts.slice(0, 12))}`);
       return [];
     }
 
@@ -9947,7 +9947,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
         if (tab.url.startsWith('postback:')) {
           const eventTarget = tab.url.slice('postback:'.length);
           if (!eventTarget) continue;
-          console.log(` 🇸🇪 kommersannons: firing __doPostBack('${eventTarget}') for ${tab.label}`);
+          console.log(`    🇸🇪 kommersannons: firing __doPostBack('${eventTarget}') for ${tab.label}`);
           // 2026-05-14 fix v2: avoid strict-mode TypeError (some
           // ASP.NET __doPostBack variants use arguments.callee).
           // Use indirect-eval which runs in global non-strict scope.
@@ -9960,19 +9960,19 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
           await new Promise((r) => setTimeout(r, 1500));
         } else {
-          console.log(` 🇸🇪 kommersannons: navigating to ${tab.label} → ${tab.url.slice(-80)}`);
+          console.log(`    🇸🇪 kommersannons: navigating to ${tab.label} → ${tab.url.slice(-80)}`);
           await page.goto(tab.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
           try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
           await new Promise((r) => setTimeout(r, 1200));
         }
         // 2026-05-15 fix: BEFORE scanning for downloads, the tab page
-        // usually requires the user to click "Anmäl intereste" (Register
+        // usually requires the user to click "Anmäl intresse" (Register
         // Interest). User-confirmed DOM:
-        // <a id="ctl00_ctl00_ctl00_content_Content_NoticeInnerContent_lbRegister"
-        // class="btn btn-primary"
-        // href="javascript:__doPostBack('ctl00$ctl00$ctl00$content$Content$NoticeInnerContent$lbRegister','')">
-        // Registration interest
-        // </a>
+        //   <a id="ctl00_ctl00_ctl00_content_Content_NoticeInnerContent_lbRegister"
+        //      class="btn btn-primary"
+        //      href="javascript:__doPostBack('ctl00$ctl00$ctl00$content$Content$NoticeInnerContent$lbRegister','')">
+        //     Anmäl intresse
+        //   </a>
         // Fire that postback first; document anchors only render after.
         // Use page.click() (non-strict native context) — same approach as
         // the e-avrop SubscribeBtn fix.
@@ -9986,7 +9986,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           return !!el;
         }).catch(() => false);
         if (hasRegisterBtn) {
-          console.log(` 🇸🇪 kommersannons: "Anmäl intresse" found on ${tab.label} — firing postback to reveal docs`);
+          console.log(`    🇸🇪 kommersannons: "Anmäl intresse" found on ${tab.label} — firing postback to reveal docs`);
           let regFired = 'no-attempt';
           try {
             await page.click('#ctl00_ctl00_ctl00_content_Content_NoticeInnerContent_lbRegister');
@@ -10007,7 +10007,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
               }).catch((e) => 'evaluate-error:' + (e.message || '').slice(0, 40));
             } catch (_) { regFired = 'click-error'; }
           }
-          console.log(` 🇸🇪 kommersannons: Anmäl intereste trigger = ${regFired}`);
+          console.log(`    🇸🇪 kommersannons: Anmäl intresse trigger = ${regFired}`);
           try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
           await new Promise((r) => setTimeout(r, 1500));
         }
@@ -10017,28 +10017,28 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           // /<tenant>/Utils/FileDownload.aspx?FileId=<id> — added
           // FileDownload.aspx to the path regex. Previously we
           // matched only Download.aspx / Documents.aspx / GetFile.aspx
-          // patterns and silently missed every kommersannon's doc.
+          // patterns and silently missed every kommersannons doc.
           //
           // 2026-05-16 fix v3:
-          // (a) Bug 1 — /Documents.aspx is the tab-page URL we just
-          // navigated to (Notice/Request/Documents.aspx?
-          // ProcurementId=X), not a real download. It used to
-          // pollute the priority list and waste fetch cycles on
-          // HTML auth walls. Explicitly exclude same-URL self-
-          // links AND any /Documents.aspx without a file-style
-          // query param (FileId / DocId / AttachmentId).
-          // (b) Bug 2 — FileDownload.aspx?FileId=X anchors often
-          // have empty <a> text (the visible filename lives in
-          // a sibling <span> or parent <td>). Walk parents
-          // containers to find a displayable filename so the
-          // priority scorer can match qualification vocab.
+          //   (a) Bug 1 — /Documents.aspx is the tab-page URL we just
+          //       navigated to (Notice/Request/Documents.aspx?
+          //       ProcurementId=X), not a real download. It used to
+          //       pollute the priority list and waste fetch cycles on
+          //       HTML auth-walls. Explicitly exclude same-URL self-
+          //       links AND any /Documents.aspx without a file-style
+          //       query param (FileId / DocId / AttachmentId).
+          //   (b) Bug 2 — FileDownload.aspx?FileId=X anchors often
+          //       have empty <a> text (the visible filename lives in
+          //       a sibling <span> or parent <td>). Walk parent
+          //       containers to find a displayable filename so the
+          //       priority scorer can match qualification vocab.
           const RX_DL_PATH = /\/(?:Download|DownloadFile|FileDownload|GetFile|DownloadAttachment)\.(?:aspx|ashx)|\/Notice\/.*\/Download|\/Utils\/FileDownload/i;
           const RX_DOCS_TAB = /\/Documents\.aspx(?:\?|$)/i;
-          const RX_DL_EXT = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:[?&#]|$)/i;
+          const RX_DL_EXT  = /\.(pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods)(?:[?&#]|$)/i;
 
           // Parent-walking helper: find the closest ancestor's text
           // that contains a file-like token (extension or "filename"
-          // word). Walks up to most 4 levels.
+          // word). Walks up at most 4 levels.
           const findContainerText = (el) => {
             let cur = el.parentElement;
             for (let i = 0; i < 4 && cur; i++) {
@@ -10072,7 +10072,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
 
             // Self-link guard — Documents.aspx tab-page pointing to
             // itself or to /Documents.aspx without a file-style query
-            // param (FileId / DocId / AttachmentId). User confirmed
+            // param (FileId / DocId / AttachmentId). User-confirmed
             // kommersannons file URLs ALWAYS carry FileId.
             if (RX_DOCS_TAB.test(abs)) {
               let absNoHash = abs.split('#')[0];
@@ -10094,7 +10094,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
 
             // Parent-text fallback (Bug 2 fix) — when anchor text is
             // empty/icon-only, walk ancestors to find filename text.
-            if (!text || text.length < 4 || /^(download|h[äa]mta|t[eé]l[eé]charger|download)$/i.test(text)) {
+            if (!text || text.length < 4 || /^(download|h[äa]mta|t[eé]l[eé]charger|herunterladen)$/i.test(text)) {
               const containerText = findContainerText(a);
               if (containerText) text = containerText.slice(0, 200);
             }
@@ -10122,20 +10122,20 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           seenDocUrl.add(d.url);
           allDocAnchors.push(d);
         }
-        console.log(` 🇸🇪 kommersannons: ${tab.label} → ${docs.length} doc anchor(s)`);
+        console.log(`    🇸🇪 kommersannons: ${tab.label} → ${docs.length} doc anchor(s)`);
       } catch (e) {
-        console.log(` ⚠️ kommersannons: tab ${tab.label} error: ${(e.message || '').slice(0, 80)}`);
+        console.log(`    ⚠️  kommersannons: tab ${tab.label} error: ${(e.message || '').slice(0, 80)}`);
       }
     }
 
     if (!allDocAnchors.length) {
-      console.log(` ⚠️ kommersannons: no document download anchors found across tabs`);
+      console.log(`    ⚠️  kommersannons: no document download anchors found across tabs`);
       // ZERO-ANCHOR DIAGNOSTIC — dump sample button/anchor texts from
       // the current page so we can identify what trigger we're missing.
       // Real-world (goteborg.kommersannons.se 2026-05-15): the Documents
       // tab shows 0 anchors because the page needs a tenant-specific
-      // button (eg "Visa upphandlingsdocument" / "Begär tillgång")
-      // that doesn't match the "Anmäl intereste" selector. Capture text
+      // button (e.g. "Visa upphandlingsdokument" / "Begär tillgång")
+      // that doesn't match the "Anmäl intresse" selector. Capture text
       // samples so next iteration can extend the trigger regex.
       try {
         const sample = await page.evaluate(() => {
@@ -10152,21 +10152,21 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           return { url: location.href, totalEls: els.length, texts };
         }).catch(() => null);
         if (sample) {
-          console.log(` 🔍 kommersannons zero-anchor diag: url=${sample.url.slice(0, 100)} totalEls=${sample.totalEls}`);
-          console.log(` 🔍 kommersannons clickable text samples: ${JSON.stringify(sample.texts.slice(0, 20))}`);
+          console.log(`    🔍 kommersannons zero-anchor diag: url=${sample.url.slice(0, 100)} totalEls=${sample.totalEls}`);
+          console.log(`    🔍 kommersannons clickable text samples: ${JSON.stringify(sample.texts.slice(0, 20))}`);
         }
       } catch (_) {}
       return [];
     }
-    console.log(` 🇸🇪 kommersannons: collected ${allDocAnchors.length} unique doc anchor(s) across tabs`);
+    console.log(`    🇸🇪 kommersannons: collected ${allDocAnchors.length} unique doc anchor(s) across tabs`);
 
     // STEP 3 — score by Swedish qualification vocab (same rules as
     // tendsign + e-avrop handlers).
     const SCORE_RULES = [
       { rx: /Kvalificering(?:skrav)?|Krav\s+p[åa]\s+(?:anbudsgivare|leverant[öo]r|leverand[øo]r)|Lev(?:erant[öo]r)?krav|Skakrav|qualification\s*criteria|tender(?:er)?\s+requirements/i, score: 30 },
       { rx: /Administrativa\s+krav|Generella\s+krav|Krav\s+p[åa]\s+(?:tj[äa]nsten|varan|leveransen)|Uteslutningsgrund/i, score: 25 },
-      { rx: /F[öo]rfr[åa]gningsunderlag|FFU|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdocument|tender\s*document|Upphandlingsf[öo]reskrifter/i, score: 18 },
-      { rx: /AUC\b|Administrativa\s+f[öo]rekrifter/i, score: 12 },
+      { rx: /F[öo]rfr[åa]gningsunderlag|FFU|Anbudsforesp[øo]rsel|Konkurransegrunnlag|Anskaffelsesdokument|tender\s*document|Upphandlingsf[öo]reskrifter/i, score: 18 },
+      { rx: /AUC\b|Administrativa\s+f[öo]reskrifter/i, score: 12 },
       { rx: /Anbudsformul[äa]r|Tilbudsformular|Egenf[öo]rs[äa]kran|ESPD|UEA/i, score: 10 },
       { rx: /Utv[äa]rderingskriterier|Grund\s+f[öo]r\s+tilldelning|tilldelningskriterier|award\s*criteria/i, score: 8 },
       { rx: /Bilaga|Bilagor|Attachment|Vedlegg|appendix/i, score: 5 },
@@ -10183,7 +10183,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
     allDocAnchors.sort((a, b) => b.score - a.score);
     const topDocs = allDocAnchors.slice(0, 6);
     console.log(
-      ` 🇸🇪 kommersannons: priority docs: ` +
+      `    🇸🇪 kommersannons: priority docs: ` +
       topDocs.map((d) => `${(d.filename || d.text || d.url.split('/').pop()).slice(0, 40)}[s=${d.score}]`).join(' | ')
     );
 
@@ -10209,7 +10209,7 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           const ct = resp.headers.get('content-type') || '';
           const ab = await resp.arrayBuffer();
           return {
-            OK: true,
+            ok: true,
             status: resp.status,
             ct,
             url: resp.url || url,
@@ -10222,13 +10222,13 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
 
       if (!result || !result.ok || !result.data || result.data.length < 500) {
         const status = result?.status || result?.error || '?';
-        console.log(` ⚠️ kommersannons: fetch failed "${labelName.slice(0, 40)}" (status=${status})`);
+        console.log(`    ⚠️  kommersannons: fetch failed "${labelName.slice(0, 40)}" (status=${status})`);
         continue;
       }
       const buf = Buffer.from(result.data);
       const fmt = detectFormat(buf);
       console.log(
-        ` 🇸🇪 kommersannons: fetched "${labelName.slice(0, 40)}" ` +
+        `    🇸🇪 kommersannons: fetched "${labelName.slice(0, 40)}" ` +
         `(${buf.length}B, magic=${fmt}, ct=${(result.ct || '').slice(0, 30)})`
       );
 
@@ -10264,31 +10264,31 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
           const out = await mammothLib.extractRawText({ buffer: buf });
           text = ((out && out.value) || '').trim();
         } else if (fmt === 'html') {
-          console.log(` ⚠️ kommersannons: "${labelName.slice(0, 40)}" served HTML — likely auth-wall`);
+          console.log(`    ⚠️  kommersannons: "${labelName.slice(0, 40)}" served HTML — likely auth-wall`);
         }
         if (text.length > 200) {
           const clipped = text.slice(0, 80000);
           texts.push(`--- (kommersannons) ${labelName} ---\n${clipped}`);
-          console.log(` 🇸🇪 kommersannons: parsed "${labelName.slice(0, 40)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+          console.log(`    🇸🇪 kommersannons: parsed "${labelName.slice(0, 40)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
           _collectDriveFile(labelName, buf);
         } else {
-          console.log(` ⚠️ kommersannons: "${labelName.slice(0, 40)}" extracted text too short (${text.length}ch)`);
+          console.log(`    ⚠️  kommersannons: "${labelName.slice(0, 40)}" extracted text too short (${text.length}ch)`);
         }
       } catch (e) {
-        console.log(` ⚠️ kommersannons: parse failed for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+        console.log(`    ⚠️  kommersannons: parse failed for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
       }
     }
     return texts;
   } catch (e) {
-    console.log(` ⚠️ kommersannons handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  kommersannons handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
 
 // =====================================================================
-// fetchPlasspDocuments
+// fetchPlacspDocuments
 // ---------------------------------------------------------------------
 // contrataciondelestado.es (Plataforma de Contratación del Sector
 // Público — PLACSP) is Spain's national e-procurement portal. Each
@@ -10300,44 +10300,44 @@ async function fetchKommersAnnonsDocuments(browser, sourceUrl) {
 //
 // There is ALREADY a comprehensive inline PLACSP harvest inside the
 // main fetchSourcePageDetails page.evaluate. That logic:
-// - Detects 4 servlet URL patterns (GetDocumentByIdServlet, docAccCmpnt,
-// GetDocumentsById, deeplink:detalle_pliego)
-// - Reads doc type from <tr>'s tipoDocumento cell (PCAP > PPT > etc.)
-// - Has snapshot-rescue if main eval missed
-// - Bumps char caps to 150k/file 180k/total
+//   - Detects 4 servlet URL patterns (GetDocumentByIdServlet, docAccCmpnt,
+//     GetDocumentsById, deeplink:detalle_pliego)
+//   - Reads doc type from <tr>'s tipoDocumento cell (PCAP > PPT > etc.)
+//   - Has snapshot-rescue if main eval missed
+//   - Bumps char caps to 150k/file 180k/total
 //
 // This DEDICATED handler complements the inline logic by addressing
 // THREE gaps the inline scan can't:
 //
-// 1. Hardcoded ext='pdf' — inline sets every PLACSP doc as PDF, like this
-// "Documento de Pliegos" (which is ALWAYS a ZIP bundle) fails the
-// magic-byte check and is silently skipped. The dedicated handler
-// detects format from magic bytes and uses adm-zip to recurse.
+//   1. Hardcoded ext='pdf' — inline sets every PLACSP doc as PDF, so
+//      "Documento de Pliegos" (which is ALWAYS a ZIP bundle) fails the
+//      magic-byte check and is silently skipped. The dedicated handler
+//      detects format from magic bytes and uses adm-zip to recurse.
 //
-// 2. Main document only — inline scan misses anchors hosted inside
-// same-origin iframes (some PLACSP portlets render the documents
-(/table inside an iframe).
+//   2. Main document only — inline scan misses anchors hosted inside
+//      same-origin iframes (some PLACSP portlets render the documents
+//      table inside an iframe).
 //
-// 3. No per-doc parse diagnostic — inline harvest goes through the
-// generic prefetch loop; failures appear as "magic mismatch" with
-// no PLACSP-specific context.
+//   3. No per-doc parse diagnostic — inline harvest goes through the
+//      generic prefetch loop; failures appear as "magic mismatch" with
+//      no PLACSP-specific context.
 //
 // Strategy:
-// 1. New page, Spanish locale.
-// 2. Navigate to source URL, settle.
-// 3. Strict cookie-banner dismissal (excludes "aceptar la cesión" /
-// "aceptar términos" — those are tender-acceptance triggers).
-// 4. Scan main doc + same-origin iframes for PLACSP doc anchors.
-// 5. Score by doc type (PCAP > PPT > Pliego > Anuncio > DocPliegos
-// > Decreto), like the inline logic.
-// 6. Fetch top 6 docs via page.evaluate fetch (carries session
-(/cookies if any).
-// 7. Determine format from magic bytes:
-// %PDF -> pdf-parse
-// PK\x03\x04 -> adm-zip (extract inner PDF/DOCX, recurse)
-// D0 CF 11 E0 -> CFB (Office 97 .doc / .xls) — log + skip
-// else -> log + skip
-// 8. Return [`--- (placsp) name ---\ntext`] array.
+//   1. New page, Spanish locale.
+//   2. Navigate to source URL, settle.
+//   3. Strict cookie-banner dismissal (excludes "aceptar la cesión" /
+//      "aceptar términos" — those are tender-acceptance triggers).
+//   4. Scan main doc + same-origin iframes for PLACSP doc anchors.
+//   5. Score by doc type (PCAP > PPT > Pliego > Anuncio > DocPliegos
+//      > Decreto), like the inline logic.
+//   6. Fetch top 6 docs via page.evaluate fetch (carries session
+//      cookies if any).
+//   7. Determine format from magic bytes:
+//        %PDF -> pdf-parse
+//        PK\x03\x04 -> adm-zip (extract inner PDF/DOCX, recurse)
+//        D0 CF 11 E0 -> CFB (Office 97 .doc / .xls) — log + skip
+//        else -> log + skip
+//   8. Return [`--- (placsp) name ---\ntext`] array.
 // =====================================================================
 async function fetchPlacspDocuments(browser, sourceUrl) {
   try {
@@ -10347,10 +10347,10 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
 
   let pdfParseLib = null, mammothLib = null, admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-  try { mammothLib = require('mammoth'); } catch (_) {}
-  try { admZipLib = require('adm-zip'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
   if (!pdfParseLib && !mammothLib && !admZipLib) {
-    console.log(` ⚠️ PLACSP: no parser libs available — skipping`);
+    console.log(`    ⚠️  PLACSP: no parser libs available — skipping`);
     return [];
   }
 
@@ -10362,7 +10362,7 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
     try { await page.setViewport({ width: 1280, height: 900 }); } catch (_) {}
 
     // Spanish locale — some PLACSP portlets render different markup based
-    // on Accept Language. So disable webdriver flag.
+    // on Accept-Language. Also disable webdriver flag.
     try {
       await page.evaluateOnNewDocument(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -10377,7 +10377,7 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e) {
-      console.log(` 🇪🇸 PLACSP: nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇪🇸 PLACSP: nav warn: ${(e.message || '').slice(0, 80)}`);
     }
     try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
     await new Promise((r) => setTimeout(r, 1500));
@@ -10408,7 +10408,7 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
         return null;
       }).catch(() => null);
       if (dismissed) {
-        console.log(` 🇪🇸 PLACSP: cookie banner ${dismissed}`);
+        console.log(`    🇪🇸 PLACSP: cookie banner ${dismissed}`);
         await new Promise((r) => setTimeout(r, 500));
       }
     } catch (_) {}
@@ -10425,20 +10425,20 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
         // PCAP (rank 0) — strict phrase + abbreviation + flexible
         // "Pliego administrativo" / "cláusulas particulares" variants
         // observed across regional PLACSP deployments.
-        { rank: 0, name: 'PCAP', re: /\bpcap\b|pliego\s+(?:de\s+)?cl[aá]usulas\s+administrativas|cl[aá]usulas\s+administrativas\s+particulares|pliego\s+administrative[oa]|cl[aá]usulas\s+particulares/i },
+        { rank: 0, name: 'PCAP',       re: /\bpcap\b|pliego\s+(?:de\s+)?cl[aá]usulas\s+administrativas|cl[aá]usulas\s+administrativas\s+particulares|pliego\s+administrativ[oa]|cl[aá]usulas\s+particulares/i },
         // PPT (rank 1) — abbreviation + flexible "Pliego técnico" variants.
-        { rank: 1, name: 'PPT', re: /\bppt\b|pliego\s+(?:de\s+)?prescripciones\s+t[eé]cnicas|prescripciones\s+t[eé]cnicas\s+particulares|pliego\s+t[eé]cnico/i },
+        { rank: 1, name: 'PPT',        re: /\bppt\b|pliego\s+(?:de\s+)?prescripciones\s+t[eé]cnicas|prescripciones\s+t[eé]cnicas\s+particulares|pliego\s+t[eé]cnico/i },
         // DocPliegos (rank 2) — promoted above generic Pliego because the
         // ZIP bundle USUALLY contains the actual PCAP + PPT + Anexos.
         // Run 52: zero rank-0 matches across 48 tenders → reach for the
         // bundle before falling back to whatever's labeled "Pliego".
         { rank: 2, name: 'DocPliegos', re: /documento\s+de\s+pliegos|pliegos\s+y\s+(?:documento|anex)|documentos?\s+adjuntos?|documentos?\s+asociados?/i },
         // Generic Pliego (rank 3) — catch-all cover/notice Pliego.
-        { rank: 3, name: 'Pliego', re: /\bpliego\b/i },
+        { rank: 3, name: 'Pliego',     re: /\bpliego\b/i },
         // Anuncio (rank 4) — bid notice, usually 3-5 pages, no quals.
-        { rank: 4, name: 'Anuncio', re: /anuncio\s+de\s+licitaci[oó]n|\banuncio\b/i },
+        { rank: 4, name: 'Anuncio',    re: /anuncio\s+de\s+licitaci[oó]n|\banuncio\b/i },
         // Decreto (rank 5) — least useful (cover decree approving pliego).
-        { rank: 5, name: 'Decreto', re: /decreto\s+aprobando\s+(?:el\s+)?pliego/i },
+        { rank: 5, name: 'Decreto',    re: /decreto\s+aprobando\s+(?:el\s+)?pliego/i },
       ];
       const collectFromRoot = (root, sourceLabel) => {
         const out = [];
@@ -10458,7 +10458,7 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
             ? (row.innerText || row.textContent || '').replace(/\s+/g, ' ').trim()
             : '';
           // Also inspect URL query string for tipo/type/cn parameters —
-          // PLACSP servlets sometimes encode the doc type there (eg
+          // PLACSP servlets sometimes encode the doc type there (e.g.
           // tipo=PCAP, type=2). Useful when the row text is uninformative.
           let urlTypeHint = '';
           try {
@@ -10468,15 +10468,15 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
               if (v) { urlTypeHint += ' ' + v; }
             }
           } catch (_) {}
-          // Filename hints from the anchor's own attributes — many PLACSP
+          // Filename hint from the anchor's own attributes — many PLACSP
           // anchors set download="<filename>.pdf" or title with the real
           // filename, which often contains "PCAP"/"PPT" abbreviations
           // even when the rendered text is just "Pliego".
           const filenameHint = (
             (a.getAttribute('download') || '') + ' ' +
-            (a.getAttribute('title') || '')
+            (a.getAttribute('title')    || '')
           ).trim();
-          const haystack = `${ownText} ${rowText} ${urlTypeHint} ${filenameHint}`;
+          const haystack = `${ownText}  ${rowText}  ${urlTypeHint}  ${filenameHint}`;
           let chosenType = null;
           for (const rt of ROW_TYPE_RE) {
             if (rt.re.test(haystack)) {
@@ -10547,7 +10547,7 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
     }).catch(() => ({ docs: [], totalIframes: 0, mainCount: 0, iframeCount: 0 }));
 
     console.log(
-      ` 🇪🇸 PLACSP: ${probe.docs.length} doc candidate(s) ` +
+      `    🇪🇸 PLACSP: ${probe.docs.length} doc candidate(s) ` +
       `(main=${probe.mainCount}, iframes=${probe.iframeCount}/${probe.totalIframes})`
     );
     if (!probe.docs.length) {
@@ -10557,14 +10557,14 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
       // being a normal PLACSP tender — the body presumably uses a
       // different anchor structure (or PCAP is behind a tab/click).
       console.log(
-        ` ⚠️ PLACSP: zero doc anchors matched out of ${probe.totalAnchors || 0} totally. ` +
+        `    ⚠️  PLACSP: zero doc anchors matched out of ${probe.totalAnchors || 0} total. ` +
         `Sample: ${JSON.stringify((probe.anchorSample || []).slice(0, 10))}`
       );
       return [];
     }
     // Log priority list — first 6.
     console.log(
-      ` 🇪🇸 PLACSP priority: ` +
+      `    🇪🇸 PLACSP priority: ` +
       probe.docs.slice(0, 6).map((d) =>
         `${d.type}[${d.source.startsWith('iframe') ? 'if' : 'main'}](r=${d.rank})`
       ).join(' | ')
@@ -10577,15 +10577,15 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
     try {
       const hasRealPCAP = probe.docs.some((d) => d.rank <= 1);
       if (!hasRealPCAP && probe.docs.length > 0) {
-        console.log(` 🇪🇸 PLACSP: ⚠️ no PCAP/PPT matched (rank≤1) — dumping row context for regex tuning:`);
+        console.log(`    🇪🇸 PLACSP: ⚠️ no PCAP/PPT matched (rank≤1) — dumping row context for regex tuning:`);
         for (const d of probe.docs.slice(0, 10)) {
           const dx = d._diag || {};
-          console.log(` [r=${d.rank} ${d.type}] own="${dx.ownText || ''}" | url-type="${dx.urlTypeHint || ''}" | file="${dx.filenameHint || ''}" | row="${(dx.rowText || '').slice(0, 160)}"`);
+          console.log(`       [r=${d.rank} ${d.type}] own="${dx.ownText || ''}" | url-type="${dx.urlTypeHint || ''}" | file="${dx.filenameHint || ''}" | row="${(dx.rowText || '').slice(0, 160)}"`);
         }
       }
     } catch (_) {}
 
-    // Magic byte format detection.
+    // Magic-byte format detection.
     const detectFormat = (buf) => {
       if (!buf || buf.length < 4) return 'unknown';
       const b0 = buf[0], b1 = buf[1], b2 = buf[2], b3 = buf[3];
@@ -10611,7 +10611,7 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
           const ct = resp.headers.get('content-type') || '';
           const ab = await resp.arrayBuffer();
           return {
-            OK: true,
+            ok: true,
             status: resp.status,
             ct,
             url: resp.url || url,
@@ -10624,13 +10624,13 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
 
       if (!result || !result.ok || !result.data || result.data.length < 500) {
         const status = result?.status || result?.error || '?';
-        console.log(` ⚠️ PLACSP: fetch failed "${labelName.slice(0, 40)}" (status=${status})`);
+        console.log(`    ⚠️  PLACSP: fetch failed "${labelName.slice(0, 40)}" (status=${status})`);
         continue;
       }
       const buf = Buffer.from(result.data);
       const fmt = detectFormat(buf);
       console.log(
-        ` 🇪🇸 PLACSP: fetched "${labelName.slice(0, 40)}" ` +
+        `    🇪🇸 PLACSP: fetched "${labelName.slice(0, 40)}" ` +
         `(${buf.length}B, magic=${fmt}, ct=${(result.ct || '').slice(0, 30)})`
       );
 
@@ -10642,7 +10642,7 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
         } else if (fmt === 'zip' && admZipLib) {
           // ZIP bundle — extract inner PDF/DOCX entries and concat.
           // Per-entry cap of 80k chars to fit ~3 files in a typical
-          // "Documento de Pliegos" bundle without blowing the AI ​​input.
+          // "Documento de Pliegos" bundle without blowing the AI input.
           try {
             const zip = new admZipLib(buf);
             const entries = zip.getEntries()
@@ -10662,17 +10662,17 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
             }
             text = parts.join('\n\n').trim();
             if (parts.length) {
-              console.log(` 🇪🇸 PLACSP: ZIP parsed ${parts.length} inner entries from "${labelName.slice(0, 40)}"`);
+              console.log(`    🇪🇸 PLACSP: ZIP parsed ${parts.length} inner entries from "${labelName.slice(0, 40)}"`);
             }
           } catch (e) {
-            console.log(` ⚠️ PLACSP: ZIP parse failed for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+            console.log(`    ⚠️  PLACSP: ZIP parse failed for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
           }
         } else if (fmt === 'cfb') {
-          console.log(` ⚠️ PLACSP: "${labelName.slice(0, 40)}" is legacy Office .doc/.xls (CFB) — no parser, skipping`);
+          console.log(`    ⚠️  PLACSP: "${labelName.slice(0, 40)}" is legacy Office .doc/.xls (CFB) — no parser, skipping`);
         } else if (fmt === 'html') {
-          console.log(` ⚠️ PLACSP: "${labelName.slice(0, 40)}" served HTML (likely auth-wall or error page) — skipping`);
+          console.log(`    ⚠️  PLACSP: "${labelName.slice(0, 40)}" served HTML (likely auth-wall or error page) — skipping`);
         } else {
-          console.log(` ⚠️ PLACSP: "${labelName.slice(0, 40)}" unknown format (magic=${fmt}) — skipping`);
+          console.log(`    ⚠️  PLACSP: "${labelName.slice(0, 40)}" unknown format (magic=${fmt}) — skipping`);
         }
         if (text.length > 200) {
           // Per-priority-file cap at 150k chars (PCAP bodies routinely
@@ -10680,20 +10680,20 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
           // around page 50, so caps below 100k drop it).
           const clipped = text.slice(0, 150000);
           texts.push(`--- (placsp ${doc.type}) ${labelName} ---\n${clipped}`);
-          console.log(` 🇪🇸 PLACSP: parsed "${labelName.slice(0, 40)}" (${clipped.length}ch, rank=${doc.rank})`);
+          console.log(`    🇪🇸 PLACSP: parsed "${labelName.slice(0, 40)}" (${clipped.length}ch, rank=${doc.rank})`);
           _collectDriveFile(labelName, buf);
         } else if (fmt === 'pdf' || fmt === 'zip') {
-          console.log(` ⚠️ PLACSP: "${labelName.slice(0, 40)}" extracted text too short (${text.length}ch)`);
+          console.log(`    ⚠️  PLACSP: "${labelName.slice(0, 40)}" extracted text too short (${text.length}ch)`);
         }
       } catch (e) {
-        console.log(` ⚠️ PLACSP: parse failed for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+        console.log(`    ⚠️  PLACSP: parse failed for "${labelName.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
       }
     }
     return texts;
   } catch (e) {
-    console.log(` ⚠️ PLACSP handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  PLACSP handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -10705,35 +10705,35 @@ async function fetchPlacspDocuments(browser, sourceUrl) {
 // publics.com / private.e-marchespublics.com) host their procurement
 // workflow as a multi-step wizard:
 //
-// 1 - CGU (Conditions Générales d'Utilisation — terms acceptance)
-// 2 - Lots
-// 3 - Documents ← the step we want
-// 4 - Recapitulation
+//   1 - CGU (Conditions Générales d'Utilisation — terms acceptance)
+//   2 - Lots
+//   3 - Documents   ← the step we want
+//   4 - Récapitulatif
 //
-// (Some variants have 6 steps: 1-CGU, 2-Lots, 3-Repondants,
-// 4-Questionnaires, 5-Documents, 6-Recapitulatif.)
+// (Some variants have 6 steps: 1-CGU, 2-Lots, 3-Répondants,
+//  4-Questionnaires, 5-Documents, 6-Récapitulatif.)
 //
 // After a successful login (handled by attemptPortalLogin), the user is
 // redirected from the marches-publics.info tender URL to
-// https://awsolutions.fr/apr/depot/<uuid>
-// where the CGU step is active. To reach the documents step we must:
-// 1. Tick the "I have read and accept the General Terms" checkbox
-// 2. Click "Following" (the English label for "Suivant") to advance
-// 3. Repeat clicking "Following" through intermediate steps (Lots,
-// Répondants, Questionnaires) until the Documents step renders
-// 4. Harvest the PDF / DOCX / ZIP anchors that appear on that step
+//   https://awsolutions.fr/apr/depot/<uuid>
+// where the CGU step is active. To reach the Documents step we must:
+//   1. Tick the "I have read and accept the General Terms" checkbox
+//   2. Click "Following" (the English label for "Suivant") to advance
+//   3. Repeat clicking "Following" through intermediate steps (Lots,
+//      Répondants, Questionnaires) until the Documents step renders
+//   4. Harvest the PDF / DOCX / ZIP anchors that appear on that step
 //
 // User confirmed 2026-05-16 DOM facts:
-// - Source URL: https://www.marches-publics.info/mpiaws/index.cfm?
-// fuseaction=demat.termes&IDM=<tender_id>
-// - Post-login redirect: https://awsolutions.fr/apr/depot/<uuid>
-// - CGU checkbox label: "We have read the General Terms and Conditions
-// and accept all of these terms and conditions"
-// - Advance button label: "Following" (likely localized "Suivant")
+//   - Source URL: https://www.marches-publics.info/mpiaws/index.cfm?
+//                 fuseaction=demat.termes&IDM=<tender_id>
+//   - Post-login redirect: https://awsolutions.fr/apr/depot/<uuid>
+//   - CGU checkbox label: "We have read the General Terms and Conditions
+//                          and accept all of these terms and conditions"
+//   - Advance button label: "Following" (likely localized "Suivant")
 //
 // Heuristics in this handler are defensive — we don't have the full
 // awsolutions.fr DOM yet, so each step uses multiple selector and text
-// strategies. If a step fails, we log the page state for next iteration
+// strategies. If a step fails, we log the page state for next-iteration
 // diagnosis instead of throwing.
 // =====================================================================
 async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
@@ -10741,7 +10741,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
     const u = new URL(sourceUrl);
     // Trigger on the whole awsolutions / marches-publics.info family.
     // marches-publics.info redirects to awsolutions.fr after login, and
-    // private.e-marchespublics.com / e-marchespublics.com are siblings
+    // private.e-marchespublics.com / e-marchespublics.com are sibling
     // domains under the same awsolutions platform.
     if (!/(^|\.)marches-publics\.info$|(^|\.)awsolutions\.fr$|(^|\.)e-marchespublics\.com$/i.test(u.hostname)) {
       return [];
@@ -10750,8 +10750,8 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
 
   let pdfParseLib = null, mammothLib = null, admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-  try { mammothLib = require('mammoth'); } catch (_) {}
-  try { admZipLib = require('adm-zip'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
 
   let page = null;
   try {
@@ -10771,7 +10771,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
     } catch (e) {
-      console.log(` 🇫🇷 marches-publics.info: nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇫🇷 marches-publics.info: nav warn: ${(e.message || '').slice(0, 80)}`);
     }
     try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }); } catch (_) {}
     await new Promise((r) => setTimeout(r, 2000));
@@ -10780,11 +10780,11 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
     //
     // Loop up to 6 iterations to advance through the wizard. Each
     // iteration:
-    // - Detect if the current step renders a meaningful number of
-    // downloadable doc anchors → if yes, break and harvest.
-    // - Else: tick any visible CGU-style checkbox, then click the
-    // advance button ("Following" / "Suivant" / "Next").
-    // - Wait for the next step to render.
+    //   - Detect if the current step renders a meaningful number of
+    //     downloadable doc anchors → if yes, break and harvest.
+    //   - Else: tick any visible CGU-style checkbox, then click the
+    //     advance button ("Following" / "Suivant" / "Next").
+    //   - Wait for the next step to render.
     const MAX_STEPS = 6;
     let reachedDocsStep = false;
     let lastStepUrl = '';
@@ -10828,7 +10828,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
                                  /dossier\s+de\s+consultation/i.test(bodyText.slice(0, 4000));
 
         // MUI-aware file detection — files often rendered as list items
-        // with download icon buttons (not <a href>). Look for filename
+        // with download icon buttons (not <a href>). Look for filename-
         // like text in list/card structures.
         const FILENAME_RE = /([A-Za-z0-9_\-. ]{4,80}\.(?:pdf|docx?|xlsx?|pptx?|zip|rtf|odt|ods))/gi;
         const muiFiles = [];
@@ -10881,7 +10881,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
           url: location.href,
           docAnchorCount: docAnchors.length,
           stepLabels: stepLabels.slice(0, 6),
-          activeStep
+          activeStep,
           isDocumentsStep,
           muiFiles,
           mainText: mainText.slice(0, 30000),
@@ -10890,12 +10890,12 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
       }).catch(() => null);
 
       if (!stepState) {
-        console.log(` 🇫🇷 marches-publics.info step ${step}: evaluate failed`);
+        console.log(`    🇫🇷 marches-publics.info step ${step}: evaluate failed`);
         break;
       }
       lastStepUrl = stepState.url;
       console.log(
-        ` 🇫🇷 marches-publics.info step ${step}: url=${(stepState.url || '').slice(-70)} ` +
+        `    🇫🇷 marches-publics.info step ${step}: url=${(stepState.url || '').slice(-70)} ` +
         `docAnchors=${stepState.docAnchorCount} muiFiles=${(stepState.muiFiles || []).length} ` +
         `active="${(stepState.activeStep || '').slice(0, 40)}" ` +
         `steps=[${(stepState.stepLabels || []).join(' | ')}]`
@@ -10907,13 +10907,13 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
           stepState.isDocumentsStep ||
           (stepState.muiFiles && stepState.muiFiles.length >= 1)) {
         console.log(
-          ` 🇫🇷 marches-publics.info: reached Documents step ` +
+          `    🇫🇷 marches-publics.info: reached Documents step ` +
           `(anchors=${stepState.docAnchorCount}, MUI files=${(stepState.muiFiles || []).length}, ` +
           `active="${(stepState.activeStep || '').slice(0, 40)}")`
         );
         reachedDocsStep = true;
 
-        // 2026-05-19 — Lazy load wait. awsolutions.fr renders the
+        // 2026-05-19 — Lazy-load wait. awsolutions.fr renders the
         // Documents step shell instantly but fetches the actual file
         // list asynchronously (XHR), populating MUI components 1-3s
         // later. Without this wait we capture an empty placeholder.
@@ -10927,7 +10927,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
         await new Promise((r) => setTimeout(r, 2500));
 
         // Try clicking "Tout télécharger" / "Download all" — many
-        // awsolutions.fr Documents steps expose a bulk download
+        // awsolutions.fr Documents steps expose a bulk-download
         // button that streams a ZIP of all files. Faster than
         // per-file clicks if it works.
         const bulkClicked = await page.evaluate(() => {
@@ -10949,7 +10949,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
           ));
           for (const el of iconCands) {
             if (el.disabled || el.offsetParent === null) continue;
-            const lbl = (el.getAttribute('aria-label') || el.getAttribute('title') || '').t rim();
+            const lbl = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
             if (lbl && RE.test(lbl)) {
               try { el.scrollIntoView({ block: 'center' }); el.click(); return `aria:${lbl.slice(0, 50)}`; } catch (_) {}
             }
@@ -10957,7 +10957,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
           return null;
         }).catch(() => null);
         if (bulkClicked) {
-          console.log(` 🇫🇷 marches-publics.info: clicked bulk download ("${bulkClicked}") — waiting for response`);
+          console.log(`    🇫🇷 marches-publics.info: clicked bulk download ("${bulkClicked}") — waiting for response`);
           // Bulk download usually returns a ZIP via a separate response.
           // We don't capture it here (no response interception set up),
           // but the click may also expand the file list. Re-capture state.
@@ -11032,7 +11032,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
 
         if (enrichedState) {
           console.log(
-            ` 🇫🇷 marches-publics.info: post-wait re-capture: docAnchors=${enrichedState.docAnchorCount}, MUI files=${enrichedState.muiFiles.length}, mainText=${enrichedState.mainText.length}ch`
+            `    🇫🇷 marches-publics.info: post-wait re-capture: docAnchors=${enrichedState.docAnchorCount}, MUI files=${enrichedState.muiFiles.length}, mainText=${enrichedState.mainText.length}ch`
           );
           page._mpiDocStepCache = enrichedState;
         } else {
@@ -11051,15 +11051,15 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
       // Result: visual state changes but `Suivant` stays disabled.
       //
       // Working approach for React/MUI:
-      // STRATEGY 1 — Click the visible label or wrapper element. MUI
-      // wraps the real <input> in a <span class="MuiCheckbox-root">
-      // and a <label class="MuiFormControlLabel-root">. Clicking
-      // EITHER fires the proper synthetic onChange via React's
-      // event delegation.
-      // STRATEGY 2 — Use the native HTMLInputElement.prototype.checked
-      // setter from getOwnPropertyDescriptor (the React-recognized
-      // "native value setter" trick used by react-testing-library).
-      // Then fire input + change events.
+      //   STRATEGY 1 — Click the visible label or wrapper element. MUI
+      //     wraps the real <input> in a <span class="MuiCheckbox-root">
+      //     and a <label class="MuiFormControlLabel-root">. Clicking
+      //     EITHER fires the proper synthetic onChange via React's
+      //     event delegation.
+      //   STRATEGY 2 — Use the native HTMLInputElement.prototype.checked
+      //     setter from getOwnPropertyDescriptor (the React-recognized
+      //     "native value setter" trick used by react-testing-library).
+      //     Then fire input + change events.
       const cbChecked = await page.evaluate(() => {
         const cbs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
         let any = 0;
@@ -11083,7 +11083,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
             (grand?.innerText || '')
           ).toLowerCase().slice(0, 600);
           // Match CGU / Terms acceptance phrases (FR/EN) — broadened.
-          const matchesCGU = /conditions\s*g[ée]n[ée]rales|terms\s*and\s*conditions|terms\s*of\s*(?:use|service)|cgu\b|we\s*have\s*read|j['']?\s*accepte|i\s*(?:have\s*)?read|i \s*accept|pris\s*connaissance|lu\s*et\s*(?:approuv[eé]|accept[eé])|j['']?\s*ai\s*lu|i\s*agree|i\s*confirm|je\s*reconnais|je\s*certifie/i.test(ctx);
+          const matchesCGU = /conditions\s*g[ée]n[ée]rales|terms\s*and\s*conditions|terms\s*of\s*(?:use|service)|cgu\b|we\s*have\s*read|j['']?\s*accepte|i\s*(?:have\s*)?read|i\s*accept|pris\s*connaissance|lu\s*et\s*(?:approuv[eé]|accept[eé])|j['']?\s*ai\s*lu|i\s*agree|i\s*confirm|je\s*reconnais|je\s*certifie/i.test(ctx);
           if (!matchesCGU) continue;
 
           // STRATEGY 1: click the MUI label or wrapper. This is the
@@ -11100,7 +11100,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
             }
           } catch (_) {}
 
-          // STRATEGY 2: native React recognized setter + events.
+          // STRATEGY 2: native React-recognized setter + events.
           // Fires even when STRATEGY 1 succeeded — belt-and-suspenders
           // for cases where MUI ignores synthetic label clicks.
           try {
@@ -11114,7 +11114,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
         return any;
       }).catch(() => 0);
       if (cbChecked) {
-        console.log(` 🇫🇷 marches-publics.info: ticked ${cbChecked} CGU acceptance checkbox(es)`);
+        console.log(`    🇫🇷 marches-publics.info: ticked ${cbChecked} CGU acceptance checkbox(es)`);
         // React/MUI debounces form validation by ~300-800ms after the
         // change event. 1500ms gives the disabled Suivant button time
         // to re-render as enabled.
@@ -11136,7 +11136,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
         // Match keywords ANYWHERE in the button text — covers
         // "Suivant ›", "Étape suivante", "Following >", "Continuer →".
         const ADVANCE_RE = /\b(following|suivant|continuer|continue|next|étape\s+suivante|valider\s+et\s+(?:continuer|suivre)|valider)\b/i;
-        // Anti-pattern — buttons that look like "next" but aren't (eg,
+        // Anti-pattern — buttons that look like "next" but aren't (e.g.,
         // "Retour" reverses). Filter explicitly.
         const REJECT_RE = /\b(annuler|cancel|retour|back|précédent|previous)\b/i;
         const target = candidates.find((el) => {
@@ -11153,7 +11153,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
       }).catch(() => null);
 
       if (!clicked) {
-        console.log(` 🇫🇷 marches-publics.info step ${step}: no advance button found — stopping wizard walk`);
+        console.log(`    🇫🇷 marches-publics.info step ${step}: no advance button found — stopping wizard walk`);
         // Diagnostic dump — buttons + ALL checkboxes (so we can tell
         // whether Suivant stayed disabled because of another unticked
         // required checkbox, not just CGU).
@@ -11196,26 +11196,26 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
         }).catch(() => ({ btns: [], cbs: [], inputs: [] }));
 
         if (diag.btns.length) {
-          console.log(` visible buttons (${diag.btns.length}):`);
+          console.log(`       visible buttons (${diag.btns.length}):`);
           for (const b of diag.btns) {
-            console.log(` <${b.tag}${b.type ? ' type=' + b.type : ''}${b.disabled ? ' disabled' : ''}> "${b.text}" class="${b.cls}"`);
+            console.log(`         <${b.tag}${b.type ? ' type=' + b.type : ''}${b.disabled ? ' disabled' : ''}> "${b.text}" class="${b.cls}"`);
           }
         } else {
-          console.log(` (no visible buttons — wizard may not have rendered)`);
+          console.log(`       (no visible buttons — wizard may not have rendered)`);
         }
         if (diag.cbs.length) {
-          console.log(` checkboxes (${diag.cbs.length}): ${diag.cbs.filter(c => c.checked).length} checked, ${diag.cbs.filter(c => !c.checked && !c.disabled).length} unchecked-actionable`);
+          console.log(`       checkboxes (${diag.cbs.length}): ${diag.cbs.filter(c => c.checked).length} checked, ${diag.cbs.filter(c => !c.checked && !c.disabled).length} unchecked-actionable`);
           for (const c of diag.cbs) {
             const flags = [c.checked ? '✓' : '✗', c.disabled ? 'disabled' : '', c.hidden ? 'hidden' : '', c.required ? 'required' : ''].filter(Boolean).join(',');
-            console.log(` [${flags}] "${c.label}"`);
+            console.log(`         [${flags}] "${c.label}"`);
           }
         }
         if (diag.inputs.length) {
-          console.log(` required/empty inputs (${diag.inputs.length}): ${diag.inputs.map(i => `${i.tag}[${i.name}${i.required ? ',required' : ''}${!i.hasValue ? ',empty' : ''}]`).join(' ')}`);
+          console.log(`       required/empty inputs (${diag.inputs.length}): ${diag.inputs.map(i => `${i.tag}[${i.name}${i.required ? ',required' : ''}${!i.hasValue ? ',empty' : ''}]`).join(' ')}`);
         }
         break;
       }
-      console.log(` 🇫🇷 marches-publics.info: clicked "${clicked}" — advancing to next step`);
+      console.log(`    🇫🇷 marches-publics.info: clicked "${clicked}" — advancing to next step`);
 
       // Wait for step transition (navigation OR in-place DOM update)
       await Promise.race([
@@ -11227,7 +11227,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
 
     if (!reachedDocsStep) {
       // Even if we didn't formally reach Documents, but Suivant became
-      // disabled mid-walk (eg, on the LAST content-bearing step where
+      // disabled mid-walk (e.g., on the LAST content-bearing step where
       // there's nothing to advance to), the cached page state may still
       // hold useful body text — qualifications + award criteria are
       // often rendered as plain HTML on every wizard step. Try to
@@ -11241,11 +11241,11 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
           return hasQualLang ? body.slice(0, 25000) : '';
         }).catch(() => '');
         if (fallback && fallback.length > 500) {
-          console.log(` 🇫🇷 marches-publics.info: wizard walk incomplete but extracted ${fallback.length}ch fallback content (qualifications/criteria language detected)`);
+          console.log(`    🇫🇷 marches-publics.info: wizard walk incomplete but extracted ${fallback.length}ch fallback content (qualifications/criteria language detected)`);
           return [`--- (marches-publics.info wizard fallback) ---\n${fallback}`];
         }
       } catch (_) {}
-      console.log(` ⚠️ marches-publics.info: wizard walk ended without reaching Documents step (last URL: ${lastStepUrl.slice(-80)})`);
+      console.log(`    ⚠️  marches-publics.info: wizard walk ended without reaching Documents step (last URL: ${lastStepUrl.slice(-80)})`);
       return [];
     }
 
@@ -11288,7 +11288,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
       const muiFiles = cache?.muiFiles || [];
       const mainText = cache?.mainText || '';
       if (mainText || muiFiles.length) {
-        console.log(` 🇫🇷 marches-publics.info: no doc anchors but cached MUI state — ${muiFiles.length} file(s) listed, ${mainText.length}ch body text`);
+        console.log(`    🇫🇷 marches-publics.info: no doc anchors but cached MUI state — ${muiFiles.length} file(s) listed, ${mainText.length}ch body text`);
         const out = [];
         if (muiFiles.length) {
           out.push(`--- (marches-publics.info MUI file list) ---`);
@@ -11300,14 +11300,14 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
         }
         return [out.join('\n\n')];
       }
-      console.log(` ⚠️ marches-publics.info: Documents step reached but no doc anchors or MUI content extracted`);
+      console.log(`    ⚠️  marches-publics.info: Documents step reached but no doc anchors or MUI content extracted`);
       return [];
     }
-    console.log(` 🇫🇷 marches-publics.info: collected ${docs.length} doc anchor(s)`);
+    console.log(`    🇫🇷 marches-publics.info: collected ${docs.length} doc anchor(s)`);
 
     // Score docs — same multilingual qualification vocab as kommersannons
     const SCORE_RULES = [
-      {rx: /CCAP|cahier\s+des\s+clauses\s+administratives\s+particuli[èe]res|r[èe]glement\s+de\s+(?:la\s+)?consultation|RC\s*\.?\s*pdf|CCTP|cahier\s+des\s+clauses\s+techniques\s+particuli[èe]res/i, score: 30 },
+      { rx: /CCAP|cahier\s+des\s+clauses\s+administratives\s+particuli[èe]res|r[èe]glement\s+de\s+(?:la\s+)?consultation|RC\s*\.?\s*pdf|CCTP|cahier\s+des\s+clauses\s+techniques\s+particuli[èe]res/i, score: 30 },
       { rx: /candidature|DC[12]|DUME|attestation|qualifications?|crit[èe]res?\s+de\s+s[ée]lection/i, score: 25 },
       { rx: /AE\b|acte\s+d'engagement|bordereau\s+de\s+prix|annexe\s+financi[èe]re/i, score: 18 },
       { rx: /annexe|bilan|justificatif/i, score: 8 },
@@ -11324,7 +11324,7 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
     docs.sort((a, b) => b.score - a.score);
     const topDocs = docs.slice(0, 6);
     console.log(
-      ` 🇫🇷 marches-publics.info: priority docs: ` +
+      `    🇫🇷 marches-publics.info: priority docs: ` +
       topDocs.map((d) => `${(d.filename || d.text || d.url.split('/').pop()).slice(0, 40)}[s=${d.score}]`).join(' | ')
     );
 
@@ -11357,12 +11357,12 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
 
       if (!result || !result.ok || !result.data || result.data.length < 500) {
         const status = result?.status || result?.error || '?';
-        console.log(` ⚠️ marches-publics.info: fetch failed "${labelName.slice(0, 40)}" (status=${status})`);
+        console.log(`    ⚠️  marches-publics.info: fetch failed "${labelName.slice(0, 40)}" (status=${status})`);
         continue;
       }
       const buf = Buffer.from(result.data);
       const fmt = detectFormat(buf);
-      console.log(` 🇫🇷 marches-publics.info: fetched "${labelName.slice(0, 40)}" (${buf.length}B, magic=${fmt})`);
+      console.log(`    🇫🇷 marches-publics.info: fetched "${labelName.slice(0, 40)}" (${buf.length}B, magic=${fmt})`);
 
       let text = '';
       try {
@@ -11392,23 +11392,23 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
           text = (out?.value || '').trim();
         }
       } catch (e) {
-        console.log(` ⚠️ marches-publics.info: parse failed "${labelName}": ${e.message}`);
+        console.log(`    ⚠️  marches-publics.info: parse failed "${labelName}": ${e.message}`);
         continue;
       }
       if (text && text.length > 50) {
         const clipped = text.slice(0, 50000);
         texts.push(`--- (source) ${labelName} ---\n${clipped}`);
-        console.log(` 🇫🇷 marches-publics.info: parsed "${labelName.slice(0, 40)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+        console.log(`    🇫🇷 marches-publics.info: parsed "${labelName.slice(0, 40)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
         _collectDriveFile(labelName, buf);
       } else {
-        console.log(` ⚠️ marches-publics.info: "${labelName.slice(0, 40)}" extracted no usable text`);
+        console.log(`    ⚠️  marches-publics.info: "${labelName.slice(0, 40)}" extracted no usable text`);
       }
     }
     return texts;
   } catch (e) {
-    console.log(` ⚠️ marches-publics.info handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  marches-publics.info handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -11419,36 +11419,36 @@ async function fetchMarchesPublicsInfoDocuments(browser, sourceUrl) {
 // Estonian public procurement portal (riigihanked.riik.ee) — Angular
 // SPA with hash-based routing. Sidebar exposes named sub-pages:
 //
-// #/procurement/<id>/general-info
-// #/procurement/<id>/procurers
-// #/procurement/<id>/additional-data
-// #/procurement/<id>/procurement-passport ← "Grounds for exclusion + qualification conditions"
-// #/procurement/<id>/qualification-conditions ← "Eligibility criteria"
-// #/procurement/<id>/evaluation ← "Evaluation criteria + indicators"
-// #/procurement/<id>/subcontractor-passport
-// #/procurement/<id>/notices
-// #/procurement/<id>/procurement-versions
-// #/procurement/<id>/documents?group=B ← THE DOCS PAGE
+//   #/procurement/<id>/general-info
+//   #/procurement/<id>/procurers
+//   #/procurement/<id>/additional-data
+//   #/procurement/<id>/procurement-passport       ← "Grounds for exclusion + qualification conditions"
+//   #/procurement/<id>/qualification-conditions   ← "Eligibility criteria"
+//   #/procurement/<id>/evaluation                 ← "Evaluation criteria + indicators"
+//   #/procurement/<id>/subcontractor-passport
+//   #/procurement/<id>/notices
+//   #/procurement/<id>/procurement-versions
+//   #/procurement/<id>/documents?group=B          ← THE DOCS PAGE
 //
 // User-confirmed 2026-05-17 DOM facts:
-// - Documents page renders a list "Documents:" with items like
-// "Eligibility criteria"
-// - Clicking an item reveals "Document file: <fname>.pdf (<size>)"
-// as a download anchor pointing back into /rhr-web/
+//   - Documents page renders a list "Documents:" with items like
+//     "Eligibility criteria"
+//   - Clicking an item reveals "Document file: <fname>.pdf (<size>)"
+//     as a download anchor pointing back into /rhr-web/
 //
 // Strategy (defensive — full DOM not yet inspected):
-// 1. Navigate to source URL; wait for Angular to settle
-// 2. Force navigation to #/procurement/<id>/documents?group=B (the
-// group=B variant — most common; also try ?group=A as fallback)
-// 3. Wait for Angular digest + render
-// 4. Scan for downloadable file anchors (PDF/DOC/XLS extensions or
-// href patterns matching /file/, /download/, /attachment/,
-// /document/<id>)
-// 5. If zero anchors visible, click each ITEM HEADER in the
-// Documents list to expand its "Document file" anchor, then scan again
-// 6. Fetch + parse top docs (same magic-byte detection as other handlers)
+//   1. Navigate to source URL; wait for Angular to settle
+//   2. Force navigation to #/procurement/<id>/documents?group=B (the
+//      group=B variant — most common; also try ?group=A as fallback)
+//   3. Wait for Angular digest + render
+//   4. Scan for downloadable file anchors (PDF/DOC/XLS extensions or
+//      href patterns matching /file/, /download/, /attachment/,
+//      /document/<id>)
+//   5. If zero anchors visible, click each ITEM HEADER in the
+//      Documents list to expand its "Document file" anchor, then scan again
+//   6. Fetch + parse top docs (same magic-byte detection as other handlers)
 //
-// Hash routing quirk: Angular's $location strips reload-on-hashchange.
+// Hash-routing quirk: Angular's $location strips reload-on-hashchange.
 // We use page.goto for first nav, then page.evaluate(window.location.hash = ...)
 // for SPA-internal jumps to avoid Angular detection issues.
 // =====================================================================
@@ -11460,8 +11460,8 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
 
   let pdfParseLib = null, mammothLib = null, admZipLib = null;
   try { pdfParseLib = require('pdf-parse'); } catch (_) {}
-  try { mammothLib = require('mammoth'); } catch (_) {}
-  try { admZipLib = require('adm-zip'); } catch (_) {}
+  try { mammothLib  = require('mammoth');   } catch (_) {}
+  try { admZipLib   = require('adm-zip');   } catch (_) {}
 
   // 2026-05-26 — CDP download capture for bulk ZIP button.
   // User-confirmed: doc anchors (#/procurement/X/documents/source-document?
@@ -11469,7 +11469,7 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
   // returns 2606B SPA shell, not files. Workaround: click the green
   // "Download published procurement documents" / "Laadi alla avaldatud
   // hankedokumendid" button which ZIPs ALL docs server-side and streams
-  // via content disposition. Browser-level CDP download config catches it.
+  // via Content-Disposition. Browser-level CDP download config catches it.
   const fs = require('fs');
   const pathLib = require('path');
   const os = require('os');
@@ -11507,16 +11507,16 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
     } catch (_) {}
 
     // Extract procurement ID from URL — works for both
-    // /rhr-web/#/procurement/<id>/...
+    //   /rhr-web/#/procurement/<id>/...
     // and short variants without hash routing yet.
     const procurementId = (sourceUrl.match(/\/procurement\/(\d+)(?:[/?]|$)/i) || [])[1];
-    console.log(` 🇪🇪 riigihanked: procurementId=${procurementId || '(unknown)'} from ${sourceUrl.slice(-80)}`);
+    console.log(`    🇪🇪 riigihanked: procurementId=${procurementId || '(unknown)'} from ${sourceUrl.slice(-80)}`);
 
     // STEP 1 — initial load
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
     } catch (e) {
-      console.log(` 🇪🇪 riigihanked: nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇪🇪 riigihanked: nav warn: ${(e.message || '').slice(0, 80)}`);
     }
     try { await page.waitForNetworkIdle({ idleTime: 1500, timeout: 10000 }); } catch (_) {}
     await new Promise((r) => setTimeout(r, 2500));
@@ -11557,13 +11557,13 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
       //
       // 2026-05-26 log 37 confirmed actual ET text: "Laadi alla
       // kehtivad hanke dokumendid". Notes:
-      // - "kehtivad" (valid/current), NOT "avaldatud" as guessed
-      // - "dokumendid" (Estonian plural) NOT "documentid" — the "t"
-      // becomes "d" via consonant gradation. We match the prefix
-      // "dokumen" like "document"/"dokumendi"/"dokumendid"/"documents"
-      // all hit.
-      // EN "document" (with C) vs ET "document" (with K) — match BOTH
-      // via /do[ck]umen/ stem. Covers documents/documendid/documentide/etc.
+      //   - "kehtivad" (valid/current), NOT "avaldatud" as guessed
+      //   - "dokumendid" (Estonian plural) NOT "dokumentid" — the "t"
+      //     becomes "d" via consonant gradation. We match the prefix
+      //     "dokumen" so "dokument"/"dokumendi"/"dokumendid"/"documents"
+      //     all hit.
+      // EN "document" (with C) vs ET "dokument" (with K) — match BOTH
+      // via /do[ck]umen/ stem. Covers documents/dokumendid/dokumentide/etc.
       const RE_PUBLISHED = /\b(kehtivad|kehtivat|avaldatud|published)\b[\s\S]{0,40}\bdo[ck]umen/i;
       const RE_ALL = /\b(k[oõ]ik|all)\b[\s\S]{0,20}\bdo[ck]umen/i;
       const candidates = Array.from(document.querySelectorAll(
@@ -11589,7 +11589,7 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
           try { el.scrollIntoView({ block: 'center' }); el.click(); return `all:${text.slice(0, 60)}`; } catch (_) {}
         }
       }
-      // Pass 3 — diagnostic dump of ALL visible buttons as we can
+      // Pass 3 — diagnostic dump of ALL visible buttons so we can
       // refine the regex against the real wording if it's still off.
       const sample = candidates
         .filter((el) => el.offsetParent !== null && !el.disabled)
@@ -11600,14 +11600,14 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
     }).catch(() => null);
 
     if (bulkClicked && bulkClicked.failed) {
-      console.log(` ⚠️ riigihanked: no PUBLISHED bulk button matched. Visible buttons (${bulkClicked.sample.length}):`);
-      for (const s of bulkClicked.sample) console.log(` "${s}"`);
+      console.log(`    ⚠️  riigihanked: no PUBLISHED bulk button matched. Visible buttons (${bulkClicked.sample.length}):`);
+      for (const s of bulkClicked.sample) console.log(`         "${s}"`);
     }
 
     // bulkClicked is now: null (eval failed) | string (button text) | {failed:true} (diag)
     const bulkWasClicked = typeof bulkClicked === 'string';
     if (bulkWasClicked) {
-      console.log(` 🇪🇪 riigihanked: clicked bulk download button "${bulkClicked}" — waiting for ZIP`);
+      console.log(`    🇪🇪 riigihanked: clicked bulk download button "${bulkClicked}" — waiting for ZIP`);
       // Wait up to 30s for ZIP (procurement bundles can be 5-15MB)
       const watchDeadline = Date.now() + 30000;
       let newFile = null;
@@ -11629,7 +11629,7 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
       if (newFile) {
         try {
           const buf = fs.readFileSync(newFile.path);
-          console.log(` 🇪🇪 riigihanked: ✓ captured bulk ZIP ${buf.length}B: "${newFile.name}"`);
+          console.log(`    🇪🇪 riigihanked: ✓ captured bulk ZIP ${buf.length}B: "${newFile.name}"`);
           try { fs.unlinkSync(newFile.path); } catch (_) {}
           // Parse ZIP and return text — bypass legacy per-anchor path
           const texts = [];
@@ -11653,11 +11653,11 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
                 if (extracted && extracted.length > 100) {
                   const clipped = extracted.slice(0, 50000);
                   texts.push(`--- (zip:${newFile.name}) ${z.entryName} ---\n${clipped}`);
-                  console.log(` 📦 zip entry "${z.entryName}" (${ext}, ${innerBytes.length}B → ${clipped.length}ch)`);
+                  console.log(`    📦 zip entry "${z.entryName}" (${ext}, ${innerBytes.length}B → ${clipped.length}ch)`);
                 }
               }
             } catch (e) {
-              console.log(` ⚠️ riigihanked: ZIP parse failed: ${(e.message || '').slice(0, 80)}`);
+              console.log(`    ⚠️  riigihanked: ZIP parse failed: ${(e.message || '').slice(0, 80)}`);
             }
           }
           // Cleanup tempdir
@@ -11668,13 +11668,13 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
           } catch (_) {}
           if (texts.length) return texts;
         } catch (e) {
-          console.log(` ⚠️ riigihanked: failed to read bulk ZIP: ${e.message}`);
+          console.log(`    ⚠️  riigihanked: failed to read bulk ZIP: ${e.message}`);
         }
       } else {
-        console.log(` ⚠️ riigihanked: bulk click but no ZIP appeared within 30s — falling back to per-anchor scrape`);
+        console.log(`    ⚠️  riigihanked: bulk click but no ZIP appeared within 30s — falling back to per-anchor scrape`);
       }
     } else {
-      console.log(` ℹ️ riigihanked: bulk download button not found — falling back to per-anchor scrape`);
+      console.log(`    ℹ️  riigihanked: bulk download button not found — falling back to per-anchor scrape`);
     }
 
     // STEP 3 — diagnostic snapshot
@@ -11713,17 +11713,17 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
 
     if (snapshot) {
       console.log(
-        ` 🇪🇪 riigihanked snapshot: url=${(snapshot.url || '').slice(-70)} ` +
+        `    🇪🇪 riigihanked snapshot: url=${(snapshot.url || '').slice(-70)} ` +
         `title="${(snapshot.title || '').slice(0, 40)}" ` +
         `totalAnchors=${snapshot.totalAnchors} ` +
         `docAnchors=${snapshot.docAnchorCount} ` +
         `expandable=${snapshot.expandableCount}`
       );
       if (snapshot.docAnchorCount > 0) {
-        console.log(` 🇪🇪 riigihanked doc samples: ${JSON.stringify(snapshot.docAnchorSamples.slice(0, 3))}`);
+        console.log(`    🇪🇪 riigihanked doc samples: ${JSON.stringify(snapshot.docAnchorSamples.slice(0, 3))}`);
       }
       if (snapshot.expandableCount > 0 && snapshot.docAnchorCount === 0) {
-        console.log(` 🇪🇪 riigihanked expandable items: ${JSON.stringify(snapshot.expandableSamples)}`);
+        console.log(`    🇪🇪 riigihanked expandable items: ${JSON.stringify(snapshot.expandableSamples)}`);
       }
     }
 
@@ -11731,7 +11731,7 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
     // try revealing them. This handles the "expand to see Document file"
     // user flow.
     if (snapshot && snapshot.docAnchorCount === 0 && snapshot.expandableCount > 0) {
-      console.log(` 🇪🇪 riigihanked: 0 doc anchors visible — trying to expand list items`);
+      console.log(`    🇪🇪 riigihanked: 0 doc anchors visible — trying to expand list items`);
       const expandResults = await page.evaluate(async () => {
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         const items = Array.from(document.querySelectorAll('li, .document-item, [class*="document"]'));
@@ -11753,7 +11753,7 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
         }
         return clickedCount;
       }).catch(() => 0);
-      console.log(` 🇪🇪 riigihanked: clicked ${expandResults} list item(s) to expand`);
+      console.log(`    🇪🇪 riigihanked: clicked ${expandResults} list item(s) to expand`);
       try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 6000 }); } catch (_) {}
       await new Promise((r) => setTimeout(r, 1500));
     }
@@ -11778,7 +11778,7 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
         seen.add(abs);
         const text = (a.innerText || a.textContent || '').trim();
         // Walk siblings/parents to find a richer label (the section
-        // header text — eg "Eligibility criteria" — sits in the
+        // header text — e.g. "Eligibility criteria" — sits in the
         // parent <li> above the anchor)
         let contextLabel = '';
         let cur = a.parentElement;
@@ -11796,15 +11796,15 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
     }).catch(() => []);
 
     if (!docs.length) {
-      console.log(` ⚠️ riigihanked: no document download anchors found after navigation/expansion`);
+      console.log(`    ⚠️  riigihanked: no document download anchors found after navigation/expansion`);
       return [];
     }
-    console.log(` 🇪🇪 riigihanked: collected ${docs.length} doc anchor(s)`);
+    console.log(`    🇪🇪 riigihanked: collected ${docs.length} doc anchor(s)`);
 
     // Score docs by context (Estonian + English keywords)
     const SCORE_RULES = [
       { rx: /eligibility|qualification|kvalifikatsioon|sobivus/i, score: 30 },
-      { rx: /tender\s+document|hankedokumendid|hanke\s+document/i, score: 25 },
+      { rx: /tender\s+document|hankedokumendid|hanke\s+dokument/i, score: 25 },
       { rx: /criteria|kriteerium|hindamiskriteerium/i, score: 18 },
       { rx: /terms|conditions|tingimused|t[üu]vesisaldused/i, score: 12 },
       { rx: /annex|lisa\s+\d+/i, score: 8 },
@@ -11821,7 +11821,7 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
     docs.sort((a, b) => b.score - a.score);
     const topDocs = docs.slice(0, 6);
     console.log(
-      ` 🇪🇪 riigihanked: priority docs: ` +
+      `    🇪🇪 riigihanked: priority docs: ` +
       topDocs.map((d) => `${(d.contextLabel || d.text || d.url.split('/').pop()).slice(0, 40)}[s=${d.score}]`).join(' | ')
     );
 
@@ -11854,12 +11854,12 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
 
       if (!result || !result.ok || !result.data || result.data.length < 500) {
         const status = result?.status || result?.error || '?';
-        console.log(` ⚠️ riigihanked: fetch failed "${labelName.slice(0, 40)}" (status=${status})`);
+        console.log(`    ⚠️  riigihanked: fetch failed "${labelName.slice(0, 40)}" (status=${status})`);
         continue;
       }
       const buf = Buffer.from(result.data);
       const fmt = detectFormat(buf);
-      console.log(` 🇪🇪 riigihanked: fetched "${labelName.slice(0, 40)}" (${buf.length}B, magic=${fmt})`);
+      console.log(`    🇪🇪 riigihanked: fetched "${labelName.slice(0, 40)}" (${buf.length}B, magic=${fmt})`);
 
       let text = '';
       try {
@@ -11889,23 +11889,23 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
           text = (out?.value || '').trim();
         }
       } catch (e) {
-        console.log(` ⚠️ riigihanked: parse failed "${labelName}": ${e.message}`);
+        console.log(`    ⚠️  riigihanked: parse failed "${labelName}": ${e.message}`);
         continue;
       }
       if (text && text.length > 50) {
         const clipped = text.slice(0, 50000);
         texts.push(`--- (source) ${labelName} ---\n${clipped}`);
-        console.log(` 🇪🇪 riigihanked: parsed "${labelName.slice(0, 40)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
+        console.log(`    🇪🇪 riigihanked: parsed "${labelName.slice(0, 40)}" (${buf.length}B → ${clipped.length}ch, score=${doc.score})`);
         _collectDriveFile(labelName, buf);
       } else {
-        console.log(` ⚠️ riigihanked: "${labelName.slice(0, 40)}" extracted no usable text`);
+        console.log(`    ⚠️  riigihanked: "${labelName.slice(0, 40)}" extracted no usable text`);
       }
     }
     return texts;
   } catch (e) {
-    console.log(` ⚠️ riigihanked handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  riigihanked handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
     // Cleanup temp download dir (may have leftover files if bulk path failed)
     try {
@@ -11922,37 +11922,37 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
 // When Mercell's "Go to source" points to permalink.mercell.com/<id>.aspx
 // (or app.mercell.com/tender/<id>), the previous behavior was to skip
 // the URL as "Mercell-internal" — leaving us with only the 803-byte XML
-// notice stubs from the search-service-api JSON. Result: pdfText what
+// notice stubs from the search-service-api JSON. Result: pdfText was
 // effectively zero, AI made content-filter decisions from title +
 // description alone.
 //
 // permalink.mercell.com is actually a redirect to Mercell's Next.js
 // tender page on app.mercell.com. The page contains the full tender
 // description, buyer info, and a list of procurement document download
-// left. Since the scraper is already authenticated to Mercell (Monika's
+// links. Since the scraper is already authenticated to Mercell (Monika's
 // session cookies are on the browser context), we can simply navigate
 // to the URL, wait for hydration, and scrape both the rendered text and
 // the document anchors.
 //
 // Strategy:
-// 1. Open new page in same browser context (inherits Mercell auth).
-// 2. Capture ALL JSON XHR responses during navigation — Mercell's SPA
-// may load documents from an undocumented endpoint and we want to
-// learn it via diagnostic logs.
-// 3. After page render, scan DOM for document anchors:
-// a) <a href="/files/<id>/download">
-// b) <a href*="EntrepriseDownloadReglement"> (carry over from
-(portal-aggregated tenders)
-// c) Any anchor whose text matches /document|specifikacij|
-// specification|regulation|pliego|annexe|anexo|kvalifik/i
-// 4. Download each via page.evaluate fetch (inherits cookies →
-// authenticated). Convert ArrayBuffer → Buffer to Node.
-// 5. Sniff magic bytes, parse PDF/DOCX/XLSX/ZIP into text.
-// 6. Return { sourceFilesText, bodyTextPreview, sourceHost, ... }
-// shape compatible with fetchSourcePageDetails.
+//   1. Open new page in same browser context (inherits Mercell auth).
+//   2. Capture ALL JSON XHR responses during navigation — Mercell's SPA
+//      may load documents from an undocumented endpoint and we want to
+//      learn it via diagnostic logs.
+//   3. After page render, scan DOM for document anchors:
+//        a) <a href="/files/<id>/download">
+//        b) <a href*="EntrepriseDownloadReglement"> (carry-over from
+//           portal-aggregated tenders)
+//        c) Any anchor whose text matches /document|specifikacij|
+//           specification|reglement|pliego|annexe|anexo|kvalifik/i
+//   4. Download each via page.evaluate fetch (inherits cookies →
+//      authenticated). Convert ArrayBuffer → Buffer in Node.
+//   5. Sniff magic bytes, parse PDF/DOCX/XLSX/ZIP into text.
+//   6. Return { sourceFilesText, bodyTextPreview, sourceHost, ... }
+//      shape compatible with fetchSourcePageDetails.
 // =====================================================================
 // =====================================================================
-// fetchDoffinDocuments (2026-06-08, part-b)
+// fetchDoffinDocuments  (2026-06-08, part-b)
 // ---------------------------------------------------------------------
 // Norway fallback. Mercell hands Norwegian tenders as permalink.mercell.com
 // → my.mercell.com (login wall) and the OriginalNotice "Contract Doffin"
@@ -11964,14 +11964,14 @@ async function fetchRiigihankedDocuments(browser, sourceUrl) {
 //
 // Strategy (best-effort, diagnostic-heavy — Doffin is a React SPA, exact
 // DOM may shift; we log generously so selectors can be tuned over runs):
-// 1. Search https://www.doffin.no/search?searchString=<ref or title>
-// 2. Open the first matching notice (/notices/<id>...)
-// 3. Capture the notice body innerText (often carries selection criteria
-// inline) AND harvest external "competition documents" links.
-// 4. If an external link points to a portal we already handle
-// (artifik.no / eu-supply), delegate to that handler so the real
-// documents get downloaded + parsed.
-// 5. Return [text blocks]. No-op (returns []) if nothing usable found.
+//   1. Search https://www.doffin.no/search?searchString=<ref or title>
+//   2. Open the first matching notice (/notices/<id>...)
+//   3. Capture the notice body innerText (often carries selection criteria
+//      inline) AND harvest external "competition documents" links.
+//   4. If an external link points to a portal we already handle
+//      (artifik.no / eu-supply), delegate to that handler so the real
+//      documents get downloaded + parsed.
+//   5. Return [text blocks]. No-op (returns []) if nothing usable found.
 //
 // ctx = { referenceNumber, title, country }
 // =====================================================================
@@ -11980,9 +11980,9 @@ async function fetchDoffinDocuments(browser, ctx = {}) {
   const title = (ctx.title || '').trim();
   // 2026-06-08 run 112 lesson: Doffin's `searchString` does FULL-TEXT search
   // and does NOT index the buyer's internal reference ("2025/6484" → 0 hits,
-  // "Competitor (0)"). The tender TITLE is what matches. So try, in order:
-  // 1. full title (best for full-text), 2. first ~7 words of title (drops
-  // trailing codes/lot suffixes), 3. the buyer ref (last resort).
+  // "Konkurranse (0)"). The tender TITLE is what matches. So try, in order:
+  //   1. full title (best for full-text), 2. first ~7 words of title (drops
+  //   trailing codes/lot suffixes), 3. the buyer ref (last resort).
   const titleWords = title.split(/\s+/).filter(Boolean);
   const titleShort = titleWords.slice(0, 7).join(' ');
   const searchCandidates = [];
@@ -11991,7 +11991,7 @@ async function fetchDoffinDocuments(browser, ctx = {}) {
   pushCand(titleShort);
   pushCand(ref);
   if (!searchCandidates.length) {
-    console.log(` 🇳🇴 doffin: no usable title/reference to search — skipping`);
+    console.log(`    🇳🇴 doffin: no usable title/reference to search — skipping`);
     return [];
   }
   let page = null;
@@ -12012,11 +12012,11 @@ async function fetchDoffinDocuments(browser, ctx = {}) {
     let noticeUrl = null;
     for (const term of searchCandidates) {
       const searchUrl = `https://www.doffin.no/search?searchString=${encodeURIComponent(term)}`;
-      console.log(` 🇳🇴 doffin: searching "${term.slice(0, 60)}" → ${searchUrl.slice(0, 90)}`);
+      console.log(`    🇳🇴 doffin: searching "${term.slice(0, 60)}" → ${searchUrl.slice(0, 90)}`);
       try {
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
       } catch (e) {
-        console.log(` 🇳🇴 doffin: search nav warn: ${(e.message || '').slice(0, 80)}`);
+        console.log(`    🇳🇴 doffin: search nav warn: ${(e.message || '').slice(0, 80)}`);
       }
       try { await page.waitForNetworkIdle({ idleTime: 1200, timeout: 12000 }); } catch (_) {}
       await new Promise((r) => setTimeout(r, 2500));
@@ -12031,10 +12031,10 @@ async function fetchDoffinDocuments(browser, ctx = {}) {
           const href = a.getAttribute('href') || '';
           if (RX.test(href)) { try { hit = new URL(href, location.href).toString(); } catch (_) { hit = href; } break; }
         }
-        // result-count text ("Competition ranse (N)") to distinguish 0-hits from
+        // result-count text ("Konkurranse (N)") to distinguish 0-hits from
         // selector-miss.
         const body = (document.body?.innerText || '').replace(/\s+/g, ' ');
-        const countM = body.match(/Competition ranse\s*\((\d+)\)/i);
+        const countM = body.match(/Konkurranse\s*\((\d+)\)/i);
         return {
           hit,
           resultCount: countM ? parseInt(countM[1], 10) : null,
@@ -12042,23 +12042,23 @@ async function fetchDoffinDocuments(browser, ctx = {}) {
         };
       }).catch(() => ({ hit: null, resultCount: null, allHrefs: [] }));
       if (probe.hit) { noticeUrl = probe.hit; break; }
-      console.log(` 🇳🇴 doffin: "${term.slice(0, 40)}" → resultCount=${probe.resultCount}, 0 notice links. Hrefs: ${JSON.stringify((probe.allHrefs || []).slice(0, 14))}`);
+      console.log(`    🇳🇴 doffin: "${term.slice(0, 40)}" → resultCount=${probe.resultCount}, 0 notice links. Hrefs: ${JSON.stringify((probe.allHrefs || []).slice(0, 14))}`);
       // If the count is a positive number but our selector missed, no point
       // trying more terms with the same selector — log and stop.
       if (probe.resultCount && probe.resultCount > 0) {
-        console.log(` 🇳🇴 doffin: ⚠️ ${probe.resultCount} result(s) present but link selector missed — needs DOM tuning (see hrefs above)`);
+        console.log(`    🇳🇴 doffin: ⚠️ ${probe.resultCount} result(s) present but link selector missed — needs DOM tuning (see hrefs above)`);
         break;
       }
     }
     if (!noticeUrl) {
-      console.log(` 🇳🇴 doffin: no notice found across ${searchCandidates.length} search term(s)`);
+      console.log(`    🇳🇴 doffin: no notice found across ${searchCandidates.length} search term(s)`);
       return [];
     }
-    console.log(` 🇳🇴 doffin: opening notice ${noticeUrl.slice(0, 90)}`);
+    console.log(`    🇳🇴 doffin: opening notice ${noticeUrl.slice(0, 90)}`);
     try {
       await page.goto(noticeUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
     } catch (e) {
-      console.log(` 🇳🇴 doffin: notice nav warn: ${(e.message || '').slice(0, 80)}`);
+      console.log(`    🇳🇴 doffin: notice nav warn: ${(e.message || '').slice(0, 80)}`);
     }
     try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10000 }); } catch (_) {}
     await new Promise((r) => setTimeout(r, 1800));
@@ -12082,9 +12082,9 @@ async function fetchDoffinDocuments(browser, ctx = {}) {
         body: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 40000),
       };
     }).catch(() => ({ externalLinks: [], body: '' }));
-    console.log(` 🇳🇴 doffin: notice body ${harvest.body.length}ch, ${harvest.externalLinks.length} external portal link(s)`);
+    console.log(`    🇳🇴 doffin: notice body ${harvest.body.length}ch, ${harvest.externalLinks.length} external portal link(s)`);
     for (const l of harvest.externalLinks.slice(0, 6)) {
-      console.log(` ↗ ${l.host} — "${l.text}" → ${l.href.slice(0, 80)}`);
+      console.log(`       ↗ ${l.host} — "${l.text}" → ${l.href.slice(0, 80)}`);
     }
     const out = [];
     // (a) delegate to a known portal handler for the real documents
@@ -12097,12 +12097,12 @@ async function fetchDoffinDocuments(browser, ctx = {}) {
           portalTexts = await fetchEuSupplyDocuments(browser, l.href);
         }
         if (portalTexts && portalTexts.length) {
-          console.log(` 🇳🇴 doffin: delegated to ${l.host} handler → ${portalTexts.length} block(s)`);
+          console.log(`    🇳🇴 doffin: delegated to ${l.host} handler → ${portalTexts.length} block(s)`);
           out.push(...portalTexts);
           break; // one good portal is enough
         }
       } catch (e) {
-        console.log(` 🇳🇴 doffin: portal delegation (${l.host}) failed: ${(e.message || '').slice(0, 80)}`);
+        console.log(`    🇳🇴 doffin: portal delegation (${l.host}) failed: ${(e.message || '').slice(0, 80)}`);
       }
     }
     // (b) Include the Doffin notice body ONLY if it's plausibly the RIGHT
@@ -12123,23 +12123,23 @@ async function fetchDoffinDocuments(browser, ctx = {}) {
       for (const t of titleTokens) if (bodyLow.includes(t)) overlap++;
       if (overlap >= 2) {
         out.push(`--- (doffin notice) ${noticeUrl} ---\n${harvest.body}`);
-        console.log(` 🇳🇴 doffin: notice body accepted (${overlap} title-token match)`);
+        console.log(`    🇳🇴 doffin: notice body accepted (${overlap} title-token match)`);
       } else {
-        console.log(` 🇳🇴 doffin: notice body REJECTED — only ${overlap} title-token overlap (likely wrong/fuzzy match: ${noticeUrl.slice(-40)}), not merging to avoid wrong-tender data`);
+        console.log(`    🇳🇴 doffin: notice body REJECTED — only ${overlap} title-token overlap (likely wrong/fuzzy match: ${noticeUrl.slice(-40)}), not merging to avoid wrong-tender data`);
       }
     } else if (delegated && harvest.body && harvest.body.length > 500) {
       // Portal delegation already gave us the real docs — body is bonus.
       out.push(`--- (doffin notice) ${noticeUrl} ---\n${harvest.body}`);
     }
     if (!out.length) {
-      console.log(` 🇳🇴 doffin: notice reached but no portal docs or relevant body text`);
+      console.log(`    🇳🇴 doffin: notice reached but no portal docs or relevant body text`);
       return [];
     }
     return out;
   } catch (e) {
-    console.log(` ⚠️ doffin handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  doffin handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return [];
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -12150,22 +12150,22 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
   //
   // permalink.mercell.com/<id>.aspx redirects to www.mercell.com/<lang>/tender/<id>/<slug>
   // — the PUBLIC MARKETING PAGE with paywall. body shows only:
-  // - "Sign in" link → my.mercell.com/en/m/logon/?ReturnUrl=/m/mts/Tender.aspx?id=<id>
-  // - "Tender access" → plans/pricing
-  // - Language switcher (World/Denmark/Germany/...)
+  //   - "Sign in" link → my.mercell.com/en/m/logon/?ReturnUrl=/m/mts/Tender.aspx?id=<id>
+  //   - "Tender access" → plans/pricing
+  //   - Language switcher (World/Danmark/Deutschland/...)
   // bodyLen=~1500ch, no document anchors.
   //
   // The real authenticated tender page (classic Mercell ASP.NET) lives at:
-  // https://my.mercell.com/m/mts/Tender.aspx?id=<id>
+  //   https://my.mercell.com/m/mts/Tender.aspx?id=<id>
   //
-  This page shows:
-  // - Tender description + buyer info
-  // - File list (eg "01 Invitation to tender.pdf", "05 SSA-D Appendix
-  // 3 - System documentation.pdf", etc.)
-  // - "Show interest" submit button:
-  // <input type="submit" name="ctl00$main$btnDownloadInterest"
-  // value="Show interest"
-  // id="ctl00_main_btnDownloadInterest" ...>
+  // This page shows:
+  //   - Tender description + buyer info
+  //   - File list (e.g. "01 Invitation to tender.pdf", "05 SSA-D Appendix
+  //     3 - System documentation.pdf", etc.)
+  //   - "Show interest" submit button:
+  //       <input type="submit" name="ctl00$main$btnDownloadInterest"
+  //              value="Show interest"
+  //              id="ctl00_main_btnDownloadInterest" ...>
   //
   // The files are NOT downloadable until "Show interest" is clicked.
   // After the ASP.NET __doPostBack, the file anchors become live and
@@ -12187,14 +12187,14 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     //
     // User inspection of tender 284856286 confirmed the permalink instead
     // redirects to the PUBLIC tender page:
-    // https://www.mercell.com/en/tender/<id>/<slug>-tender.aspx
+    //   https://www.mercell.com/en/tender/<id>/<slug>-tender.aspx
     // which carries the file list + "Show interest" (ctl00$main$btnDownloadInterest)
     // + "Enable download" (ctl00$main$btnDownload) buttons and the
     // rpFiles __doPostBack download links. So we navigate the permalink
     // AS-IS and let Puppeteer follow the native 30x to www.mercell.com —
     // the "Show interest"/"Enable download"/file-postback handlers below
     // already know how to drive that page.
-    console.log(` 🟦 mercell-tender: permalink (${u.host}, id=${tenderId}) — following native redirect to www.mercell.com tender page (NOT my.mercell SSO)`);
+    console.log(`    🟦 mercell-tender: permalink (${u.host}, id=${tenderId}) — following native redirect to www.mercell.com tender page (NOT my.mercell SSO)`);
     // sourceUrl/u left unchanged.
   }
 
@@ -12221,7 +12221,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     // dialog freezes the renderer and makes every page.evaluate hang until
     // protocolTimeout (180s) → "Runtime.callFunctionOn timed out" (run 114).
     page.on('dialog', async (d) => {
-      try { console.log(` 🟦 mercell-tender: auto-dismissing dialog "${(d.message() || '').slice(0, 60)}"`); await d.dismiss(); } catch (_) {}
+      try { console.log(`    🟦 mercell-tender: auto-dismissing dialog "${(d.message() || '').slice(0, 60)}"`); await d.dismiss(); } catch (_) {}
     });
 
     // Capture all JSON responses for diagnostic — helps identify the
@@ -12245,27 +12245,27 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     // 2026-06-08 — REUSABLE email-first classic login for Mercell's
     // my.mercell.com/.../default.aspx logon page. User inspection (tender
     // 285221645) confirmed the AUTHENTICATED document flow is:
-    // www.mercell.com/.../tender.aspx → click "Show interest"
-    // → "Already registered" button → my.mercell.com/en/m/logon/default.aspx
-    // default.aspx STEP 1: Username field (ctl00$commonContent$lbUserInfo_text)
-    // + "Continue" link (ctl00$commonContent$newbutton1,
-    // fires WebForm_DoPostBackWithOptions(...,'Login',...))
-    // default.aspx STEP 2: Password field → submit → ReturnUrl back to tender.
+    //   www.mercell.com/.../tender.aspx  → click "Show interest"
+    //     → "Already registered" button  → my.mercell.com/en/m/logon/default.aspx
+    //   default.aspx STEP 1: Username field (ctl00$commonContent$lbUserInfo_text)
+    //                        + "Continue" link (ctl00$commonContent$newbutton1,
+    //                          fires WebForm_DoPostBackWithOptions(...,'Login',...))
+    //   default.aspx STEP 2: Password field → submit → ReturnUrl back to tender.
     // (This is NOT SsoLogOn.aspx, which is SSO-only and has no password.)
     const mercellClassicLogin = async () => {
       // 2026-06-08 — creds come from PORTAL_CREDS_JSON["mercell.com"]
       // FIRST (sales@cornercasetech.com), env MERCELL_USERNAME/PASSWORD
       // only as fallback. Run 115 failed because the env username was a
       // stale/wrong value; the authoritative login lives in the portal
-      // credits JSON.
+      // creds JSON.
       const mCreds = getPortalCreds('mercell.com') || {};
       const username = String(mCreds.username || process.env.MERCELL_USERNAME || '').trim();
       const password = String(mCreds.password || process.env.MERCELL_PASSWORD || '');
       if (!username || !password) {
-        console.log(` ⚠️ mercell-tender: no mercell.com creds (PORTAL_CREDS_JSON or env) — cannot login`);
+        console.log(`    ⚠️  mercell-tender: no mercell.com creds (PORTAL_CREDS_JSON or env) — cannot login`);
         return { ok: false, reason: 'no-creds' };
       }
-      console.log(` 🟦 mercell-tender: using creds for "${username}" (src=${mCreds.username ? 'PORTAL_CREDS_JSON' : 'env'})`);
+      console.log(`    🟦 mercell-tender: using creds for "${username}" (src=${mCreds.username ? 'PORTAL_CREDS_JSON' : 'env'})`);
       // Tag the username/email field. default.aspx uses lbUserInfo_text;
       // older flows use lvEmail_text — match both (+ generic hints).
       const USER_FINDER = () => {
@@ -12282,7 +12282,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
       };
       // Click Continue/Login/Next. Mercell's "Continue" is an <a id=newbutton1>
       // whose onclick calls WebForm_DoPostBackWithOptions — a plain .click()
-      // fires it. So matches input[type=submit]/buttons in other locales.
+      // fires it. Also matches input[type=submit]/buttons in other locales.
       const CLICK_CONTINUE = () => {
         const cands = Array.from(document.querySelectorAll('input[type="submit"], button[type="submit"], button, a'));
         const btn = cands.find((b) => {
@@ -12306,7 +12306,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
           // STEP 1 → click Continue, wait for the postback to SETTLE before
           // probing (probing mid-navigation hangs the protocol call, 180s).
           const advanced = await page.evaluate(CLICK_CONTINUE).catch(() => null);
-          console.log(` 🟦 mercell-tender: username submitted (continue="${advanced || 'none'}") — waiting for password step`);
+          console.log(`    🟦 mercell-tender: username submitted (continue="${advanced || 'none'}") — waiting for password step`);
           await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null);
           await new Promise((r) => setTimeout(r, 1200));
           await page.waitForSelector('input[type="password"]', { timeout: 10000 }).catch(() => null);
@@ -12318,9 +12318,9 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         // a React SPA) with input#password. The previous approach (tag via
         // evaluate → type → click "Continue") failed: CLICK_CONTINUE found
         // no button (btn="none") so the form never submitted. Auth0 forms
-        // submit reliably on ENTER. Let the SPA hydrate, type directly into it
+        // submit reliably on ENTER. Let the SPA hydrate, type directly into
         // the field, verify the value registered, then press Enter (with a
-        // submit button click as fallback).
+        // submit-button click as fallback).
         await new Promise((r) => setTimeout(r, 1200)); // allow Auth0 hydration
         const passHandle = await page.$('input[type="password"]:not([disabled])').catch(() => null);
         if (!passHandle) { return { ok: false, reason: 'password-handle-lost' }; }
@@ -12329,9 +12329,9 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         // Verify the value actually landed in the field (React can reset it).
         const typedLen = await page.evaluate(() => {
           const el = Array.from(document.querySelectorAll('input[type="password"]')).find((e) => e.offsetParent !== null);
-          return el? (el.value || '').length : -1;
+          return el ? (el.value || '').length : -1;
         }).catch(() => -1);
-        console.log(` 🟦 mercell-tender: password typed (field len=${typedLen}) — submitting via Enter`);
+        console.log(`    🟦 mercell-tender: password typed (field len=${typedLen}) — submitting via Enter`);
         let submittedVia = 'enter';
         try { await passHandle.press('Enter'); } catch (_) { try { await page.keyboard.press('Enter'); } catch (_) {} }
         // Fallback: if still on the password page after a beat, click the
@@ -12347,25 +12347,25 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
           }).catch(() => false);
           if (clicked) submittedVia = 'enter+button';
         }
-        console.log(` 🟦 mercell-tender: password submitted (via=${submittedVia}) — waiting for auth round-trip`);
+        console.log(`    🟦 mercell-tender: password submitted (via=${submittedVia}) — waiting for auth round-trip`);
         await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null);
         await new Promise((r) => setTimeout(r, 1800));
         const stillPass = await page.$('input[type="password"]:not([disabled]):not([aria-hidden="true"])').catch(() => null);
         ok = !stillPass;
-        reason = ok? 'ok' : 'password-field-still-present';
+        reason = ok ? 'ok' : 'password-field-still-present';
       } catch (e) {
         reason = 'exception:' + (e.message || '').slice(0, 60);
       }
       if (ok) {
-        console.log(` ✅ mercell-tender: classic login OK — post-login URL: ${page.url().slice(0, 100)}`);
+        console.log(`    ✅ mercell-tender: classic login OK — post-login URL: ${page.url().slice(0, 100)}`);
       } else {
-        console.log(` ⚠️ mercell-tender: classic login failed (${reason})`);
+        console.log(`    ⚠️  mercell-tender: classic login failed (${reason})`);
         const inputDump = await page.evaluate(() => Array.from(document.querySelectorAll('input')).slice(0, 20)
           .map((i) => ({ type: i.type, name: i.name, id: i.id, visible: i.offsetParent !== null }))).catch(() => null);
-        console.log(` 🔍 mercell-tender login-fail diag — inputs: ${JSON.stringify(inputDump)}`);
+        console.log(`    🔍 mercell-tender login-fail diag — inputs: ${JSON.stringify(inputDump)}`);
         // Surface WHY: wrong-password popup, validation text, or other error.
         const errDiag = await page.evaluate(() => {
-          const getVal = (id) => { const e = document.getElementById(id); return e? (e.value || '') : null; };
+          const getVal = (id) => { const e = document.getElementById(id); return e ? (e.value || '') : null; };
           const popupWrong = getVal('ctl00_commonContent_NewPopupWrongPassword__show');
           const popupSend = getVal('ctl00_commonContent_NewPopupSendPassword__show');
           // Any visible error/popup/validation text on the page.
@@ -12381,18 +12381,18 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
           };
         }).catch(() => null);
         if (errDiag) {
-          console.log(` 🔍 mercell-tender login-fail why: wrongPwPopup=${JSON.stringify(errDiag.wrongPasswordPopup)} sendPwPopup=${JSON.stringify(errDiag.sendPasswordPopup)} msgs=${JSON.stringify(errDiag.messages)}`);
-          console.log(` 🔍 mercell-tender login-fail body: "${errDiag.bodySnippet}"`);
+          console.log(`    🔍 mercell-tender login-fail why: wrongPwPopup=${JSON.stringify(errDiag.wrongPasswordPopup)} sendPwPopup=${JSON.stringify(errDiag.sendPasswordPopup)} msgs=${JSON.stringify(errDiag.messages)}`);
+          console.log(`    🔍 mercell-tender login-fail body: "${errDiag.bodySnippet}"`);
         }
       }
       return { ok, reason };
     };
 
-    console.log(` 🟦 mercell-tender: navigating to ${sourceUrl.slice(0, 100)}`);
+    console.log(`    🟦 mercell-tender: navigating to ${sourceUrl.slice(0, 100)}`);
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
     } catch (e) {
-      console.log(` ⚠️ mercell-tender: navigation error: ${(e.message || '').slice(0, 100)}`);
+      console.log(`    ⚠️  mercell-tender: navigation error: ${(e.message || '').slice(0, 100)}`);
     }
 
     // Wait for Next.js hydration — typically 1-3s for Mercell tender page.
@@ -12424,7 +12424,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
       const curUrl = page.url();
       const onLogon = /\/m\/logon\/?/i.test(curUrl) || /logon\.aspx/i.test(curUrl);
       if (onLogon) {
-        console.log(` 🟦 mercell-tender: detected my.mercell.com logon page`);
+        console.log(`    🟦 mercell-tender: detected my.mercell.com logon page`);
 
         // ─── Path A: SSO Login anchor (modern flow) ──────────────────
         // 2026-06-03 (Task #154) — declared with `let` so the SSO
@@ -12453,7 +12453,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         }).catch(() => null);
 
         if (ssoClicked && typeof ssoClicked === 'string') {
-          console.log(` 🟦 mercell-tender: clicked SSO Login anchor — waiting for auth round-trip`);
+          console.log(`    🟦 mercell-tender: clicked SSO Login anchor — waiting for auth round-trip`);
           // SSO bounce: my.mercell → ums-lambda-auth → my.mercell.
           // Multiple navigations may occur. Give it generous wait.
           await Promise.race([
@@ -12463,7 +12463,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
           // Sometimes SSO triggers a second redirect to the actual
           // Tender.aspx — wait for that too.
           await new Promise((r) => setTimeout(r, 2000));
-          console.log(` 🟦 mercell-tender: post-SSO URL: ${page.url().slice(0, 110)}`);
+          console.log(`    🟦 mercell-tender: post-SSO URL: ${page.url().slice(0, 110)}`);
 
           // 2026-06-03 (Task #154) — SSO landing diagnostic + fallback.
           // Run 67: SSO click landed on /m/logon/SsoLogOn.aspx?ReturnUrl=...
@@ -12507,10 +12507,10 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
               };
             }).catch(() => null);
             if (ssoDiag) {
-              console.log(` 🔍 mercell-tender SSO diag: bodyLen=${ssoDiag.bodyLen}, meta="${ssoDiag.metaRefreshUrl || '∅'}", js=${JSON.stringify(ssoDiag.jsRedirects)}, errors=${JSON.stringify(ssoDiag.errors)}`);
-              if (ssoDiag.bodyText) console.log(` 🔍 mercell-tender SSO body preview: "${ssoDiag.bodyText.slice(0, 180)}"`);
+              console.log(`    🔍 mercell-tender SSO diag: bodyLen=${ssoDiag.bodyLen}, meta="${ssoDiag.metaRefreshUrl || '∅'}", js=${JSON.stringify(ssoDiag.jsRedirects)}, errors=${JSON.stringify(ssoDiag.errors)}`);
+              if (ssoDiag.bodyText) console.log(`    🔍 mercell-tender SSO body preview: "${ssoDiag.bodyText.slice(0, 180)}"`);
               if (ssoDiag.htmlHead && ssoDiag.bodyLen < 100) {
-                console.log(` 🔍 mercell-tender SSO head: "${ssoDiag.htmlHead.slice(0, 400)}"`);
+                console.log(`    🔍 mercell-tender SSO head: "${ssoDiag.htmlHead.slice(0, 400)}"`);
               }
               // If we found a redirect URL embedded in the SSO landing
               // page (meta refresh OR JS window.location), navigate to
@@ -12522,13 +12522,13 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
                 let absoluteUrl;
                 try { absoluteUrl = new URL(redirectUrl, page.url()).toString(); }
                 catch (_) { absoluteUrl = redirectUrl; }
-                console.log(` 🟦 mercell-tender: SSO landing has embedded redirect → ${absoluteUrl.slice(0, 110)}, following`);
+                console.log(`    🟦 mercell-tender: SSO landing has embedded redirect → ${absoluteUrl.slice(0, 110)}, following`);
                 try {
                   await page.goto(absoluteUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
                   await new Promise((r) => setTimeout(r, 2000));
-                  console.log(` 🟦 mercell-tender: post-redirect URL: ${page.url().slice(0, 110)}`);
+                  console.log(`    🟦 mercell-tender: post-redirect URL: ${page.url().slice(0, 110)}`);
                 } catch (e) {
-                  console.log(` ⚠️ mercell-tender: SSO redirect-follow failed: ${(e.message || '').slice(0, 80)}`);
+                  console.log(`    ⚠️  mercell-tender: SSO redirect-follow failed: ${(e.message || '').slice(0, 80)}`);
                 }
               } else {
                 // No embedded redirect URL — but run 79 diag confirmed
@@ -12536,7 +12536,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
                 // ("E-mail / Remember me / Login"). Stay on this page
                 // (don't navigate away) and trigger Path B which will
                 // fill those fields directly.
-                console.log(` 🟦 mercell-tender: SSO landing has no redirect — falling back to classic email/password login on current page`);
+                console.log(`    🟦 mercell-tender: SSO landing has no redirect — falling back to classic email/password login on current page`);
                 ssoClicked = null;
               }
             }
@@ -12546,7 +12546,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
           // ─── Path B: classic email-first login (default.aspx) ────────
           // We landed directly on a logon page (permalink redirected
           // straight to login). Run the reusable email-first login.
-          console.log(` 🟦 mercell-tender: no SSO redirect — running classic email-first login`);
+          console.log(`    🟦 mercell-tender: no SSO redirect — running classic email-first login`);
           await mercellClassicLogin();
         }
       }
@@ -12559,7 +12559,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     // requires a click. Try multiple text patterns (EN/NO/SE/DA/FI/DE/FR
     // localized labels).
     const docTabClicked = await page.evaluate(() => {
-      const TAB_RE = /^(documents?|filer?|filer|documenter|documentai|tiedostot|documents|documents?|documenten|dosi[ae]rs?|fichiers?)$/i;
+      const TAB_RE = /^(documents?|filer?|filer|dokumenter|dokumentai|tiedostot|dokumente|documents?|documenten|dosi[ae]rs?|fichiers?)$/i;
       const clickables = Array.from(document.querySelectorAll('a, button, [role="tab"], [role="button"], li'));
       for (const el of clickables) {
         const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
@@ -12574,7 +12574,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
       return null;
     }).catch(() => null);
     if (docTabClicked) {
-      console.log(` 🟦 mercell-tender: clicked "${docTabClicked}" tab — waiting for content`);
+      console.log(`    🟦 mercell-tender: clicked "${docTabClicked}" tab — waiting for content`);
       await new Promise((r) => setTimeout(r, 2500));
     }
 
@@ -12592,8 +12592,8 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     // re-renders with active download anchors. This is a classic
     // ASP.NET WebForms __doPostBack pattern.
     //
-    // EN: "Show interest" NO: "Vis interest" SE: "Visa intereste"
-    // DA: "Vis interest" FI: "Näytä kiinnostus" DE: "Show interest"
+    // EN: "Show interest"   NO: "Vis interesse"   SE: "Visa intresse"
+    // DA: "Vis interesse"   FI: "Näytä kiinnostus"   DE: "Interesse zeigen"
     const showInterestClicked = await page.evaluate(() => {
       // Prefer the canonical Mercell name attr — handles all locales.
       const byName = document.querySelector('input[name="ctl00$main$btnDownloadInterest"]')
@@ -12604,7 +12604,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         return (byName.value || 'Show interest').slice(0, 40);
       }
       // Text-based fallback (multi-lang).
-      const RE = /\b(show\s+interest|vis\s+interest|visa\s+intresse|n[äa]yt[äa]\s+kiinnostus|interest\s+show|montrer\s+l['']int[ée]r[êe]t|to[on]\s+interest)\b/i;
+      const RE = /\b(show\s+interest|vis\s+interesse|visa\s+intresse|n[äa]yt[äa]\s+kiinnostus|interesse\s+zeigen|montrer\s+l['']int[ée]r[êe]t|to[on]\s+interesse)\b/i;
       const inputs = Array.from(document.querySelectorAll('input[type="submit"], input[type="button"], button'));
       for (const el of inputs) {
         if (el.disabled || el.offsetParent === null) continue;
@@ -12618,7 +12618,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
       return null;
     }).catch(() => null);
     if (showInterestClicked) {
-      console.log(` 🟦 mercell-tender: clicked "Show interest" button ("${showInterestClicked}") — waiting for postback`);
+      console.log(`    🟦 mercell-tender: clicked "Show interest" button ("${showInterestClicked}") — waiting for postback`);
       // ASP.NET __doPostBack — wait for navigation OR DOM update
       await Promise.race([
         page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => null),
@@ -12631,15 +12631,15 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     //
     // User inspection (tender 285221645): after "Show interest", an
     // "Already registered" button appears. Clicking it redirects to
-    // my.mercell.com/en/m/logon/default.aspx?ReturnUrl=<tender>&auth0done=true
+    //   my.mercell.com/en/m/logon/default.aspx?ReturnUrl=<tender>&auth0done=true
     // which is the REAL classic login (Username → Continue → Password),
     // NOT the SSO-only SsoLogOn.aspx. After login the ReturnUrl brings us
     // back to the tender page with showinterest=true and live file links.
     //
-    // EN "Already registered" NO "Allerede registrert" SE "Redan registrerad"
-    // DA "Already registered" FI "Already registered" DE "Already registered"
+    // EN "Already registered"  NO "Allerede registrert"  SE "Redan registrerad"
+    // DA "Allerede registreret" FI "Jo rekisteröitynyt"  DE "Bereits registriert"
     const alreadyRegClicked = await page.evaluate(() => {
-      const RE = /\b(already\s+registered|allerede\s+registr(ert|eret)|redan\s+registrerad|jo\s+rekister[öo]itynyt|already\s+registered|d[ée]j[àa]\s+inscrit|al\s+geregistreerd)\b/i;
+      const RE = /\b(already\s+registered|allerede\s+registr(ert|eret)|redan\s+registrerad|jo\s+rekister[öo]itynyt|bereits\s+registriert|d[ée]j[àa]\s+inscrit|al\s+geregistreerd)\b/i;
       const cands = Array.from(document.querySelectorAll('input[type="submit"], input[type="button"], button, a'));
       for (const el of cands) {
         if (el.disabled || el.offsetParent === null) continue;
@@ -12653,13 +12653,13 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
       return null;
     }).catch(() => null);
     if (alreadyRegClicked) {
-      console.log(` 🟦 mercell-tender: clicked "Already registered" ("${alreadyRegClicked}") — expecting login redirect`);
+      console.log(`    🟦 mercell-tender: clicked "Already registered" ("${alreadyRegClicked}") — expecting login redirect`);
       await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null);
       await new Promise((r) => setTimeout(r, 1500));
     }
     // If we are now (or were already) on a Mercell logon page, authenticate.
     if (/\/m\/logon\/|logon\.aspx|default\.aspx/i.test(page.url())) {
-      console.log(` 🟦 mercell-tender: on logon page (${page.url().slice(0, 90)}) — authenticating`);
+      console.log(`    🟦 mercell-tender: on logon page (${page.url().slice(0, 90)}) — authenticating`);
       const loginRes = await mercellClassicLogin();
       if (loginRes.ok) {
         // After login the ReturnUrl should land us back on the tender page.
@@ -12669,12 +12669,12 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         await new Promise((r) => setTimeout(r, 1500));
         if (!/(^|\.)mercell\.com$/i.test((() => { try { return new URL(page.url()).hostname; } catch (_) { return ''; } })()) || !/\/tender\//i.test(page.url())) {
           try {
-            console.log(` 🟦 mercell-tender: not on tender page (${page.url().slice(0, 70)}) — navigating back to source`);
+            console.log(`    🟦 mercell-tender: not on tender page (${page.url().slice(0, 70)}) — navigating back to source`);
             await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
             await new Promise((r) => setTimeout(r, 1500));
           } catch (_) {}
         }
-        console.log(` 🟦 mercell-tender: post-login back on ${page.url().slice(0, 90)}`);
+        console.log(`    🟦 mercell-tender: post-login back on ${page.url().slice(0, 90)}`);
         // Re-click "Show interest" if the returned page shows it again
         // (some tenders require it post-auth before files unlock).
         const reInterest = await page.evaluate(() => {
@@ -12684,7 +12684,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
           return false;
         }).catch(() => false);
         if (reInterest) {
-          console.log(` 🟦 mercell-tender: re-clicked "Show interest" after login — waiting`);
+          console.log(`    🟦 mercell-tender: re-clicked "Show interest" after login — waiting`);
           await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => null);
           await new Promise((r) => setTimeout(r, 1500));
         }
@@ -12694,21 +12694,21 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     // 2026-05-19 — "Enable download" click (Mercell classic ASP.NET).
     //
     // SECOND gate that appears on some tenders (observed on license/software
-    // procurement, eg permalink.mercell.com/283799952.aspx — "Negotiating
-    // licenses, software and services from Microsoft"):
+    // procurement, e.g. permalink.mercell.com/283799952.aspx — "Negotiating
+    // licences, software and services from Microsoft"):
     //
-    // <input type="submit" name="ctl00$main$btnDownload"
-    // value="Enable download" id="ctl00_main_btnDownload"
-    // class="button bgColor1 width100pct">
+    //   <input type="submit" name="ctl00$main$btnDownload"
+    //          value="Enable download" id="ctl00_main_btnDownload"
+    //          class="button bgColor1 width100pct">
     //
     // This button is distinct from btnDownloadInterest. Some tenders show
     // ONLY this one; some show it AFTER the Show-interest postback re-renders
     // the page; some show both side-by-side. We click it here unconditionally
     // if present — the postback unlocks the actual download anchors below.
     //
-    // EN: "Enable download" NO: "Active nedlasting" SE: "Aktivera nedladdning"
-    // DA: "Active download" FI: "Salli lataus" DE: "Activate download"
-    // FR: "Active the téléchargement" NL: "Download activeren"
+    // EN: "Enable download"   NO: "Aktiver nedlasting"   SE: "Aktivera nedladdning"
+    // DA: "Aktiver download"   FI: "Salli lataus"        DE: "Download aktivieren"
+    // FR: "Activer le téléchargement"  NL: "Download activeren"
     const enableDownloadClicked = await page.evaluate(() => {
       // Prefer the canonical Mercell name attr — handles all locales.
       const byName = document.querySelector('input[name="ctl00$main$btnDownload"]')
@@ -12733,7 +12733,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
       return null;
     }).catch(() => null);
     if (enableDownloadClicked) {
-      console.log(` 🟦 mercell-tender: clicked "Enable download" button ("${enableDownloadClicked}") — waiting for postback`);
+      console.log(`    🟦 mercell-tender: clicked "Enable download" button ("${enableDownloadClicked}") — waiting for postback`);
       await Promise.race([
         page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => null),
         new Promise((r) => setTimeout(r, 4000)),
@@ -12742,7 +12742,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     }
 
     const finalUrl = page.url();
-    console.log(` 🟦 mercell-tender: landed on ${finalUrl.slice(0, 100)}`);
+    console.log(`    🟦 mercell-tender: landed on ${finalUrl.slice(0, 100)}`);
     if (capturedJson.length) {
       // Log up to 5 unique-prefix endpoints — helps us learn the API
       // surface over multiple runs without spamming logs.
@@ -12752,7 +12752,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         if (seen.has(prefix)) continue;
         seen.add(prefix);
         if (seen.size > 5) break;
-        console.log(` json XHR: ${c.url.slice(0, 100)} keys=${JSON.stringify(c.keys)}`);
+        console.log(`       json XHR: ${c.url.slice(0, 100)} keys=${JSON.stringify(c.keys)}`);
       }
     }
 
@@ -12794,13 +12794,13 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
     }).catch(() => null);
 
     if (!pageState) {
-      console.log(` ⚠️ mercell-tender: page.evaluate failed`);
+      console.log(`    ⚠️  mercell-tender: page.evaluate failed`);
       return null;
     }
-    console.log(` 🟦 mercell-tender: bodyLen=${pageState.bodyLen} anchors=${pageState.anchorCount} docAnchors=${pageState.docAnchors.length}`);
+    console.log(`    🟦 mercell-tender: bodyLen=${pageState.bodyLen} anchors=${pageState.anchorCount} docAnchors=${pageState.docAnchors.length}`);
     if (pageState.docAnchors.length) {
       for (const a of pageState.docAnchors.slice(0, 8)) {
-        console.log(` doc anchor: "${a.text.slice(0, 60)}" → ${a.href.slice(0, 90)}`);
+        console.log(`       doc anchor: "${a.text.slice(0, 60)}" → ${a.href.slice(0, 90)}`);
       }
     } else if (pageState.anchorCount > 0) {
       // No doc anchors matched — dump first 10 anchors so we can refine
@@ -12812,9 +12812,9 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
           href: (x.href || '').slice(0, 110),
         }));
       }).catch(() => []);
-      console.log(` 🔎 mercell-tender: no doc anchors matched — sample of ${sample.length} anchors:`);
+      console.log(`    🔎 mercell-tender: no doc anchors matched — sample of ${sample.length} anchors:`);
       for (const a of sample) {
-        console.log(` a: "${a.text}" → ${a.href}`);
+        console.log(`       a: "${a.text}" → ${a.href}`);
       }
     }
 
@@ -12880,7 +12880,7 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         }
         return '';
       } catch (e) {
-        console.log(` ⚠️ parse error for "${name.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+        console.log(`       ⚠️  parse error for "${name.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
         return '';
       }
     };
@@ -12905,32 +12905,32 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         }, a.href).catch(() => ({ ok: false, error: 'evaluate-failed' }));
 
         if (!dataArr || !dataArr.ok) {
-          console.log(` ⚠️ mercell-tender: fetch failed for "${a.text.slice(0, 40)}" (status=${dataArr?.status || '?'}, err=${dataArr?.error || '?'})`);
+          console.log(`    ⚠️  mercell-tender: fetch failed for "${a.text.slice(0, 40)}" (status=${dataArr?.status || '?'}, err=${dataArr?.error || '?'})`);
           continue;
         }
         const buf = Buffer.from(dataArr.bytes);
         const fmt = detectFmt(buf);
         if (fmt === 'unknown' || fmt === 'html-or-xml') {
           // Likely a login redirect or error page — skip.
-          console.log(` ⚠️ mercell-tender: "${a.text.slice(0, 40)}" returned non-doc (fmt=${fmt}, ct=${dataArr.ct}, ${buf.length}B)`);
+          console.log(`    ⚠️  mercell-tender: "${a.text.slice(0, 40)}" returned non-doc (fmt=${fmt}, ct=${dataArr.ct}, ${buf.length}B)`);
           continue;
         }
         const text = await parseBuffer(a.text || a.href, buf);
         if (text && text.length > 100) {
           const clip = text.slice(0, 30000);
           texts.push(`--- (mercell-doc) ${(a.text || a.href).slice(0, 80)} ---\n${clip}`);
-          console.log(` ✓ mercell-tender: parsed "${(a.text || a.href).slice(0, 50)}" (${buf.length}B → ${clip.length}ch, fmt=${fmt})`);
+          console.log(`    ✓ mercell-tender: parsed "${(a.text || a.href).slice(0, 50)}" (${buf.length}B → ${clip.length}ch, fmt=${fmt})`);
         } else {
-          console.log(` ⚠️ mercell-tender: "${(a.text || a.href).slice(0, 40)}" yielded no usable text (fmt=${fmt}, ${buf.length}B)`);
+          console.log(`    ⚠️  mercell-tender: "${(a.text || a.href).slice(0, 40)}" yielded no usable text (fmt=${fmt}, ${buf.length}B)`);
         }
       } catch (e) {
-        console.log(` ⚠️ mercell-tender: error processing "${(a.text || a.href).slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+        console.log(`    ⚠️  mercell-tender: error processing "${(a.text || a.href).slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
       }
     }
 
     // 2026-06-08 — POSTBACK FILE DOWNLOADS (rpFiles ZIP/PDF).
     // After auth, Mercell renders the document list as ASP.NET __doPostBack
-    // anchors (eg ctl00$main$rpFiles$ctl01$ctl00 → "Konk.gr.l ....zip").
+    // anchors (e.g. ctl00$main$rpFiles$ctl01$ctl00 → "Konk.gr.l ....zip").
     // These are NOT plain hrefs — the in-page fetch loop above skips
     // javascript: links — clicking them triggers a server postback that
     // STREAMS the file as an attachment (no navigation). Capture via CDP
@@ -12954,14 +12954,14 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
         return out.slice(0, 4);
       }).catch(() => []);
       if (postbackFiles.length) {
-        console.log(` 🟦 mercell-tender: ${postbackFiles.length} postback file link(s) — downloading via CDP`);
+        console.log(`    🟦 mercell-tender: ${postbackFiles.length} postback file link(s) — downloading via CDP`);
         const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mercell-dl-'));
         let cdp = null;
         try {
           cdp = await page.target().createCDPSession();
           await cdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: downloadDir });
         } catch (e) {
-          console.log(` ⚠️ mercell-tender: CDP download setup failed: ${(e.message || '').slice(0, 80)}`);
+          console.log(`    ⚠️  mercell-tender: CDP download setup failed: ${(e.message || '').slice(0, 80)}`);
         }
         for (const pf of postbackFiles) {
           try {
@@ -12973,31 +12973,31 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
               const now = fs.readdirSync(downloadDir).filter((f) => !before.has(f) && !/\.crdownload$/i.test(f));
               if (now.length) { newFile = now[0]; break; }
             }
-            if (!newFile) { console.log(` ⚠️ mercell-tender: postback "${pf.text.slice(0, 40)}" produced no download`); continue; }
+            if (!newFile) { console.log(`    ⚠️  mercell-tender: postback "${pf.text.slice(0, 40)}" produced no download`); continue; }
             const buf = fs.readFileSync(path.join(downloadDir, newFile));
             const text = await parseBuffer(pf.text || newFile, buf);
             if (text && text.length > 100) {
               const clip = text.slice(0, 30000);
               texts.push(`--- (mercell-doc) ${(pf.text || newFile).slice(0, 80)} ---\n${clip}`);
-              console.log(` ✓ mercell-tender: parsed postback "${pf.text.slice(0, 50)}" (${buf.length}B → ${clip.length}ch)`);
+              console.log(`    ✓ mercell-tender: parsed postback "${pf.text.slice(0, 50)}" (${buf.length}B → ${clip.length}ch)`);
             } else {
-              console.log(` ⚠️ mercell-tender: postback "${pf.text.slice(0, 40)}" → ${buf.length}B but no usable text`);
+              console.log(`    ⚠️  mercell-tender: postback "${pf.text.slice(0, 40)}" → ${buf.length}B but no usable text`);
             }
             try { fs.unlinkSync(path.join(downloadDir, newFile)); } catch (_) {}
           } catch (e) {
-            console.log(` ⚠️ mercell-tender: postback download error for "${pf.text.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
+            console.log(`    ⚠️  mercell-tender: postback download error for "${pf.text.slice(0, 40)}": ${(e.message || '').slice(0, 80)}`);
           }
         }
         try { if (cdp) await cdp.detach(); } catch (_) {}
         try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch (_) {}
       }
     } catch (e) {
-      console.log(` ⚠️ mercell-tender: postback download block error: ${(e.message || '').slice(0, 100)}`);
+      console.log(`    ⚠️  mercell-tender: postback download block error: ${(e.message || '').slice(0, 100)}`);
     }
 
     const sourceFilesText = texts.join('\n\n');
     const elapsed = Date.now() - t0;
-    console.log(` 🟦 mercell-tender: done in ${elapsed}ms — extracted ${texts.length} docs (fetch+postback), ${sourceFilesText.length}ch total`);
+    console.log(`    🟦 mercell-tender: done in ${elapsed}ms — extracted ${texts.length} docs (fetch+postback), ${sourceFilesText.length}ch total`);
 
     return {
       sourceHost: hostLabel,
@@ -13008,9 +13008,9 @@ async function fetchMercellTenderDocuments(browser, sourceUrl) {
       skipped: null,
     };
   } catch (e) {
-    console.log(` ⚠️ mercell-tender handler error: ${(e.message || String(e)).slice(0, 140)}`);
+    console.log(`    ⚠️  mercell-tender handler error: ${(e.message || String(e)).slice(0, 140)}`);
     return null;
-  finally {
+  } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
 }
@@ -13024,11 +13024,11 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
   // 2026-06-02 (Task #143) — reset module-level Drive collector at the
   // start of each tender. Handlers (viesiejipirkimai for now; others to
   // follow incrementally) push parsed binary buffers via
-  // _collectDriveFile() so the centralized upload step in the caller can
+  // _collectDriveFile() so the centralised upload step in the caller can
   // drain them and store the filename→Drive-link map on details.
   _driveFileCollector.length = 0;
-  // URL scheme normalization — Mercell sometimes returns sourceUrl
-  // values ​​like "www.conselleriadefacenda.es/silex" without an
+  // URL scheme normalisation — Mercell sometimes returns sourceUrl
+  // values like "www.conselleriadefacenda.es/silex" without an
   // http(s):// scheme. Puppeteer's page.goto() rejects those with
   // "Cannot navigate to invalid URL" and the call lands on Chrome's
   // chromewebdata error page (which our dead-site bail then catches —
@@ -13036,11 +13036,11 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
   // upfront for any URL that lacks a scheme but otherwise looks
   // valid (has a dot). Real-world impact (Spanish PLACSP run on
   // 2026-05-05): 3 of 9 tenders had this issue.
-  if (sourceUrl && typeof sourceUrl === 'string' && !/^[az][a-z0-9+.-]*:\/\//i.test(sourceUrl)) {
+  if (sourceUrl && typeof sourceUrl === 'string' && !/^[a-z][a-z0-9+.-]*:\/\//i.test(sourceUrl)) {
     const trimmed = sourceUrl.trim();
     if (trimmed && /\./.test(trimmed)) {
       const fixed = `https://${trimmed.replace(/^\/+/, '')}`;
-      console.log(` ↪️ source URL missing scheme — normalizing "${sourceUrl}" → "${fixed}"`);
+      console.log(`    ↪️  source URL missing scheme — normalising "${sourceUrl}" → "${fixed}"`);
       sourceUrl = fixed;
     }
   }
@@ -13062,29 +13062,29 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
       // a 301→https on the real domain anyway.
       u.protocol = 'https:';
       const fixed = u.toString();
-      console.log(` ↪️ marchespublics: rewriting Mercell typo → ${fixed.slice(0, 80)}`);
+      console.log(`    ↪️  marchespublics: rewriting Mercell typo → ${fixed.slice(0, 80)}`);
       sourceUrl = fixed;
     }
   } catch (_) {}
 
   // dtvp.de URL normaliser — Mercell's "Go to source" for DTVP can land
   // on several path variants of the notice page:
-  // /Satellite/notice/<id> (notice summary, no docs)
-  // /Satellite/notice/<id>/ (trailing slash variant)
-  // /Satellite/notice/<id>/projectSpace (project space landing)
-  // /Satellite/notice/<id>/documents (doc list page — what we want)
+  //   /Satellite/notice/<id>                  (notice summary, no docs)
+  //   /Satellite/notice/<id>/                 (trailing slash variant)
+  //   /Satellite/notice/<id>/projectSpace     (project space landing)
+  //   /Satellite/notice/<id>/documents        (doc list page — what we want)
   //
-  // The bulk-ZIP link "Download all documents as a ZIP file" is
+  // The bulk-ZIP link "Alle Dokumente als ZIP-Datei herunterladen" is
   // rendered on the /documents page specifically. Other entry points
   // either don't show it at all, or hide it behind a click that triggers
   // a tab change. Rewriting any DTVP notice URL to the /documents form
   // upfront skips that nav and lands the generic source-page handler on
   // the page that has the link we need.
   //
-  // Legal context: German Public Procurement Regulations §41 require anonymity
-  // public access to purchasing documents — so the /documents page is
+  // Legal context: German Vergabeverordnung §41 requires anonymous
+  // public access to procurement documents — so the /documents page is
   // always accessible without authentication. No login flow needed.
-  // (Confirmed via DTVP info-center FAQ + BaFin help guide.)
+  // (Confirmed via DTVP info-center FAQ + BaFin Hilfestellung guide.)
   try {
     const u = new URL(sourceUrl);
     if (u.hostname === 'www.dtvp.de' || u.hostname === 'dtvp.de') {
@@ -13093,17 +13093,17 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
         const noticeId = noticeMatch[1];
         u.pathname = `/Satellite/notice/${noticeId}/documents`;
         // Reset search/hash — query params on the notice landing page
-        // (eg ?tab=overview) don't apply to /documents.
+        // (e.g. ?tab=overview) don't apply to /documents.
         u.search = '';
         u.hash = '';
         const fixed = u.toString();
-        console.log(` ↪️ dtvp: rewriting to /documents endpoint → ${fixed.slice(0, 90)}`);
+        console.log(`    ↪️  dtvp: rewriting to /documents endpoint → ${fixed.slice(0, 90)}`);
         sourceUrl = fixed;
       }
     }
   } catch (_) {}
 
-  // 2026-05-18 — Mercell internal handling rewrite.
+  // 2026-05-18 — Mercell-internal handling rewrite.
   //
   // Previous behavior: ANY *.mercell.com URL was skipped as
   // "Mercell-internal" to avoid recursive loops. That dropped ~10% of
@@ -13116,7 +13116,7 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
   // existing authenticated browser session (Monika's Mercell login) to
   // navigate the Next.js tender page, scrape document anchors, and
   // download via in-page fetch (cookies inherited). Other Mercell hosts
-  // (s2c.mercell.com, my.mercell.com — internal-only dashboards) silent
+  // (s2c.mercell.com, my.mercell.com — internal-only dashboards) still
   // get the skip — they don't host tender documents.
   try {
     const u = new URL(sourceUrl);
@@ -13127,7 +13127,7 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
       if (result && (result.sourceFilesText || result.bodyTextPreview)) {
         return result;
       }
-      console.log(` ℹ️ mercell-tender handler returned empty — falling through to original skip`);
+      console.log(`    ℹ️  mercell-tender handler returned empty — falling through to original skip`);
       return {
         skipped: 'mercell-tender-empty',
         sourceHost: u.host,
@@ -13146,7 +13146,7 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
     // above. Direct my.mercell.com URLs from Mercell's source field
     // are rare and almost always internal dashboards.
     if (/(^|\.)my\.mercell\.com$/i.test(u.hostname)) {
-      console.log(` skipping Mercell-internal source: ${u.host}`);
+      console.log(`    skipping Mercell-internal source: ${u.host}`);
       return {
         skipped: 'mercell-internal',
         sourceHost: u.host,
@@ -13155,7 +13155,7 @@ async function fetchSourcePageDetails(browser, sourceUrl, ctx = {}) {
   } catch (_) { /* invalid URL → tęsiame, fetchas pats pašalins klaidą */ }
 
   // tendsign.com URL rewrite — doc.aspx?MeFormsNoticeId=X is the
-  // login-walled buyer-restricted view; our login succeeds but that
+  // login-walled buyer-restricted view; our login succeeds but the
   // page stays gated (sample run 2026-05-13: bodyLen=487 post-login,
   // gated=true). The user-confirmed anonymous public view is at
   // /public/p_meformsnotice.aspx?MeFormsNoticeId=<same-id> (visible
