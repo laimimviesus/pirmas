@@ -416,13 +416,28 @@ const LOGIN_URLS = {
   // 2026-06-15 — achatpublic.com login forma faktiškai gyvena
   // marchesonline.com (kai user'is kuria profilį, redirect'ina ten).
   // Tos pačios SAFE TENDER platformos abi host'ai dalinasi sesiją.
-  // Default-jam navigate'inam į marchesonline.com identification page.
-  'achatpublic.com':          'https://www.marchesonline.com/extranet/connexion/login.cfm',
-  'marchesonline.com':        'https://www.marchesonline.com/extranet/connexion/login.cfm',
-  // e-marchespublics.com — French aggregator. Login URL pattern
-  // /index.cfm?fuseaction=connexion.afficheConnexion. Po login'o session
-  // suteikia priėjimą prie /appel-offre/<id> DCE failų.
-  'e-marchespublics.com':     'https://www.e-marchespublics.com/index.cfm?fuseaction=connexion.afficheConnexion',
+  // 2026-06-16 (Task #192): pakeisti URL'ą į ROOT marchesonline.com —
+  // /extranet/connexion/login.cfm grąžina Vue.js SPA homepage'į kur
+  // "Log in" button'as yra PAGE HEADER'yje (data-v-4b2099e1 marker),
+  // ne form viduje. Mūsų submit search'as anksčiau scope'inosi į
+  // passForm = passEl.closest('form'), todėl header'io button'as
+  // nerastas. FIX B (submit fallback į whole document) tai apims.
+  'achatpublic.com':          'https://www.marchesonline.com/',
+  'marchesonline.com':        'https://www.marchesonline.com/',
+  // e-marchespublics.com — French aggregator (multi-tenant: tenders served
+  // from sivu-*.e-marchespublics.com subdomains). Login flow has TWO hops:
+  //   1. www.e-marchespublics.com/login = "Are you a buyer / Are you a
+  //      company?" selector page (NO form, just two redirect buttons)
+  //   2. https://private.e-marchespublics.com/acces_membre_entreprise =
+  //      REAL login form: <form id="signin" method="post" action="">
+  //        - input[name="login"] (identifier)
+  //        - input[type="password" name="pwd"]
+  //        - button[type="submit"].signup-button (text "Log in")
+  // We skip hop 1 and point straight at the form host. After auth, the
+  // session cookie is set on the parent e-marchespublics.com domain so
+  // sivu-*.e-marchespublics.com tender pages become accessible.
+  'e-marchespublics.com':     'https://private.e-marchespublics.com/acces_membre_entreprise',
+  'private.e-marchespublics.com': 'https://private.e-marchespublics.com/acces_membre_entreprise',
   // anogov.com — Portuguese Anogov supplier portal (panašu į contrataciondelestado).
   'anogov.com':               'https://www.anogov.com/anogov-supplier-portal/login.xhtml',
   // acingov.pt — ACINGOV Portuguese e-procurement.
@@ -1065,6 +1080,25 @@ async function extractFieldsWithAI(text, meta = {}) {
     '       ✓ Build-operate-transfer: contractor builds, briefly operates during transition, then hands over\n' +
     '       ✓ "Maintenance and support" of buyer-owned/buyer-hosted system after custom build\n' +
     '       ✓ Cloud-hosted just refers to the DEV environment (CI/CD) not the production service\n' +
+    '\n' +
+    '     🚨 ABSOLUTE OVERRIDE — NO EXCEPTIONS:\n' +
+    '     If the scopeOfAgreement OR description contains ANY of these EXACT phrases (case-insensitive),\n' +
+    '     IMMEDIATELY set rejectReason="saas_provision_or_creation" — DO NOT BE FOOLED by mentions of\n' +
+    '     "implementation project", "data conversion", "system development", "continuous development",\n' +
+    '     or "user training" which are NORMAL SaaS engagement activities, NOT custom software development:\n' +
+    '       • "SaaS service" / "SaaS solution" / "as a SaaS service" / "as a SaaS"\n' +
+    '       • "Software as a Service" / "(Software as a Service)"\n' +
+    '       • "SaaS-based" / "SaaS offering" / "SaaS-palvelu" (FI) / "SaaS-dienst" (NL)\n' +
+    '       • "SaaS-Lösung" (DE) / "Solution SaaS" (FR) / "Solución SaaS" (ES) / "Soluzione SaaS" (IT)\n' +
+    '       • "SaaS sprendimas" (LT) / "SaaS-palveluna" (FI as-a-service)\n' +
+    '       • "delivered as a SaaS" / "provided as a SaaS"\n' +
+    '     CONCRETE EXAMPLE (real case the AI got wrong): "Property management system delivered as a SaaS\n' +
+    '     service ... includes operating environment, user rights, capacity, maintenance, updates ...\n' +
+    '     supplier is responsible for hardware, software, licences, capacity, technical operating\n' +
+    '     environment ... Client receives the right to use the system during the contract period."\n' +
+    '     → REJECT as saas_provision_or_creation. The presence of "implementation project", "data\n' +
+    '     conversion from existing systems", "user training", and "continuous development" is NORMAL\n' +
+    '     for SaaS engagements — those services are standard turnkey SaaS onboarding, not custom dev.\n' +
     '   • Off-The-Shelf (COTS) — Existing Market Solution: The CORE TEST is semantic, NOT brand-list:\n' +
     '     ❓ KEY QUESTION: "Is the buyer procuring an EXISTING software product / system / service / environment from a market vendor (paying to receive or operate a finished thing), OR is the buyer commissioning a CUSTOM-BUILT solution (paying engineers to design and construct something new)?"\n' +
     '     If the answer is "existing market solution" → set rejectReason="cots_implementation_or_licenses". This applies whether the product is named (Atlassian, SAP, Microsoft Dynamics, SharePoint, Power BI, SSRS, etc.) or unnamed but clearly a market product (e.g. "ERP system", "GIS platform", "Document Management System", "case management system", "library system", "BI environment", "ticketing system" as catalog purchases).\n' +
@@ -2625,6 +2659,30 @@ async function attemptPortalLogin(browser, sourceUrl, creds, hostLabel) {
           if (byAttr) {
             if (fireClick(byAttr)) return 'in-form-attr:' + (byAttr.id || byAttr.className || '').slice(0, 30);
           }
+        }
+        // 2026-06-16 (Task #192) — WHOLE-DOCUMENT FALLBACK.
+        // Vue.js / Angular SPAs (e.g. marchesonline.com Vue 3 with
+        // data-v-XXX scoped CSS) often put the "Log in" submit button in
+        // the PAGE HEADER, OUTSIDE the form that contains email+password
+        // fields. The in-form scan above misses it. Scan the whole
+        // document for a visible button/anchor whose text strictly
+        // matches login vocabulary (already a tight regex, safe to widen
+        // scope). Same TXT_SUBMIT and fireClick logic.
+        if (passForm) {
+          try {
+            const allDoc = Array.from(document.querySelectorAll(
+              'a, button, [role="button"], input[type="button"], input[type="submit"]'
+            ));
+            const docByText = allDoc.find((el) => {
+              if (!el || el.offsetParent === null) return false;
+              if (el.hasAttribute('disabled')) return false;
+              const t = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+              return t.length > 0 && t.length <= 20 && TXT_SUBMIT.test(t);
+            });
+            if (docByText) {
+              if (fireClick(docByText)) return 'doc-text:' + (docByText.innerText || docByText.value || '').trim().slice(0, 20);
+            }
+          } catch (_) { /* fall through */ }
         }
       } catch (_) { /* fall through to Enter-key path */ }
       return null;
@@ -19458,6 +19516,51 @@ async function runScraper() {
           // Carry reject decision through (used by the content filter below)
           if (ai.rejectReason) { dd.rejectReason = ai.rejectReason; }
           if (ai.rejectCategory) { dd.rejectCategory = ai.rejectCategory; }
+
+          // 2026-06-16 (Task #191) — DETERMINISTIC SaaS DETECTOR (safety net).
+          // AI sometimes overlooks tenders that EXPLICITLY say "SaaS service"
+          // / "Software as a Service" in the scope (run 121 Järvenpään
+          // Mestariasunnot Oy property management system — 3 explicit SaaS
+          // mentions). AI got fooled by "implementation project", "data
+          // conversion", "system development" — but those are NORMAL SaaS
+          // engagement activities. Hard override: if scope/description has
+          // any unambiguous SaaS marker AND AI didn't already reject, force
+          // rejectReason='saas_provision_or_creation'.
+          if (!dd.rejectReason) {
+            const saasScanText = [
+              dd.scopeOfAgreement || '',
+              dd.requirementsForSupplier || '',
+              dd.qualificationRequirements || '',
+              dd.fullTextSnippet || '',
+              dd.title || '',
+              toFetch[i].title || '',
+            ].join(' ').toLowerCase();
+            // Multi-lingual SaaS phrase set — matched as whole-word or punctuated.
+            const SAAS_PATTERNS = [
+              /\bsaas\s*service\b/i,
+              /\bsaas\s*solution\b/i,
+              /\bsaas\s*offering\b/i,
+              /\bsaas[-\s]based\b/i,
+              /\bas\s+a\s+saas\b/i,
+              /\bsoftware\s+as\s+a\s+service\b/i,
+              /\(software\s+as\s+a\s+service\)/i,
+              /\bsaas[-\s]dienst\b/i,             // NL "SaaS dienst"
+              /\bsaas[-\s]l[öo]sung\b/i,          // DE "SaaS-Lösung"
+              /\bsolution\s+saas\b/i,             // FR
+              /\bsoluci[óo]n\s+saas\b/i,          // ES
+              /\bsoluzione\s+saas\b/i,            // IT
+              /\bsaas[-\s]sprendim/i,             // LT "SaaS sprendimas"
+              /\bsaas[-\s]palvelu/i,              // FI "SaaS-palvelu"
+              /\bsaas[-\s]palveluna\b/i,          // FI "as a SaaS service"
+              /\bsaas[-\s]oplossing\b/i,          // NL
+            ];
+            const saasHit = SAAS_PATTERNS.find(re => re.test(saasScanText));
+            if (saasHit) {
+              dd.rejectReason = 'saas_provision_or_creation';
+              dd.rejectCategory = 'saas_provision_or_creation';
+              console.log(`    🚨 SaaS deterministic override — matched ${saasHit} in scope/desc; AI missed it`);
+            }
+          }
           if (filled.length) console.log(`    🤖 AI filled: ${filled.join(', ')}`);
           if (dd.lotStructure && dd.lotStructure !== 'single') {
             console.log(`    🧩 multi-lot framework: structure=${dd.lotStructure}${dd.itLotsScope ? ` — IT lots: "${dd.itLotsScope.slice(0, 120)}"` : ''}`);
